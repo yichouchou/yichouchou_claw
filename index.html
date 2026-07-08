@@ -3,7 +3,21 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DeepSeek Chat - Agent Transfer Demo</title>
+    <title>yichouchou_claw</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/core.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/go.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/javascript.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/json.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/bash.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/xml.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/css.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/sql.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/yaml.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/shell.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -123,7 +137,7 @@
             color: white;
         }
         .avatar.assistant-avatar {
-            background: #4d6bfe;
+            background: #d97706;
             color: white;
         }
         .message-body {
@@ -150,19 +164,157 @@
         }
         .message-content {
             font-size: 15px;
-            line-height: 1.7;
+            line-height: 1.75;
             color: #1f2937;
-            white-space: pre-wrap;
             word-break: break-word;
         }
-        .message-content pre {
-            background: #f6f6f6;
-            padding: 12px;
-            border-radius: 6px;
-            overflow-x: auto;
+        .message-content > *:first-child { margin-top: 0; }
+        .message-content > *:last-child { margin-bottom: 0; }
+        .message-content p {
             margin: 8px 0;
-            font-family: 'Monaco', 'Menlo', monospace;
+        }
+        .message-content h1,
+        .message-content h2,
+        .message-content h3,
+        .message-content h4,
+        .message-content h5,
+        .message-content h6 {
+            margin: 18px 0 10px;
+            font-weight: 600;
+            line-height: 1.35;
+            color: #111827;
+        }
+        .message-content h1 { font-size: 1.55em; padding-bottom: 6px; border-bottom: 1px solid #e5e7eb; }
+        .message-content h2 { font-size: 1.35em; padding-bottom: 4px; border-bottom: 1px solid #f0f0f0; }
+        .message-content h3 { font-size: 1.18em; }
+        .message-content h4 { font-size: 1.05em; }
+        .message-content h5 { font-size: 0.98em; }
+        .message-content h6 { font-size: 0.92em; color: #4b5563; }
+        .message-content ul,
+        .message-content ol {
+            margin: 8px 0;
+            padding-left: 1.6em;
+        }
+        .message-content ul { list-style: disc; }
+        .message-content ol { list-style: decimal; }
+        .message-content li {
+            margin: 4px 0;
+        }
+        .message-content li > ul,
+        .message-content li > ol {
+            margin: 4px 0;
+        }
+        /* 任务列表 */
+        .message-content input[type="checkbox"] {
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+        /* 引用 */
+        .message-content blockquote {
+            margin: 10px 0;
+            padding: 8px 14px;
+            border-left: 4px solid #d97706;
+            background: #fff7ed;
+            color: #4b5563;
+            border-radius: 4px;
+        }
+        .message-content blockquote p { margin: 4px 0; }
+        /* 行内代码 */
+        .message-content code {
+            background: #f3f4f6;
+            color: #b45309;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
+            font-size: 0.9em;
+            word-break: break-word;
+        }
+        /* 代码块 */
+        .message-content pre {
+            background: #f6f8fa;
+            padding: 14px 16px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 10px 0;
+            font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
             font-size: 13px;
+            line-height: 1.55;
+            border: 1px solid #eaeef2;
+        }
+        .message-content pre code {
+            background: transparent;
+            color: inherit;
+            padding: 0;
+            font-size: inherit;
+            border-radius: 0;
+            white-space: pre;
+        }
+        /* 链接 */
+        .message-content a {
+            color: #d97706;
+            text-decoration: none;
+            border-bottom: 1px solid rgba(217, 119, 6, 0.35);
+        }
+        .message-content a:hover {
+            border-bottom-color: #d97706;
+        }
+        /* 表格 */
+        .message-content table {
+            border-collapse: collapse;
+            margin: 10px 0;
+            width: 100%;
+            font-size: 14px;
+            overflow: hidden;
+            border-radius: 6px;
+            border: 1px solid #e5e7eb;
+        }
+        .message-content th,
+        .message-content td {
+            border: 1px solid #e5e7eb;
+            padding: 8px 12px;
+            text-align: left;
+        }
+        .message-content th {
+            background: #f9fafb;
+            font-weight: 600;
+        }
+        .message-content tr:nth-child(even) td {
+            background: #fafafa;
+        }
+        /* 分隔线 */
+        .message-content hr {
+            border: none;
+            border-top: 1px solid #e5e7eb;
+            margin: 16px 0;
+        }
+        /* 加粗/斜体 */
+        .message-content strong { font-weight: 600; color: #111827; }
+        .message-content em { font-style: italic; }
+        /* 删除线 */
+        .message-content del { color: #9ca3af; }
+        /* 图片 */
+        .message-content img {
+            max-width: 100%;
+            border-radius: 6px;
+            margin: 6px 0;
+        }
+        /* 代码块语言标签 */
+        .code-block-wrapper {
+            position: relative;
+            margin: 10px 0;
+        }
+        .code-block-wrapper .code-lang {
+            position: absolute;
+            top: 6px;
+            right: 10px;
+            font-size: 11px;
+            color: #6b7280;
+            background: rgba(255, 255, 255, 0.85);
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            text-transform: lowercase;
+            pointer-events: none;
         }
         /* 思考过程 */
         .thinking-block {
@@ -197,8 +349,65 @@
             padding: 0 14px 12px 14px;
             font-size: 13px;
             color: #6b7280;
-            white-space: pre-wrap;
+            line-height: 1.6;
         }
+        .thinking-body > *:first-child { margin-top: 0; }
+        .thinking-body > *:last-child { margin-bottom: 0; }
+        .thinking-body p { margin: 6px 0; }
+        .thinking-body h1,
+        .thinking-body h2,
+        .thinking-body h3,
+        .thinking-body h4,
+        .thinking-body h5,
+        .thinking-body h6 { margin: 12px 0 6px; font-weight: 600; color: #374151; }
+        .thinking-body h1 { font-size: 1.2em; }
+        .thinking-body h2 { font-size: 1.12em; }
+        .thinking-body h3 { font-size: 1.05em; }
+        .thinking-body h4 { font-size: 1em; }
+        .thinking-body ul,
+        .thinking-body ol { margin: 6px 0; padding-left: 1.6em; }
+        .thinking-body ul { list-style: disc; }
+        .thinking-body ol { list-style: decimal; }
+        .thinking-body li { margin: 2px 0; }
+        .thinking-body code {
+            background: #eef0f2;
+            color: #b45309;
+            padding: 1px 5px;
+            border-radius: 3px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 0.9em;
+        }
+        .thinking-body pre {
+            background: #eef0f2;
+            padding: 10px 12px;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 6px 0;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 12px;
+        }
+        .thinking-body pre code { background: transparent; padding: 0; }
+        .thinking-body blockquote {
+            margin: 6px 0;
+            padding: 6px 10px;
+            border-left: 3px solid #d1d5db;
+            color: #6b7280;
+        }
+        .thinking-body a { color: #d97706; text-decoration: underline; }
+        .thinking-body strong { font-weight: 600; }
+        .thinking-body table {
+            border-collapse: collapse;
+            margin: 6px 0;
+            font-size: 12px;
+            width: 100%;
+        }
+        .thinking-body th,
+        .thinking-body td {
+            border: 1px solid #e5e7eb;
+            padding: 4px 8px;
+            text-align: left;
+        }
+        .thinking-body th { background: #f3f4f6; }
         .thinking-dot {
             display: inline-block;
             width: 6px;
@@ -235,10 +444,10 @@
         .transfer-block {
             margin: 8px 0;
             padding: 8px 12px;
-            border-left: 3px solid #4d6bfe;
-            background: #eff6ff;
+            border-left: 3px solid #d97706;
+            background: #fff7ed;
             font-size: 13px;
-            color: #1e40af;
+            color: #9a3412;
             border-radius: 4px;
         }
         /* 输入区 */
@@ -261,7 +470,7 @@
             transition: border-color 0.2s;
         }
         .input-box:focus-within {
-            border-color: #4d6bfe;
+            border-color: #d97706;
         }
         .input-box textarea {
             flex: 1;
@@ -277,7 +486,7 @@
             padding: 6px 4px;
         }
         .input-box button {
-            background: #4d6bfe;
+            background: #d97706;
             color: white;
             border: none;
             border-radius: 8px;
@@ -291,7 +500,7 @@
             flex-shrink: 0;
         }
         .input-box button:hover {
-            background: #3b5bdb;
+            background: #b45309;
         }
         .input-box button:disabled {
             background: #d1d5db;
@@ -319,7 +528,7 @@
             display: inline-block;
             width: 8px;
             height: 16px;
-            background: #4d6bfe;
+            background: #d97706;
             margin-left: 2px;
             animation: blink 1s infinite;
             vertical-align: middle;
@@ -342,17 +551,17 @@
     </div>
     <div class="main">
         <div class="main-header">
-            <div class="model-name">DeepSeek Chat</div>
+            <div class="model-name">yichouchou_claw</div>
         </div>
         <div class="chat-container" id="chatContainer">
             <div class="message-wrapper" id="welcomeMessage">
                 <div class="message">
-                    <div class="avatar assistant-avatar">DS</div>
+                    <div class="avatar assistant-avatar">YC</div>
                     <div class="message-body">
                         <div class="message-header">
-                            <span>DeepSeek</span>
+                            <span>yichouchou_claw</span>
                         </div>
-                        <div class="message-content">你好！我是 DeepSeek Chat，可以帮你查询天气、进行闲聊。请问有什么可以帮到你的？</div>
+                        <div class="message-content">你好！我是 yichouchou_claw，可以帮你查询天气、进行闲聊。请问有什么可以帮到你的？</div>
                     </div>
                 </div>
             </div>
@@ -360,7 +569,7 @@
         <div class="input-area">
             <div class="input-wrapper">
                 <div class="input-box">
-                    <textarea id="queryInput" rows="1" placeholder="发送消息给 DeepSeek..." onkeydown="handleKeyDown(event)" oninput="autoResize(this)"></textarea>
+                    <textarea id="queryInput" rows="1" placeholder="发送消息给 yichouchou_claw..." onkeydown="handleKeyDown(event)" oninput="autoResize(this)"></textarea>
                     <button id="sendButton" onclick="sendMessage()">
                         <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
                             <path d="M2 8L14 8M14 8L8 2M14 8L8 14" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -373,6 +582,93 @@
     </div>
 
     <script>
+        // ============== Markdown 渲染配置 ==============
+        if (typeof marked !== 'undefined') {
+            marked.setOptions({
+                gfm: true,
+                breaks: true,
+                pedantic: false,
+            });
+        }
+
+        // 流式渲染节流：避免每个 token 都解析 markdown。
+        function renderMarkdownInto(el, mdText, opts = {}) {
+            if (!el) return;
+            const { useHighlight = true } = opts;
+            let html = mdText;
+            try {
+                if (typeof marked !== 'undefined') {
+                    html = marked.parse(mdText);
+                } else {
+                    // 没有 marked 时退化为按行转义
+                    html = '<p>' + escapeHtml(mdText) + '</p>';
+                }
+            } catch (e) {
+                html = '<p>' + escapeHtml(mdText) + '</p>';
+            }
+            // DOMPurify 净化，保留常见 markdown 标签
+            try {
+                if (typeof DOMPurify !== 'undefined') {
+                    html = DOMPurify.sanitize(html, {
+                        ADD_ATTR: ['target', 'rel'],
+                        ADD_TAGS: ['input'],
+                    });
+                }
+            } catch (e) { /* 忽略 */ }
+            el.innerHTML = html;
+            // 处理任务列表：marked 默认会把 [ ] / [x] 渲染成 input checkbox
+            el.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                cb.disabled = true;
+                cb.addEventListener('click', e => e.preventDefault());
+            });
+            // 链接在新窗口打开
+            el.querySelectorAll('a').forEach(a => {
+                a.setAttribute('target', '_blank');
+                a.setAttribute('rel', 'noopener noreferrer');
+            });
+            // 代码高亮：对每个未高亮的 <pre><code> 执行一次
+            if (useHighlight && typeof hljs !== 'undefined') {
+                el.querySelectorAll('pre > code').forEach(block => {
+                    if (block.dataset.highlighted === 'yes') return;
+                    let lang = '';
+                    const m = (block.className || '').match(/language-(\S+)/);
+                    if (m) lang = m[1];
+                    try {
+                        if (lang && hljs.getLanguage(lang)) {
+                            const html2 = hljs.highlight(block.textContent, { language: lang, ignoreIllegals: true }).value;
+                            block.innerHTML = html2;
+                            block.classList.add('hljs');
+                        } else {
+                            hljs.highlightElement(block);
+                        }
+                    } catch (e) { /* 忽略 */ }
+                    // 添加语言标签
+                    if (lang && !block.parentElement.parentElement.querySelector('.code-lang')) {
+                        const wrap = block.parentElement.parentElement;
+                        if (wrap.classList.contains('code-block-wrapper')) {
+                            const tag = document.createElement('span');
+                            tag.className = 'code-lang';
+                            tag.textContent = lang;
+                            wrap.appendChild(tag);
+                        } else {
+                            // 兼容 marked 默认渲染（未包 wrapper）：包一层
+                            const pre = block.parentElement;
+                            if (pre && pre.tagName === 'PRE') {
+                                const wrap = document.createElement('div');
+                                wrap.className = 'code-block-wrapper';
+                                pre.parentElement.insertBefore(wrap, pre);
+                                wrap.appendChild(pre);
+                                const tag = document.createElement('span');
+                                tag.className = 'code-lang';
+                                tag.textContent = lang;
+                                wrap.appendChild(tag);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
         const chatContainer = document.getElementById('chatContainer');
         const queryInput = document.getElementById('queryInput');
         const sendButton = document.getElementById('sendButton');
@@ -385,6 +681,10 @@
         let currentAgentTag = null;
         let currentThinkingBlock = null;
         let currentThinkingBody = null;
+        // markdown 原始 buffer 与节流定时器
+        let contentMdBuffer = '';
+        let thinkingMdBuffer = '';
+        let renderTimer = null;
         // 当前对话的 session_id，存于 localStorage 实现跨页面刷新保持上下文。
         let sessionId = localStorage.getItem('eino_session_id') || '';
 
@@ -443,10 +743,10 @@
             wrapper.className = 'message-wrapper';
             wrapper.innerHTML = `
                 <div class="message">
-                    <div class="avatar assistant-avatar">DS</div>
+                    <div class="avatar assistant-avatar">YC</div>
                     <div class="message-body">
                         <div class="message-header">
-                            <span>DeepSeek</span>
+                            <span>yichouchou_claw</span>
                             <span class="agent-tag"></span>
                         </div>
                         <div class="thinking-block" style="display:none">
@@ -467,24 +767,55 @@
             currentThinkingBlock = wrapper.querySelector('.thinking-block');
             currentThinkingBody = wrapper.querySelector('.thinking-body');
 
+            // 初始化 markdown buffer
+            contentMdBuffer = '';
+            thinkingMdBuffer = '';
+            if (renderTimer) {
+                clearTimeout(renderTimer);
+                renderTimer = null;
+            }
+
             if (agentName) {
                 currentAgentTag.textContent = agentName;
             }
             scrollToBottom();
         }
 
+        // 节流渲染：在流式输出期间，每隔 ~80ms 才真正渲染一次 markdown，
+        // 避免每个 token 都触发解析与高亮造成闪烁和卡顿。
+        function scheduleRender() {
+            if (renderTimer) return;
+            renderTimer = setTimeout(() => {
+                renderTimer = null;
+                // 流式期间渲染时不强制对每个代码块做高亮，结束时再补一次。
+                renderMarkdownInto(currentContentEl, contentMdBuffer, { useHighlight: true });
+                renderMarkdownInto(currentThinkingBody, thinkingMdBuffer, { useHighlight: true });
+                scrollToBottom();
+            }, 80);
+        }
+
+        function flushRender() {
+            if (renderTimer) {
+                clearTimeout(renderTimer);
+                renderTimer = null;
+            }
+            renderMarkdownInto(currentContentEl, contentMdBuffer, { useHighlight: true });
+            renderMarkdownInto(currentThinkingBody, thinkingMdBuffer, { useHighlight: true });
+            scrollToBottom();
+        }
+
         function appendToContent(text) {
             if (currentContentEl) {
-                currentContentEl.textContent += text;
-                scrollToBottom();
+                contentMdBuffer += text;
+                scheduleRender();
             }
         }
 
         function appendToThinking(text) {
             if (currentThinkingBlock) {
                 currentThinkingBlock.style.display = 'block';
-                currentThinkingBody.textContent += text;
-                scrollToBottom();
+                thinkingMdBuffer += text;
+                scheduleRender();
             }
         }
 
@@ -592,6 +923,8 @@
             } catch (error) {
                 appendToContent(`\n\n[请求失败: ${error.message}]`);
             } finally {
+                // 流结束：做最后一次完整渲染，确保所有代码块都已高亮
+                flushRender();
                 isStreaming = false;
                 sendButton.disabled = false;
                 currentAssistantMsg = null;
