@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DeepSeek Chat - Agent Transfer Demo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+            background: #ffffff;
+            color: #1a1a1a;
+            height: 100vh;
+            display: flex;
+        }
+        /* 侧边栏 */
+        .sidebar {
+            width: 260px;
+            background: #f9f9f9;
+            border-right: 1px solid #e5e5e5;
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+        }
+        .sidebar-header {
+            padding: 16px;
+            border-bottom: 1px solid #e5e5e5;
+        }
+        .new-chat-btn {
+            width: 100%;
+            padding: 10px 16px;
+            background: #ffffff;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            color: #374151;
+            transition: all 0.2s;
+        }
+        .new-chat-btn:hover {
+            background: #f3f4f6;
+        }
+        .chat-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+        .chat-list-item {
+            padding: 10px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            color: #4b5563;
+            margin-bottom: 4px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .chat-list-item:hover {
+            background: #f3f4f6;
+        }
+        .chat-list-item.active {
+            background: #e5e7eb;
+        }
+        /* 主区域 */
+        .main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+        .main-header {
+            padding: 12px 24px;
+            border-bottom: 1px solid #e5e5e5;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .model-name {
+            font-size: 16px;
+            font-weight: 500;
+            color: #1a1a1a;
+        }
+        /* 消息区 */
+        .chat-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0;
+        }
+        .message-wrapper {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px 24px;
+        }
+        .message {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .message.user {
+            flex-direction: row-reverse;
+        }
+        .avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        .avatar.user-avatar {
+            background: #2563eb;
+            color: white;
+        }
+        .avatar.assistant-avatar {
+            background: #4d6bfe;
+            color: white;
+        }
+        .message-body {
+            flex: 1;
+            min-width: 0;
+        }
+        .message-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 6px;
+            font-size: 13px;
+            color: #6b7280;
+        }
+        .message.user .message-header {
+            justify-content: flex-end;
+        }
+        .agent-tag {
+            padding: 2px 6px;
+            background: #dbeafe;
+            color: #1d4ed8;
+            border-radius: 4px;
+            font-size: 11px;
+        }
+        .message-content {
+            font-size: 15px;
+            line-height: 1.7;
+            color: #1f2937;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .message-content pre {
+            background: #f6f6f6;
+            padding: 12px;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 8px 0;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 13px;
+        }
+        /* 思考过程 */
+        .thinking-block {
+            margin: 12px 0;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            background: #fafafa;
+        }
+        .thinking-header {
+            padding: 10px 14px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            color: #6b7280;
+            user-select: none;
+        }
+        .thinking-header:hover {
+            background: #f3f4f6;
+        }
+        .thinking-icon {
+            transition: transform 0.2s;
+        }
+        .thinking-block.collapsed .thinking-icon {
+            transform: rotate(-90deg);
+        }
+        .thinking-block.collapsed .thinking-body {
+            display: none;
+        }
+        .thinking-body {
+            padding: 0 14px 12px 14px;
+            font-size: 13px;
+            color: #6b7280;
+            white-space: pre-wrap;
+        }
+        .thinking-dot {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            background: #9ca3af;
+            border-radius: 50%;
+            margin-right: 6px;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 0.3; }
+            50% { opacity: 1; }
+        }
+        /* 工具调用 */
+        .tool-block {
+            margin: 8px 0;
+            border: 1px solid #fed7aa;
+            border-radius: 8px;
+            background: #fff7ed;
+        }
+        .tool-header {
+            padding: 8px 12px;
+            font-size: 13px;
+            color: #c2410c;
+            font-weight: 500;
+        }
+        .tool-body {
+            padding: 0 12px 10px 12px;
+            font-size: 13px;
+            color: #7c2d12;
+            font-family: 'Monaco', 'Menlo', monospace;
+        }
+        /* 转接提示 */
+        .transfer-block {
+            margin: 8px 0;
+            padding: 8px 12px;
+            border-left: 3px solid #4d6bfe;
+            background: #eff6ff;
+            font-size: 13px;
+            color: #1e40af;
+            border-radius: 4px;
+        }
+        /* 输入区 */
+        .input-area {
+            padding: 16px 24px 24px 24px;
+            background: #ffffff;
+            border-top: 1px solid #e5e5e5;
+        }
+        .input-wrapper {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .input-box {
+            display: flex;
+            align-items: flex-end;
+            background: #ffffff;
+            border: 1px solid #d1d5db;
+            border-radius: 12px;
+            padding: 8px 12px;
+            transition: border-color 0.2s;
+        }
+        .input-box:focus-within {
+            border-color: #4d6bfe;
+        }
+        .input-box textarea {
+            flex: 1;
+            border: none;
+            outline: none;
+            resize: none;
+            font-size: 15px;
+            line-height: 1.5;
+            font-family: inherit;
+            background: transparent;
+            max-height: 200px;
+            min-height: 24px;
+            padding: 6px 4px;
+        }
+        .input-box button {
+            background: #4d6bfe;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            width: 32px;
+            height: 32px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s;
+            flex-shrink: 0;
+        }
+        .input-box button:hover {
+            background: #3b5bdb;
+        }
+        .input-box button:disabled {
+            background: #d1d5db;
+            cursor: not-allowed;
+        }
+        .input-hint {
+            font-size: 12px;
+            color: #9ca3af;
+            text-align: center;
+            margin-top: 8px;
+        }
+        /* 滚动条 */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #d1d5db;
+            border-radius: 3px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #9ca3af;
+        }
+        .typing-cursor {
+            display: inline-block;
+            width: 8px;
+            height: 16px;
+            background: #4d6bfe;
+            margin-left: 2px;
+            animation: blink 1s infinite;
+            vertical-align: middle;
+        }
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0; }
+        }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <button class="new-chat-btn" onclick="newChat()">
+                <span>+</span>
+                <span>新建对话</span>
+            </button>
+        </div>
+        <div class="chat-list" id="chatList"></div>
+    </div>
+    <div class="main">
+        <div class="main-header">
+            <div class="model-name">DeepSeek Chat</div>
+        </div>
+        <div class="chat-container" id="chatContainer">
+            <div class="message-wrapper" id="welcomeMessage">
+                <div class="message">
+                    <div class="avatar assistant-avatar">DS</div>
+                    <div class="message-body">
+                        <div class="message-header">
+                            <span>DeepSeek</span>
+                        </div>
+                        <div class="message-content">你好！我是 DeepSeek Chat，可以帮你查询天气、进行闲聊。请问有什么可以帮到你的？</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="input-area">
+            <div class="input-wrapper">
+                <div class="input-box">
+                    <textarea id="queryInput" rows="1" placeholder="发送消息给 DeepSeek..." onkeydown="handleKeyDown(event)" oninput="autoResize(this)"></textarea>
+                    <button id="sendButton" onclick="sendMessage()">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <path d="M2 8L14 8M14 8L8 2M14 8L8 14" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="input-hint">按 Enter 发送，Shift + Enter 换行</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const chatContainer = document.getElementById('chatContainer');
+        const queryInput = document.getElementById('queryInput');
+        const sendButton = document.getElementById('sendButton');
+        const chatList = document.getElementById('chatList');
+        const welcomeMessage = document.getElementById('welcomeMessage');
+
+        let isStreaming = false;
+        let currentAssistantMsg = null;
+        let currentContentEl = null;
+        let currentAgentTag = null;
+        let currentThinkingBlock = null;
+        let currentThinkingBody = null;
+        // 当前对话的 session_id，存于 localStorage 实现跨页面刷新保持上下文。
+        let sessionId = localStorage.getItem('eino_session_id') || '';
+
+        function autoResize(textarea) {
+            textarea.style.height = 'auto';
+            textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+        }
+
+        function handleKeyDown(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage();
+            }
+        }
+
+        function newChat() {
+            if (isStreaming) return;
+            chatContainer.innerHTML = '';
+            chatContainer.appendChild(welcomeMessage);
+            welcomeMessage.style.display = '';
+            // 新开一个会话：清掉旧的 session_id，下次请求让服务端再分配。
+            sessionId = '';
+            localStorage.removeItem('eino_session_id');
+        }
+
+        function rememberSession(id) {
+            if (!id) return;
+            sessionId = id;
+            try {
+                localStorage.setItem('eino_session_id', id);
+            } catch (e) {
+                // localStorage 在隐私模式下可能写不进去，忽略即可。
+            }
+        }
+
+        function addUserMessage(content) {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'message-wrapper';
+            wrapper.innerHTML = `
+                <div class="message user">
+                    <div class="avatar user-avatar">U</div>
+                    <div class="message-body">
+                        <div class="message-header">
+                            <span>你</span>
+                        </div>
+                        <div class="message-content">${escapeHtml(content)}</div>
+                    </div>
+                </div>
+            `;
+            chatContainer.appendChild(wrapper);
+            scrollToBottom();
+        }
+
+        function startAssistantMessage(agentName) {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'message-wrapper';
+            wrapper.innerHTML = `
+                <div class="message">
+                    <div class="avatar assistant-avatar">DS</div>
+                    <div class="message-body">
+                        <div class="message-header">
+                            <span>DeepSeek</span>
+                            <span class="agent-tag"></span>
+                        </div>
+                        <div class="thinking-block" style="display:none">
+                            <div class="thinking-header" onclick="toggleThinking(this)">
+                                <span class="thinking-icon">▼</span>
+                                <span><span class="thinking-dot"></span>已深度思考</span>
+                            </div>
+                            <div class="thinking-body"></div>
+                        </div>
+                        <div class="message-content"></div>
+                    </div>
+                </div>
+            `;
+            chatContainer.appendChild(wrapper);
+            currentAssistantMsg = wrapper;
+            currentContentEl = wrapper.querySelector('.message-content');
+            currentAgentTag = wrapper.querySelector('.agent-tag');
+            currentThinkingBlock = wrapper.querySelector('.thinking-block');
+            currentThinkingBody = wrapper.querySelector('.thinking-body');
+
+            if (agentName) {
+                currentAgentTag.textContent = agentName;
+            }
+            scrollToBottom();
+        }
+
+        function appendToContent(text) {
+            if (currentContentEl) {
+                currentContentEl.textContent += text;
+                scrollToBottom();
+            }
+        }
+
+        function appendToThinking(text) {
+            if (currentThinkingBlock) {
+                currentThinkingBlock.style.display = 'block';
+                currentThinkingBody.textContent += text;
+                scrollToBottom();
+            }
+        }
+
+        function addTransferNotice(agentName) {
+            if (currentAssistantMsg) {
+                const div = document.createElement('div');
+                div.className = 'transfer-block';
+                div.innerHTML = `🔄 任务转交给 <b>${escapeHtml(agentName)}</b> 处理`;
+                currentAssistantMsg.querySelector('.message-body').appendChild(div);
+                scrollToBottom();
+            }
+        }
+
+        function addToolCall(toolNames) {
+            if (currentAssistantMsg) {
+                const div = document.createElement('div');
+                div.className = 'tool-block';
+                div.innerHTML = `
+                    <div class="tool-header">🔧 工具调用</div>
+                    <div class="tool-body">${escapeHtml(toolNames)}</div>
+                `;
+                currentAssistantMsg.querySelector('.message-body').appendChild(div);
+                scrollToBottom();
+            }
+        }
+
+        function toggleThinking(header) {
+            const block = header.parentElement;
+            block.classList.toggle('collapsed');
+        }
+
+        function scrollToBottom() {
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        async function sendMessage() {
+            const query = queryInput.value.trim();
+            if (!query || isStreaming) return;
+
+            isStreaming = true;
+            sendButton.disabled = true;
+            queryInput.value = '';
+            queryInput.style.height = 'auto';
+
+            welcomeMessage.style.display = 'none';
+            addUserMessage(query);
+
+            startAssistantMessage('RouterAgent');
+
+            try {
+                // 如果有 session_id 则一并传给后端，让它在该会话上累积上下文。
+                const sessionParam = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : '';
+                const response = await fetch(`/chat?query=${encodeURIComponent(query)}${sessionParam}`);
+
+                if (!response.ok) {
+                    appendToContent(`\n\n[请求失败: HTTP ${response.status}]`);
+                    return;
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+
+                    // SSE 事件以 \n\n 分隔
+                    let eventEnd;
+                    while ((eventEnd = buffer.indexOf('\n\n')) !== -1) {
+                        const eventBlock = buffer.substring(0, eventEnd);
+                        buffer = buffer.substring(eventEnd + 2);
+
+                        // 处理事件块中的每一行
+                        const lines = eventBlock.split('\n');
+                        let eventData = '';
+                        for (const line of lines) {
+                            if (line.startsWith('data:')) {
+                                eventData += line.substring(5).trim();
+                            } else if (line.startsWith('event:')) {
+                                // 忽略 event 字段
+                            } else if (line.startsWith('id:')) {
+                                // 忽略 id 字段
+                            }
+                        }
+
+                        if (eventData) {
+                            try {
+                                const data = JSON.parse(eventData);
+                                processEvent(data);
+                            } catch (e) {
+                                console.error('Parse error:', e, 'data:', eventData);
+                            }
+                        }
+                    }
+                }
+            } catch (error) {
+                appendToContent(`\n\n[请求失败: ${error.message}]`);
+            } finally {
+                isStreaming = false;
+                sendButton.disabled = false;
+                currentAssistantMsg = null;
+                currentContentEl = null;
+                currentThinkingBlock = null;
+                currentThinkingBody = null;
+                queryInput.focus();
+            }
+        }
+
+        function processEvent(data) {
+            const agentName = data.agent_name || '';
+
+            switch (data.type) {
+                case 'session':
+                    // 服务端分配或回传的 session_id，用于后续多轮请求。
+                    rememberSession(data.content);
+                    break;
+
+                case 'message':
+                case 'stream_chunk':
+                    if (data.content) {
+                        // 区分思考过程和正常输出：通过 RunPath 或 content 标记
+                        appendToContent(data.content);
+                        if (currentAgentTag && agentName && !currentAgentTag.textContent) {
+                            currentAgentTag.textContent = agentName;
+                        }
+                    }
+                    break;
+
+                case 'tool_result':
+                case 'tool_result_chunk':
+                    if (data.content) {
+                        appendToThinking(`工具返回: ${data.content}\n`);
+                    }
+                    break;
+
+                case 'action':
+                    if (data.action_type === 'transfer' && data.content) {
+                        addTransferNotice(data.content);
+                    } else if (data.action_type === 'exit') {
+                        // 结束
+                    }
+                    break;
+
+                case 'tool_calls':
+                    if (data.tool_calls && data.tool_calls.length > 0) {
+                        const toolNames = data.tool_calls.map(tc => {
+                            const name = tc.Function?.Name || tc.function?.name || 'unknown';
+                            const args = tc.Function?.Arguments || tc.function?.arguments || '';
+                            return `${name}(${args})`;
+                        }).join('\n');
+                        addToolCall(toolNames);
+                        appendToThinking(`调用工具: ${toolNames}\n`);
+                    }
+                    break;
+
+                case 'error':
+                    appendToContent(`\n\n[错误: ${data.error}]`);
+                    break;
+
+                case 'end':
+                    // SSE 流结束
+                    console.log('SSE stream ended');
+                    break;
+
+                default:
+                    // 未知事件，如果有 content 也展示出来
+                    if (data.content) {
+                        appendToContent(data.content);
+                    }
+                    console.log('Unknown event type:', data.type, data);
+            }
+        }
+    </script>
+</body>
+</html>
