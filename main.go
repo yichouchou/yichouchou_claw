@@ -19,8 +19,6 @@ package main
 import (
 	"context"
 	"embed"
-	"github.com/cloudwego/eino-ext/adk/backend/local"
-	"github.com/cloudwego/eino/components/model"
 	"log"
 
 	"github.com/cloudwego/eino/adk"
@@ -43,25 +41,6 @@ var staticFiles embed.FS
 const maxConversationRounds = 12
 
 func main() {
-	ctx := context.Background()
-	// 1. 初始化本地shell执行后端
-	backend, _ := local.NewBackend(ctx, &local.Config{
-		ShellAllowList: []string{"ls", "df -h", "top", "kubectl get pods"},
-		ShellDenyList:  []string{"rm", "mkfs"},
-		WorkDir:        "/tmp",
-	})
-	// 2. 初始化大模型（Ollama/通义/OpenAI均可）
-	var chatModel model.ChatModel
-	// 3. 创建具备执行shell能力的DeepAgent
-	agent, _ := deep.New(ctx, &deep.Config{
-		ChatModel:      chatModel,
-		Instruction:    "运维助手，查询服务器资源使用execute执行shell",
-		Backend:        backend,
-		StreamingShell: backend,
-	})
-	// 4. 用户消息输入，自动判断是否调用execute
-	rsp, _ := agent.Run(ctx, "查看当前服务器磁盘占用")
-
 	// 进程级别的会话存储。中间件 session.PersistMiddleware 会用 AfterAgent 钩子
 	// 把 SDK 内部维护的完整多轮 messages 写回这里 —— 这是一个 eino 原生方案。
 	store := session.NewStore(maxConversationRounds)
