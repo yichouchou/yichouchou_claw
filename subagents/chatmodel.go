@@ -27,6 +27,7 @@ import (
 	"github.com/cloudwego/eino/compose"
 
 	"github.com/yichouchou/yichouchou_claw/adk/common/model"
+	messagehandler "github.com/yichouchou/yichouchou_claw/adk/middlewares/messageHandler"
 	"github.com/yichouchou/yichouchou_claw/internal/session"
 )
 
@@ -63,6 +64,9 @@ func NewWeatherAgent() adk.Agent {
 				Tools: []tool.BaseTool{weatherTool},
 			},
 		},
+		Handlers: []adk.ChatModelAgentMiddleware{
+			messagehandler.NewLanguageConstraintMiddleware(),
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -83,6 +87,9 @@ func NewChatAgent() adk.Agent {
 - 如果用户的请求明显超出闲聊范围（例如需要实时天气、订单、计算器等），直接告诉用户"我无法处理，请稍后再试"，不要做任何转移动作。
 - 只在闲聊/通用知识范围内作答，不要捏造事实、不要编造数据。`,
 		Model: model.NewChatModel(),
+		Handlers: []adk.ChatModelAgentMiddleware{
+			messagehandler.NewLanguageConstraintMiddleware(),
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -128,6 +135,7 @@ func NewRouterAgent(store *session.Store) adk.Agent {
 		// 把完整 messages 写入 store；子 agent（ChatAgent / WeatherAgent）不会触发。
 		Handlers: []adk.ChatModelAgentMiddleware{
 			session.NewPersistMiddleware(store),
+			messagehandler.NewLanguageConstraintMiddleware(),
 		},
 	})
 	if err != nil {
