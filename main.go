@@ -47,11 +47,17 @@ func main() {
 
 	weatherAgent := subagents.NewWeatherAgent()
 	chatAgent := subagents.NewChatAgent()
+	localCmdAgent := subagents.NewLocalCommandAgent()
 	// RouterAgent 挂上 PersistMiddleware，让最外层 ChatModelAgent 维护 messages。
 	routerAgent := subagents.NewRouterAgent(store)
 
 	ctx := context.Background()
-	a, err := adk.SetSubAgents(ctx, routerAgent, []adk.Agent{chatAgent, weatherAgent})
+	// 三个子 agent：纯对话 / 查天气 / 本机命令执行（沙箱+授权）
+	a, err := adk.SetSubAgents(ctx, routerAgent, []adk.Agent{
+		chatAgent,
+		weatherAgent,
+		localCmdAgent,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
