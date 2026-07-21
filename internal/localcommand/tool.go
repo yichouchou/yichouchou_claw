@@ -47,7 +47,10 @@ var ErrPlatformNotSupported = errors.New("command not supported on current platf
 var ErrNotInWhitelist = errors.New("command not in whitelist")
 
 // DangerousPatterns 危险模式列表
+//
+// 规则按"用途"分组，注释说明命中后会怎样。建议每条规则都尽量窄、避免误杀。
 var DangerousPatterns = []*regexp.Regexp{
+	// ===== 通用危险：删除/破坏系统 =====
 	regexp.MustCompile(`rm\s+-rf\s+/`),
 	regexp.MustCompile(`rm\s+-rf\s+\*`),
 	regexp.MustCompile(`rm\s+-rf\s+\.`),
@@ -63,27 +66,75 @@ var DangerousPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`shutdown`),
 	regexp.MustCompile(`init\s+0`),
 	regexp.MustCompile(`init\s+6`),
+
+	// ===== 反弹 shell / 远控 =====
 	regexp.MustCompile(`nmap\s+--`),
 	regexp.MustCompile(`hping`),
 	regexp.MustCompile(`netcat`),
 	regexp.MustCompile(`nc\s+-e`),
 	regexp.MustCompile(`/dev/tcp`),
 	regexp.MustCompile(`/dev/udp`),
+
+	// ===== 敏感路径访问 =====
 	regexp.MustCompile(`/etc/passwd`),
 	regexp.MustCompile(`/etc/shadow`),
 	regexp.MustCompile(`chmod\s+777\s+/etc`),
 	regexp.MustCompile(`chmod\s+777\s+/root`),
-	regexp.MustCompile(`curl\s+.*\|\s*sh`),
-	regexp.MustCompile(`wget\s+.*\|\s*sh`),
-	regexp.MustCompile(`curl\s+-s\s+http://.*\.sh`),
-	regexp.MustCompile(`wget\s+-O\s+-.*\.sh`),
 	regexp.MustCompile(`chmod\s+4755`),
 	regexp.MustCompile(`chown\s+root:root`),
 	regexp.MustCompile(`>\s*/dev/sd`),
 	regexp.MustCompile(`tee\s+/dev/`),
+
+	// ===== 远程脚本执行（curl/wget | sh） =====
+	regexp.MustCompile(`curl\s+.*\|\s*sh`),
+	regexp.MustCompile(`wget\s+.*\|\s*sh`),
+	regexp.MustCompile(`curl\s+-s\s+http://.*\.sh`),
+	regexp.MustCompile(`wget\s+-O\s+-.*\.sh`),
+
+	// ===== shell 元编程（eval/exec/fork） =====
 	regexp.MustCompile(`eval\s+`),
 	regexp.MustCompile(`exec\s+`),
 	regexp.MustCompile(`fork\s+`),
+
+	// ===== curl 兜底规则（与 allowed_unix.go 的 curl 描述配套） =====
+	//
+	// 1) 落盘行为：禁止 curl 写入任何文件
+	//    -o / --output / -O / --remote-name / --output-dir
+	//    重定向到文件 (curl ... > /xxx)
+	//    管道落盘 (curl ... | tee / dd > file)
+	regexp.MustCompile(`curl\s+.*-\s*o\s+\S`),             // -o file
+	regexp.MustCompile(`curl\s+.*--output\s`),             // --output file
+	regexp.MustCompile(`curl\s+.*--remote-name(\s|\=|$)`), // -O / --remote-name
+	regexp.MustCompile(`curl\s+.*--output-dir\s`),         // --output-dir
+	regexp.MustCompile(`curl\s+.*>\s*\S`),                 // 任意重定向到路径（含 > file 与 >/dev/null 等）
+	regexp.MustCompile(`curl\s+.*\|\s*tee\s`),             // curl | tee file
+	regexp.MustCompile(`curl\s+.*\|\s*dd\s`),              // curl | dd ...
+	regexp.MustCompile(`curl\s+.*&&\s*\S+\s*>.*\S`),       // curl ... && cmd > file
+
+	// 2) 敏感信息夹带（启发式；可在 description 基础上再加一层硬拦截）
+	//    URL 中带 user:pass@
+	regexp.MustCompile(`curl\s+.*://[^\s/]*:[^\s/@]+@`),
+	//    -H Authorization / Cookie / Proxy-Authorization
+	regexp.MustCompile(`curl\s+.*-H\s*['"]?\s*(Authorization|Cookie|Proxy-Authorization|X-Api-Key|X-Auth-Token)\b`),
+	//    URL 中带敏感 query 参数
+	regexp.MustCompile(`curl\s+.*[?&](token|api[_-]?key|password|secret|access[_-]?token|auth|sid)=`),
+	//    -d/-F/-T/-A 直接传疑似密码/私钥关键词（弱启发，避免误杀只提一句）
+	regexp.MustCompile(`curl\s+.*-(d|F|T)\s+['"]?[^'"\s]*\b(password|passwd|secret|token|api[_-]?key|private[_-]?key)\b`),
+
+	// 3) 内网 / loopback 探测
+	regexp.MustCompile(`curl\s+.*https?://127\.`),
+	regexp.MustCompile(`curl\s+.*https?://10\.\d{1,3}\.\d{1,3}\.\d{1,3}`),
+	regexp.MustCompile(`curl\s+.*https?://192\.168\.\d{1,3}\.\d{1,3}`),
+	regexp.MustCompile(`curl\s+.*https?://169\.254\.`),
+	regexp.MustCompile(`curl\s+.*https?://172\.(1[6-9]|2[0-9]|3[01])\.\d{1,3}\.\d{1,3}`),
+	regexp.MustCompile(`curl\s+.*https?://0\.0\.0\.0`),
+	regexp.MustCompile(`curl\s+.*https?://localhost\b`),
+
+	// ===== wget 兜底（与 curl 类似，禁止落盘到工作目录之外） =====
+	regexp.MustCompile(`wget\s+.*-O\s+/`), // wget -O /etc/xxx
+	regexp.MustCompile(`wget\s+.*--output-document=/`),
+	regexp.MustCompile(`wget\s+.*-P\s+/`),
+	regexp.MustCompile(`wget\s+.*--directory-prefix=/`),
 }
 
 // SensitivePaths 敏感路径
