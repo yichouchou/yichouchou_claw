@@ -366,19 +366,57 @@ func isCommandAllowed(cmd string) bool {
 	return ok
 }
 
-// splitByOperators 按 | 分割命令（不支持 && ||，只支持管道）
+// splitByOperators 按 shell 操作符分割命令：
+//   - 单 |        → 管道（stage 之间用 io.Pipe 连接）
+//   - || 和 &&    → 短路逻辑控制（每个 stage 独立执行，前一个的失败/成功决定是否执行下一个）
+//   - ;           → 顺序执行（每个 stage 独立执行）
+//
+// 关键：LLM 经常写 `which X || command -v X || echo "NOT_FOUND"` 这种短路 fallback。
+// 如果只按单 | 切分，|| 会被错误地当成 pipe，导致 `command -v X` 这个 stage 找不到 builtin 而失败。
+//
+// 注意：本函数只切分阶段，**不**真正实现 shell 的短路语义。
+// executeSingle / executeChain 在执行每个 stage 时是独立的（不依赖前一个 stage 的退出码）。
+// 如果需要严格的短路语义（"前一个失败才执行下一个"），请用 // executeWithShell 通过 /bin/sh -c 执行。
 func splitByOperators(cmd string) []string {
 	var result []string
 	var current bytes.Buffer
 	var i int
 
 	for i < len(cmd) {
-		if i+1 < len(cmd) && cmd[i] == '|' && cmd[i+1] != '&' {
+		// || (双竖线)
+		if i+1 < len(cmd) && cmd[i] == '|' && cmd[i+1] == '|' {
 			if current.Len() > 0 {
 				result = append(result, current.String())
 				current.Reset()
 			}
 			i += 2
+			continue
+		}
+		// && (双 &)
+		if i+1 < len(cmd) && cmd[i] == '&' && cmd[i+1] == '&' {
+			if current.Len() > 0 {
+				result = append(result, current.String())
+				current.Reset()
+			}
+			i += 2
+			continue
+		}
+		// ; (单分号)
+		if cmd[i] == ';' {
+			if current.Len() > 0 {
+				result = append(result, current.String())
+				current.Reset()
+			}
+			i++
+			continue
+		}
+		// 单 | (管道) — 必须在 || 检查之后
+		if cmd[i] == '|' {
+			if current.Len() > 0 {
+				result = append(result, current.String())
+				current.Reset()
+			}
+			i++
 			continue
 		}
 		current.WriteByte(cmd[i])
@@ -388,6 +426,43 @@ func splitByOperators(cmd string) []string {
 		result = append(result, current.String())
 	}
 	return result
+}
+
+// hasShellLogic 检查命令是否包含短路/顺序控制符（|| && ;）。
+// 这些操作符无法在沙箱"按 stage 独立执行"的模型下实现严格的语义，
+// 所以遇到时整条命令会通过 /bin/sh -c 包装执行（shell 自带正确的短路语义）。
+//
+// 引号内的 || / && / ; 会被忽略（视为字符串内容）。
+func hasShellLogic(cmd string) bool {
+	for i := 0; i < len(cmd); i++ {
+		// 跳过单引号内的内容（单引号内所有字符都是字面量）
+		if cmd[i] == '\'' {
+			i++
+			for i < len(cmd) && cmd[i] != '\'' {
+				i++
+			}
+			continue
+		}
+		// 跳过双引号内的内容（双引号内大部分字符字面量，$ 反引号除外）
+		if cmd[i] == '"' {
+			i++
+			for i < len(cmd) && cmd[i] != '"' {
+				// 双引号内 $ ` \ 仍可能被 shell 解释，但为简化判断，统一跳过
+				i++
+			}
+			continue
+		}
+		if i+1 < len(cmd) && cmd[i] == '|' && cmd[i+1] == '|' {
+			return true
+		}
+		if i+1 < len(cmd) && cmd[i] == '&' && cmd[i+1] == '&' {
+			return true
+		}
+		if cmd[i] == ';' {
+			return true
+		}
+	}
+	return false
 }
 
 // CommandStage 命令阶段
@@ -449,6 +524,68 @@ func executeSingle(ctx context.Context, cmd string, argv []string) (*CommandOutp
 		ExitCode: exitCode,
 		Duration: duration.String(),
 	}, nil
+}
+
+// executeWithShell 通过 /bin/sh -c 包装执行整条命令。
+//
+// 用途：当命令包含 shell 短路/顺序控制符（|| / && / ;）时，
+// 沙箱无法靠"按 stage 独立执行"模拟正确的语义，必须交给真正的 shell 来解释。
+//
+// 安全：
+//   - 执行前已经过 IsDangerousWithContext 检查（硬禁止已拦截 eval/exec/fork 等）
+//   - /bin/sh -c 本身在硬禁止之外，但配合 shellLogic 检测 + 授权机制，可控
+//   - 沙箱环境变量、工作目录、超时仍生效
+func executeWithShell(ctx context.Context, cmd string) (*CommandOutput, error) {
+	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	execCmd := exec.CommandContext(execCtx, "/bin/sh", "-c", cmd)
+	execCmd.Env = sandboxEnv()
+	execCmd.Dir = sandboxWorkDir()
+	execCmd.Stdin = nil
+	execCmd.SysProcAttr = platformSysProcAttr()
+
+	var stdout, stderr bytes.Buffer
+	execCmd.Stdout = &stdout
+	execCmd.Stderr = &stderr
+
+	start := time.Now()
+	err := execCmd.Run()
+	duration := time.Since(start)
+
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			// /bin/sh 启动失败（例如 Windows 上不存在）
+			exitCode = -1
+		}
+	}
+
+	out := &CommandOutput{
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+		ExitCode: exitCode,
+		Duration: duration.String(),
+	}
+
+	// 平台提示：如果命令找不到（Windows 上常见的 Linux 工具），附加解释。
+	if out.ExitCode != 0 && looksLikeMissingExecutable(out.Stderr) {
+		// 提取首个命令名（粗略）
+		argv := strings.Fields(cmd)
+		if len(argv) > 0 {
+			hint := platformHintFor(argv[0])
+			if hint != "" {
+				out.Stderr += "\n\n[平台提示]\n" + hint
+			}
+			commandHint := commandNotFoundHint(argv[0], out.Stderr)
+			if commandHint != "" {
+				out.Stderr += "\n\n" + commandHint
+			}
+		}
+	}
+	return out, nil
 }
 
 // executeWithPipes 使用管道连接多个命令
@@ -561,6 +698,13 @@ func Execute(ctx context.Context, input *CommandInput) (*CommandOutput, error) {
 		authDesc = fmt.Sprintf("Install=%v,Bash=%v,By=%s", auth.Install, auth.Bash, auth.GrantedBy)
 	}
 	log.Printf("[LocalCommand][%s][auth=%s] Executing: %s", PlatformName, authDesc, cmd)
+
+	// 包含短路/顺序控制符（|| && ;）时，整条命令必须用 /bin/sh -c 包装执行，
+	// 否则 splitByOperators 会把 || 当成单 | 拆分，导致后续 stage 找不到 builtin
+	// （典型场景：which gh || command -v gh || echo NOT_FOUND）
+	if hasShellLogic(cmd) {
+		return executeWithShell(ctx, cmd)
+	}
 
 	// 解析命令链
 	parts := splitByOperators(cmd)
