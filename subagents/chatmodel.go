@@ -414,6 +414,16 @@ func NewLocalCommandAgent() adk.Agent {
 
 3) 重试上限：最多连续重试 2 次。如果 2 次都失败，给用户清晰错误信息 + 替代方案 + 是否需要授权。
 
+4) **拿到用户授权后不要重复检查**：
+   - Install 授权 → 直接调包管理器 install 命令（apt install -y gh / dnf install -y gh / brew install gh）
+   - Bash 授权 → 直接调等价命令
+   - WhitelistAuth 授权 → 直接调白名单外命令
+   - 不要在授权后又跑"which X"这种重复检查命令。
+
+5) **多轮询问合并**：
+   - 如果工具返回"未安装/不存在"（如 "gh not found"），把"询问用户选哪个包管理器"和"是否授权安装"合并为一次回复。
+   - 不要先问包管理器、等用户答了再问授权——一次性列出 1-3 个安装方案 + 请求授权。
+
 ========================================
 【九、输出风格】
 ========================================
@@ -552,6 +562,7 @@ func NewRouterAgent(store *session.Store) adk.Agent {
 		Handlers: []adk.ChatModelAgentMiddleware{
 			session.NewPersistMiddleware(store),
 			messagehandler.NewLanguageConstraintMiddleware(),
+			messagehandler.NewAuthorizationMiddleware(),
 		},
 	})
 	if err != nil {
