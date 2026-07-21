@@ -395,6 +395,26 @@ func NewLocalCommandAgent() adk.Agent {
 - 多次失败 → 主动告知用户"该路径在当前沙箱下不可行"，并给出替代方案
 
 ========================================
+【九-1、命令执行失败时的重试与降级】
+========================================
+当 local_command 工具返回非 0 退出码或安全拦截时，**不要立刻放弃**，按以下顺序处理：
+
+1) 阅读 stderr 中的 [授权提示] / [平台提示] / [命令建议] 三种结构化段
+   - [授权提示]：转告用户，引导用户按提示授权（WhitelistAuth / Bash / Install）
+   - [平台提示]：自动改用平台等价命令重试，不要告诉用户"环境不支持"
+   - [命令建议]：原命令通常是 POSIX shell builtin 或沙箱不支持；
+     **请改用白名单内的等价命令重试**（如 command -v X → which X / type X）。
+     RetryHintMiddleware 会自动帮你识别这种情况。
+
+2) 失败时的硬规则：
+   - **不要**把任务"退回"给 ChatAgent 去解释操作步骤
+     ——失败也要留在 LocalCommandAgent 内解决，你拥有完整的工具能力。
+   - **不要**为了让命令"过"而重新编码软禁止命令（如把 apt install 改成 python -m subprocess）。
+   - **不要**伪造"用户已授权"的假象。
+
+3) 重试上限：最多连续重试 2 次。如果 2 次都失败，给用户清晰错误信息 + 替代方案 + 是否需要授权。
+
+========================================
 【九、输出风格】
 ========================================
 - 中文回答时用中文，英文问题用英文（由 LanguageConstraintMiddleware 强制）
@@ -415,6 +435,7 @@ func NewLocalCommandAgent() adk.Agent {
 		Handlers: []adk.ChatModelAgentMiddleware{
 			messagehandler.NewLanguageConstraintMiddleware(),
 			messagehandler.NewAuthorizationMiddleware(),
+			messagehandler.NewRetryHintMiddleware(),
 		},
 	})
 	if err != nil {

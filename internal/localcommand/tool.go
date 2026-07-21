@@ -611,6 +611,11 @@ func Execute(ctx context.Context, input *CommandInput) (*CommandOutput, error) {
 		if hint != "" {
 			out.Stderr += "\n\n[平台提示]\n" + hint
 		}
+		// 命令建议：附加"为什么找不到 + 该怎么重试"，由 LLM 决定用什么等价工具
+		commandHint := commandNotFoundHint(stages[0].Argv[0], out.Stderr)
+		if commandHint != "" {
+			out.Stderr += "\n\n" + commandHint
+		}
 	}
 	return out, nil
 }
@@ -703,6 +708,82 @@ func looksLikeMissingExecutable(stderr string) bool {
 // 由 platform_hint.go 在 build 时提供；Linux 上始终返回空（不需要提示）。
 func platformHintFor(cmdName string) string {
 	return hintForCommand(cmdName)
+}
+
+// commandNotFoundHint 当命令找不到（如 POSIX shell builtin）时，给 LLM 一个
+// "为什么失败 + 建议你换什么工具重试"的语义化提示。
+//
+// 注意：这里**不预设**具体等价命令，而是把"沙箱不支持"这个事实告诉 LLM，
+// 由 LLM 根据工具描述（白名单速查表）自己决定用什么等价命令。
+//
+// 返回空字符串表示不附加建议（让 LLM 走原始错误信息）。
+func commandNotFoundHint(cmdName string, stderr string) string {
+	s := strings.ToLower(stderr)
+
+	// 1) POSIX shell builtin / 无独立可执行文件
+	// 典型错误："exec: \"command\": executable file not found in $PATH"
+	//         "is not recognized as an internal or external command"
+	//         "command not found"
+	builtinHints := []string{
+		"executable file not found",
+		"is not recognized as",
+		"command not found",
+		"no such file or directory",
+	}
+	isBuiltinFailure := false
+	for _, h := range builtinHints {
+		if strings.Contains(s, h) {
+			isBuiltinFailure = true
+			break
+		}
+	}
+	if !isBuiltinFailure {
+		return ""
+	}
+
+	// POSIX shell builtin 列表（沙箱内 exec.CommandContext 找不到独立二进制）
+	posixBuiltins := map[string]bool{
+		"command": true, "builtin": true,
+		"echo": true, "printf": true, "pwd": true,
+		"test": true, "[": true, "true": true, "false": true,
+		"cd": true, "set": true, "unset": true, "export": true,
+		"local": true, "read": true, "trap": true, "wait": true,
+		"jobs": true, "ulimit": true, "umask": true,
+		"kill": true, "logout": true, "hash": true, "help": true,
+		"history": true, "let": true, "mapfile": true, "readarray": true,
+		"shopt": true, "source": true, ".": true, "alias": true,
+	}
+
+	if !posixBuiltins[cmdName] {
+		// 不是 POSIX builtin，可能是平台不支持或其他未知错误
+		return fmt.Sprintf(
+			"[命令建议] 命令 %q 在当前环境不可执行（stderr: %s）。\n"+
+				"请 LLM 判断：是否要换一个等价工具重试？\n"+
+				"如果是平台/架构差异，请改用本平台允许的等价命令；如果是用户输入错误，请直接告知用户。",
+			cmdName, firstLine(stderr))
+	}
+
+	// 是 POSIX shell builtin
+	return fmt.Sprintf(
+		"[命令建议] 命令 %q 是 POSIX shell builtin，没有独立的可执行文件，"+
+			"沙箱无法通过 exec.CommandContext 直接执行它。\n"+
+			"建议改用白名单内具有等价语义的外部命令重试（例如：command -v X → which X；"+
+			"[ -f file ] → test -f file；具体等价请参考工具描述中的\"白名单分组速查\"）。",
+		cmdName)
+}
+
+// firstLine 返回 stderr 的第一行（去除前后空格）。
+func firstLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			if len(line) > 200 {
+				return line[:200] + "..."
+			}
+			return line
+		}
+	}
+	return ""
 }
 
 // GetAllowedCommands 返回允许的命令列表（带当前平台标识，方便 LLM 区分）
