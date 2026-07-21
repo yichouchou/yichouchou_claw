@@ -18,22 +18,27 @@
 yichouchou_claw/
 ├── main.go                    # 应用入口，Hertz 服务器启动，路由配置
 ├── adk/                       # Agent Development Kit（公共组件库）
-│   └── common/
-│       ├── model/
-│       │   └── chat_model.go  # LLM 模型封装，支持 OpenAI/Ark 自适应切换
-│       ├── store/
-│       │   └── store.go       # 内存版 CheckPointStore（GraphTool 断点续存）
-│       ├── trace/
-│       │   └── coze_loop.go   # CozeLoop 链路追踪集成
-│       ├── prints/
-│       │   └── util.go        # Agent 事件日志打印工具
-│       └── tool/              # 通用 Tool 封装
-│           ├── approval_wrapper.go   # 工具调用审批包装器
-│           ├── follow_up_tool.go     # 用户追问中断工具
-│           ├── review_edit_wrapper.go# 工具调用复核编辑包装器
-│           └── graphtool/
-│               ├── graph_tool.go     # GraphTool 核心实现（支持断点续存）
-│               └── examples/         # GraphTool 使用示例
+│   ├── common/
+│   │   ├── model/
+│   │   │   └── chat_model.go  # LLM 模型封装，支持 OpenAI/Ark 自适应切换
+│   │   ├── store/
+│   │   │   └── store.go       # 内存版 CheckPointStore（GraphTool 断点续存）
+│   │   ├── trace/
+│   │   │   └── coze_loop.go   # CozeLoop 链路追踪集成
+│   │   ├── prints/
+│   │   │   └── util.go        # Agent 事件日志打印工具
+│   │   └── tool/              # 通用 Tool 封装
+│   │       ├── approval_wrapper.go   # 工具调用审批包装器
+│   │       ├── follow_up_tool.go     # 用户追问中断工具
+│   │       ├── review_edit_wrapper.go# 工具调用复核编辑包装器
+│   │       └── graphtool/
+│   │           ├── graph_tool.go     # GraphTool 核心实现（支持断点续存）
+│   │           └── examples/         # GraphTool 使用示例（4个场景）
+│   └── middlewares/
+│       ├── messageHandler/
+│       │   └── middleware.go  # 消息处理中间件
+│       └── dynamictool/       # 动态工具发现与加载
+│           └── toolsearch/
 ├── internal/                  # 项目核心模块
 │   ├── session/
 │   │   ├── store.go           # 会话存储（内存版，支持多轮上下文窗口）
@@ -42,8 +47,10 @@ yichouchou_claw/
 │   │   └── streamMessageOutput.go # SSE 事件转换与发送
 │   ├── logs/
 │   │   └── logger.go          # 带颜色的日志工具
-│   └── gptr/
-│       └── ptr.go             # 泛型指针辅助函数
+│   ├── gptr/
+│   │   └── ptr.go             # 泛型指针辅助函数
+│   └── localcommand/
+│       └── tool.go            # LocalCommandTool - 沙箱化本地命令执行工具（白名单机制）
 ├── subagents/
 │   └── chatmodel.go           # Agent 定义：RouterAgent / ChatAgent / WeatherAgent
 ├── index.html                 # Web 演示页面
@@ -72,6 +79,8 @@ yichouchou_claw/
 - **多模型支持**：OpenAI API / Ark API 一键切换
 - **会话持久化**：通过 `AfterAgent` 钩子同步 SDK 内部完整 messages，避免 tool_call_id 错位
 - **Web 演示页面**：内置 `index.html`，打开浏览器即可体验
+- **沙箱化本地命令执行**：LocalCommandTool 提供 40+ 白名单命令（ls, cat, ps, curl 等），支持管道串联（cmd1 | cmd2 | cmd3），进程级沙箱隔离与超时控制
+- **安全命令白名单**：journalctl, dmesg, ss, dig, nslookup, traceroute, gzip, gunzip, md5sum, sha256sum, watch, base64, jq, crontab 等系统诊断工具
 
 ## 快速开始
 
