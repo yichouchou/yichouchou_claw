@@ -147,6 +147,14 @@ func (m *AuthorizationMiddleware) BeforeModelRewriteState(
 	// 生效，而 tool 调用走的是 graph 根 ctx，必须通过 session values 才能传递
 	localcommand.WriteAuthorizationToSession(ctx, auth)
 
+	// DEBUG: 验证 session 写入后可读
+	if sessAuth, ok := localcommand.ReadAuthorizationFromSession(ctx); ok {
+		log.Printf("[AuthorizationMiddleware] VERIFY: session has auth Install=%v Bash=%v ExpiresAt=%v",
+			sessAuth.Install, sessAuth.Bash, sessAuth.ExpiresAt.Format("15:04:05"))
+	} else {
+		log.Printf("[AuthorizationMiddleware] VERIFY: session READ returned no auth (may be expected if ctx lacks runSession)")
+	}
+
 	log.Printf("[AuthorizationMiddleware] Wrote AuthorizationScope to ctx+session: Install=%v Bash=%v WhitelistAuth=%v WhitelistCmd=%q ExpiresAt=%v GrantedBy=%s",
 		auth.Install, auth.Bash, auth.WhitelistAuth, auth.WhitelistCmd, auth.ExpiresAt.Format("15:04:05"), auth.GrantedBy)
 
@@ -156,6 +164,19 @@ func (m *AuthorizationMiddleware) BeforeModelRewriteState(
 		if msg.Role == schema.System {
 			if !strings.Contains(msg.Content, notice) {
 				msg.Content += notice
+			}
+			break
+		}
+	}
+
+	// 【关键修复】把授权提示插入到"用户消息"开头，强制 LLM 在每次回应前都看到。
+	// 只放 system prompt 末尾容易被 LLM 忽略；放到最新 user message 开头最醒目。
+	authAckTag := formatAuthAckTag(auth)
+	for i := len(state.Messages) - 1; i >= 0; i-- {
+		msg := state.Messages[i]
+		if msg.Role == schema.User {
+			if !strings.HasPrefix(msg.Content, authAckTag) {
+				msg.Content = authAckTag + msg.Content
 			}
 			break
 		}
@@ -277,6 +298,29 @@ func formatAuthNotice(a localcommand.AuthorizationScope) string {
 	exp := a.ExpiresAt.Format("15:04:05")
 	scope := strings.Join(parts, "+")
 	return "\n\n[系统提示] 用户已授权 " + scope + " 授权（至 " + exp + "）。本次会话内相关的安装/写操作/白名单外命令可以自动放行；硬禁止命令仍然不能执行。"
+}
+
+// formatAuthAckTag 生成"插入到用户消息开头"的强制授权提示。
+// 比 formatAuthNotice 更醒目 —— 直接放在 user message 的开头，让 LLM 在生成
+// 每轮回应前必然看到，不会因为 system prompt 太长而被忽略。
+func formatAuthAckTag(a localcommand.AuthorizationScope) string {
+	var parts []string
+	if a.Install {
+		parts = append(parts, "Install")
+	}
+	if a.Bash {
+		parts = append(parts, "Bash")
+	}
+	if a.WhitelistAuth {
+		if a.WhitelistCmd != "" {
+			parts = append(parts, "Whitelist("+a.WhitelistCmd+")")
+		} else {
+			parts = append(parts, "Whitelist(*)")
+		}
+	}
+	exp := a.ExpiresAt.Format("15:04:05")
+	scope := strings.Join(parts, "+")
+	return "[授权已生效] " + scope + " 授权（至 " + exp + "）。**你已经获得授权，可以直接执行相关操作；不要再询问用户授权问题；不要再做重复检查（如 which/command -v）。** "
 }
 
 // init 把 eino adk session 操作函数注入到 localcommand 包。

@@ -420,6 +420,12 @@ func NewLocalCommandAgent() adk.Agent {
    - WhitelistAuth 授权 → 直接调白名单外命令
    - 不要在授权后又跑"which X"这种重复检查命令。
 
+4-1) **【硬规则】一旦系统提示中出现 "[授权已生效] Install 授权"，下次工具调用必须是安装命令**：
+    - 不要再跑 which X / command -v X / type X / [ -f X ] 这类"存在性检查"
+    - 直接调 apt-get install -y pkg / dnf install -y pkg / brew install pkg / apt install -y pkg 等
+    - 如果上一轮已经确认"未安装/不存在"，且本轮已收到 Install 授权，**强制执行安装命令**，不允许再次"先确认一下"
+    - 例外：如果工具结果明确说明安装已经成功（exit=0，输出含 installed/已安装），则按用户最终意图回复
+
 5) **多轮询问合并**：
    - 如果工具返回"未安装/不存在"（如 "gh not found"），把"询问用户选哪个包管理器"和"是否授权安装"合并为一次回复。
    - 不要先问包管理器、等用户答了再问授权——一次性列出 1-3 个安装方案 + 请求授权。

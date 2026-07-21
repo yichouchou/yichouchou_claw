@@ -695,7 +695,11 @@ func Execute(ctx context.Context, input *CommandInput) (*CommandOutput, error) {
 		authDesc = fmt.Sprintf("Install=%v,Bash=%v,Whitelist=%v,Valid=%v,ExpiresAt=%v,By=%s",
 			auth.Install, auth.Bash, auth.WhitelistAuth, auth.Valid(Now()), auth.ExpiresAt.Format("15:04:05"), auth.GrantedBy)
 	}
-	log.Printf("[LocalCommand][%s][auth=%s] Executing: %s", PlatformName, authDesc, cmd)
+	// DEBUG: 检查 session 是否可读
+	sessAuth, sessOK := ReadAuthorizationFromSession(ctx)
+	ctxAuth := AuthorizationFromContext(ctx)
+	log.Printf("[LocalCommand][%s][auth=%s][DEBUG: ctx.Install=%v session.OK=%v session.Install=%v] Executing: %s",
+		PlatformName, authDesc, ctxAuth.Install, sessOK, sessAuth.Install, cmd)
 
 	// 包含短路/顺序控制符（|| && ;）时，整条命令必须用 /bin/sh -c 包装执行，
 	// 否则 splitByOperators 会把 || 当成单 | 拆分，导致后续 stage 找不到 builtin
