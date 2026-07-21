@@ -23,12 +23,14 @@ import (
 
 // AuthorizationScope 描述用户授权沙箱放宽限制的范围。
 //
-// 授权分两类（可叠加）：
-//   - Install: 允许"安装类"命令（apt/yum/dnf install、pip install、
-//     npm install、go install、dpkg -i、rpm -i、curl/wget 下载安装包等）。
-//   - Bash:    允许"通用 bash"放宽，除"硬禁止"区之外的所有命令都可执行。
+// 授权分三类（可叠加）：
+//   - Install:      允许"安装类"命令（apt/yum/dnf install、pip install、
+//     npm install、go install、dpkg -i、rpm -i 等）。
+//   - Bash:         允许"通用 bash"放宽；除硬禁止外任何命令都可执行。
+//   - WhitelistAuth: 允许"白名单外的单个命令"放行；用于临时允许某个不常见
+//     但用户明确要求的命令（例如 command -v 等 POSIX builtin）。
 //
-// 两类授权都受 ExpiresAt 控制，过期后自动失效；都要求 GrantedBy 非空
+// 三类授权都受 ExpiresAt 控制，过期后自动失效；都要求 GrantedBy 非空
 // （通常是用户的 user id / session id），便于审计。
 //
 // 注意：AuthorizationScope 只能放宽"软禁止"模式；
@@ -39,6 +41,10 @@ type AuthorizationScope struct {
 	Install bool
 	// Bash 授权"通用 bash"放宽
 	Bash bool
+	// WhitelistAuth 授权"白名单外命令"放行（针对单个不在白名单的命令）
+	WhitelistAuth bool
+	// WhitelistCmd 被授权放行的具体命令名（可选；如果为空则放行所有白名单外命令）
+	WhitelistCmd string
 	// ExpiresAt 授权过期时间，零值表示不过期（不推荐）
 	ExpiresAt time.Time
 	// GrantedBy 谁授权的（user id / session id / 备注）
@@ -55,9 +61,9 @@ func (a AuthorizationScope) Valid(now time.Time) bool {
 	return now.Before(a.ExpiresAt)
 }
 
-// IsEmpty 判断授权是否完全为空（两个开关都未开启）。
+// IsEmpty 判断授权是否完全为空（三个开关都未开启）。
 func (a AuthorizationScope) IsEmpty() bool {
-	return !a.Install && !a.Bash
+	return !a.Install && !a.Bash && !a.WhitelistAuth
 }
 
 // authContextKey 用于把 AuthorizationScope 存入 context.Value。

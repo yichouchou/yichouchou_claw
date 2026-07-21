@@ -172,9 +172,13 @@ B. 【需要 Bash 授权才放行】其它受限操作：
 - 用户在对话中表达授权意图后，[AuthorizationMiddleware] 会自动识别并写入 AuthorizationScope：
     Install 授权关键词："授权安装"、"可以安装"、"授权装包"、"i authorize install"、"auth: install" 等
     Bash 授权关键词："授权 bash"、"授权执行脚本"、"可以跑 bash"、"i authorize bash"、"auth: bash" 等
+    WhitelistAuth 授权关键词（白名单外的命令）："我授权白名单放宽"、"授权白名单"、"授权运行 <cmd>"、
+                                                "whitelist auth" / "auth whitelist" / "i authorize whitelist" /
+                                                "auth <cmd>" 等
 - 授权有效期 10 分钟；到期后需重新授权
 - 当 local_command 工具被软禁止拒绝时，stderr 会附 "[授权提示]" 段，告诉用户应该怎么说授权
 - 你（LLM）应该把这个 [授权提示] 直接转述给用户，引导用户用自然语言授权
+- 对于"白名单外的命令"（如 command -v 这种 POSIX builtin），**引导用户授权 WhitelistAuth** 后重试
 
 ========================================
 【五、curl 的合法用法（无需授权）】
@@ -210,7 +214,7 @@ B. 【需要 Bash 授权才放行】其它受限操作：
 - 文件搜索：stat locate which type xargs realpath readlink
 - 时间同步：timedatectl chronyc ntpq
 - 开发工具链：go gofmt goimports golangci-lint gopls python python3 pip pip3 uv poetry pdm conda node npm pnpm yarn git svn hg gh gcc g++ clang make cmake cargo rustc javac java mvn gradle php composer shellcheck
-- 辅助：env set alias history man tldr whatis apropos whereis
+- 辅助：env set alias history man tldr whatis apropos whereis command
 
 ========================================
 【七、典型工作流示例】
@@ -332,6 +336,11 @@ func NewLocalCommandAgent() adk.Agent {
 【Bash 授权】通用授权，覆盖除硬禁止外所有软禁止（chmod、rm 文件、curl 落盘等）
 - 中文："授权 bash"、"授权执行脚本"、"可以跑 bash"、"可以执行 shell"
 - 英文："i authorize bash"、"bash auth granted"、"grant bash permission"、"auth: bash"
+
+【WhitelistAuth 授权】用于放行白名单外的命令（如 POSIX builtin command -v、某些不在白名单的开发工具等）
+- 中文："我授权白名单放宽"、"授权白名单"、"授权运行 <cmd>"、"我授权 <cmd>"、"放行"
+- 英文："whitelist auth"、"auth whitelist"、"i authorize whitelist"、"auth <cmd>"
+- 如果用户授权时指定了命令名（"授权运行 gh"），仅放行该命令；未指定则放行任意白名单外命令
 
 授权有效期 10 分钟，到期后自动失效（需重新授权）。
 

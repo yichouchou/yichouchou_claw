@@ -174,6 +174,7 @@ var AllowedCommands = map[string]string{
 	"locate":   "基于数据库的全盘快速文件查找（需 updatedb 仅管理员可建库）",
 	"which":    "定位可执行文件路径",
 	"type":     "判断命令类型（alias/builtin/function/file）",
+	"command":  "POSIX shell builtin，配合 -v/-V 定位可执行文件，等价于 which/type；其他用法见 builtin 白名单",
 	"xargs":    "从标准输入构造命令行参数，配合 grep/find 做批量处理，禁止 rm 等危险命令",
 	"realpath": "解析符号链接的真实绝对路径",
 	"readlink": "读取符号链接目标",

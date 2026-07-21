@@ -265,7 +265,10 @@ func IsDangerous(cmd string) (bool, string) {
 //     - Bash=true → 放行
 //     - Install=true 且是 install 类规则 → 放行
 //     - 否则 → 拒绝（ErrAuthMissing）
-//  4. 未命中 → 放行
+//  4. 未命中白名单 → 检查 ctx 中的 AuthorizationScope.WhitelistAuth
+//     - WhitelistAuth=true 且 (WhitelistCmd 为空或等于命令名) → 放行
+//     - 否则 → 拒绝（ErrNotInWhitelist）
+//  5. 未命中 → 放行
 func IsDangerousWithContext(ctx context.Context, cmd string) (bool, string) {
 	// 1) 硬禁止：永远拒绝
 	if dangerous, reason := IsHardForbidden(cmd); dangerous {
@@ -303,6 +306,16 @@ func IsDangerousWithContext(ctx context.Context, cmd string) (bool, string) {
 		return true, fmt.Sprintf(
 			"软禁止模式 %s 需要用户授权（需要 Bash 授权或 Install 授权）",
 			pattern.String())
+	}
+
+	// 4) 白名单检查：命令不在白名单时，需要 WhitelistAuth 授权才能放行
+	if !isCommandAllowed(cmd) && !strings.Contains(cmd, "/") {
+		cmdName := strings.Fields(cmd)[0]
+		// WhitelistAuth=true 且（未指定具体命令 OR 指定的就是这条命令）→ 放行
+		if auth.WhitelistAuth && (auth.WhitelistCmd == "" || auth.WhitelistCmd == cmdName) {
+			return false, ""
+		}
+		return true, fmt.Sprintf("命令不在白名单中: %s", cmdName)
 	}
 
 	return false, ""
@@ -567,25 +580,11 @@ func Execute(ctx context.Context, input *CommandInput) (*CommandOutput, error) {
 			continue
 		}
 
-		// 检查白名单
-		if !isCommandAllowed(part) && !strings.Contains(part, "/") {
-			stderr := fmt.Sprintf(
-				"命令不在白名单中: %s\n"+
-					"当前平台: %s\n"+
-					"提示：白名单是平台相关的，请使用 %s 平台等价的命令。"+
-					"可调用 GetAllowedCommands() 查看本平台所有允许的命令。",
-				argv[0], PlatformName, PlatformName)
-			return &CommandOutput{
-				Stdout:   "",
-				Stderr:   stderr,
-				ExitCode: -1,
-				Duration: "0s",
-			}, ErrNotInWhitelist
-		}
-
 		// 安全检查（带授权感知）
+		// 白名单未命中会被 IsDangerousWithContext 当作软禁止处理，
+		// 由 AuthorizationScope.WhitelistAuth 授权后即可放行。
 		if dangerous, reason := IsDangerousWithContext(ctx, part); dangerous {
-			hint := authorizationHint(reason, auth, part)
+			hint := authorizationHint(reason, AuthorizationFromContext(ctx), part)
 			return &CommandOutput{
 				Stdout:   "",
 				Stderr:   fmt.Sprintf("安全拦截: %s\n%s", reason, hint),
@@ -625,6 +624,28 @@ func authorizationHint(reason string, auth AuthorizationScope, cmd string) strin
 	// 敏感路径直接拒绝
 	if strings.HasPrefix(reason, "禁止访问敏感路径") {
 		return fmt.Sprintf("[授权提示] 该命令访问了敏感路径，即便授权也不会放行。")
+	}
+	// 白名单未命中：建议 WhitelistAuth 授权
+	if strings.HasPrefix(reason, "命令不在白名单中") {
+		cmdName := strings.Fields(cmd)[0]
+		if auth.IsEmpty() {
+			return fmt.Sprintf(
+				`[授权提示] 命令 %q 不在本平台白名单中。`+
+					`请用户在对话中明确授权，例如："授权运行 %s" / "我授权 %s" / "whitelist auth for %s" / "auth whitelist"。`+
+					`授权后我会自动重试执行。`,
+				cmdName, cmdName, cmdName, cmdName)
+		}
+		if !auth.WhitelistAuth {
+			return fmt.Sprintf(
+				`[授权提示] 当前仅有 Install / Bash 授权，不含 WhitelistAuth。请用户授权白名单：`+
+					`"我授权运行 %s" / "whitelist auth for %s"。`,
+				cmdName, cmdName)
+		}
+		if auth.WhitelistAuth && auth.WhitelistCmd != "" && auth.WhitelistCmd != cmdName {
+			return fmt.Sprintf(
+				`[授权提示] 当前 WhitelistAuth 仅授权 %q，不含 %q。请用户追加授权或改为通用白名单放宽。`,
+				auth.WhitelistCmd, cmdName)
+		}
 	}
 	// 软禁止：按需建议授权类型
 	if auth.IsEmpty() {
