@@ -158,7 +158,22 @@ var SoftForbiddenPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(yum|dnf)\s+(install|remove|erase|upgrade|update|downgrade|autoremove)\b`),
 	regexp.MustCompile(`pacman\s+-S`),
 	regexp.MustCompile(`zypper\s+(install|remove|in|rm|up|update|patch)\b`),
-	regexp.MustCompile(`emerge\s+(?!--pretend|-pv|--search|--info|--sync|--oneshot)`),
+	// emerge：Gentoo 包管理器。Go regexp（RE2）不支持 (?!...) 前瞻，
+	// 且 Go 的 \b 在 space ↔ '-' 之间不触发（'-' 是 non-word），
+	// 所以这里用显式"空格后跟 -"代替 \b。
+	// 1) 带破坏性深度变更标志：--fetchall / --newuse / --newbin / --deep / --with-bdeps / --autounmask* / --backtrack=
+	regexp.MustCompile(`\bemerge\s+(?:-{1,2}[a-zA-Z0-9-]+=?\s+)*(?:--fetchall|--newuse|--newbin|--deep|--with-bdeps|--autounmask|--autounmask-write|--backtrack=)\b`),
+	// 2) 卸载相关：--unmerge / --prune / --depclean / --clean
+	regexp.MustCompile(`\bemerge\s+(?:-{1,2}[a-zA-Z0-9-]+=?\s+)*(?:--unmerge|--prune|--depclean|--clean)\b`),
+	// 3) 显式 install / 一次性安装 / noreplace / 重建：--noreplace / --with- / --oneshot / --emptytree
+	regexp.MustCompile(`\bemerge\s+(?:-{1,2}[a-zA-Z0-9-]+=?\s+)*(?:--noreplace|--with-|--oneshot|--emptytree)\b`),
+	// 4) -C / -c / -1 等短选项触发
+	regexp.MustCompile(`\bemerge\s+-[a-zA-Z]*[1cC]`),
+	// 5) "emerge <包名>" 安装形式（emerge 后面跟着非选项的标识符/原子名/包名）
+	//    pkg 名不是 - 开头（避免命中 -pv 等查询选项）
+	regexp.MustCompile(`\bemerge\s+([^-/][a-zA-Z0-9+_.@-]*)(?:\s|$)`),
+	// 6) "emerge <category>/<pkg>" 完整原子名（Gentoo 分类形式）
+	regexp.MustCompile(`\bemerge\s+([a-zA-Z0-9+_.-]+/[a-zA-Z0-9+_.-]+)(?:\s|$)`),
 	regexp.MustCompile(`nix-env\s+-i`),
 	regexp.MustCompile(`brew\s+(install|uninstall|upgrade|reinstall|link|untap|tap)\b`),
 	regexp.MustCompile(`rpm\s+-i`),
