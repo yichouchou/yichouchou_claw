@@ -61,7 +61,7 @@ func main() {
 		Agent:           a,
 	})
 
-	h := server.Default(server.WithHostPorts(":28080"))
+	h := server.Default(server.WithHostPorts(":8080"))
 
 	h.GET("/index.html", func(ctx context.Context, c *app.RequestContext) {
 		data, err := staticFiles.ReadFile("index.html")

@@ -32,7 +32,7 @@ var AllowedCommands = map[string]string{
 	"top":        "实时查看CPU/内存进程占用，交互式工具，执行超时自动终止",
 	"netstat":    "查看本机TCP/UDP监听端口、网络连接、路由状态，网络排查只读",
 	"ping":       "ICMP网络连通性探测，测试目标IP/域名延迟与丢包，网络诊断",
-	"curl":       "发起HTTP/HTTPS网络请求，仅GET只读查询，禁止上传/修改接口、内网高危地址",
+	"curl":       "发起 HTTP/HTTPS 请求工具。【允许】任意 HTTP 方法（GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS 等）用于与合法服务进行接口调试；【禁止】以下行为：①在请求 URL、请求头（-H/--header）、请求体（-d/--data/--data-raw/--data-binary/-F/--form/-T/--upload-file 等）中夹带敏感信息（密码/Token/Authorization/Cookie/API Key/私钥/身份证/手机号/银行卡等），②任何下载/落盘行为（-o/--output/-O/--remote-name 及重定向到本地文件、管道写入文件、tee 落盘），③禁止访问内网（10.x/172.16-31.x/192.168.x/169.254.x/127.x）和高危地址。所有响应内容只输出到 stdout，由调用方自行处理。",
 	"wget":       "远程下载网络文件到本地工作目录，仅允许公开静态资源下载",
 	"tar":        "文件打包/解压工具，仅读写工作目录内压缩包，不操作系统目录",
 	"zip":        "将目录/文件打包为zip压缩文件，仅限工作目录操作",
@@ -182,6 +182,83 @@ var AllowedCommands = map[string]string{
 	"timedatectl": "查看时区与时间同步状态（status 只读），排查时钟漂移",
 	"chronyc":     "chrony 时间同步查询（tracking/sources），分析 NTP 同步精度",
 	"ntpq":        "传统 NTP 查询（-p 打印对等节点），分析时钟源",
+
+	// ===== 开发工具链（编译器/解释器/包管理器/VCS）=====
+	// 安全约束：仅在工作目录内运行、禁止写系统目录、禁止执行任意远程脚本。
+
+	// --- Go ---
+	"go":            "Go 工具链入口（build/run/test/mod/env/version 等），仅允许工作目录内构建",
+	"gofmt":         "格式化 Go 源码（-d 打印差异/-w 写回），仅限工作目录",
+	"goimports":     "Go import 自动整理工具，仅限工作目录",
+	"golangci-lint": "Go 静态检查聚合器（run/--help），仅限工作目录",
+	"gopls":         "Go 语言服务器（gopls check/version），仅限工作目录",
+
+	// --- Python / Node / 通用脚本运行时 ---
+	"python":  "Python 2 解释器入口；建议使用 python3，仅限工作目录",
+	"python3": "Python 3 解释器入口（-c/-m/-V/-h 等），仅限工作目录",
+	"py.test": "pytest 测试运行器（-k/-x/-v 等），仅限工作目录",
+	"pytest":  "pytest 测试运行器（--collect-only/--help/-q），仅限工作目录",
+	"pip":     "pip 包管理器（仅 list/show/check/freeze 等只读查询），禁止 install/uninstall",
+	"pip3":    "pip3 包管理器（仅 list/show/check/freeze），禁止 install/uninstall",
+	"pipx":    "pipx 工具管理器（仅 list/list-all/run），禁止 install/inject",
+	"uv":      "Astral uv（仅 pip list/tree 等只读查询），禁止 add/remove/sync",
+	"poetry":  "Poetry 依赖管理（仅 show/check/version），禁止 install/add/remove",
+	"pdm":     "PDM 依赖管理（仅 list/show/info），禁止 add/remove/install",
+	"conda":   "Conda 环境管理（仅 list/info/search/version），禁止 install/create/remove",
+	"node":    "Node.js 运行时（-v/-e/-p 等），仅限工作目录，禁止 -e 执行远程代码",
+	"npm":     "npm 包管理器（仅 list/view/ls/--version/audit/outdated），禁止 install/uninstall/update/run",
+
+	// --- 包管理器（Linux） ---
+	"apt":      "APT 前端（仅 list/search/show/depends 等只读查询），禁止 install/remove/update/upgrade",
+	"apt-get":  "APT 后端（仅 list/search 等只读查询），禁止 install/remove/update",
+	"aptitude": "aptitude 前端（仅 search/show/why），禁止 install/remove",
+	"pacman":   "Arch 系包管理器（仅 -Q/-Ss 查询），禁止 -S/-R/-U",
+	"zypper":   "openSUSE 包管理器（仅 search/info/--version），禁止 install/remove",
+	"emerge":   "Gentoo 包管理器（仅 --search --info），禁止 --pretend 之外的真实安装",
+	"nix":      "Nix 包管理器（仅 search/show-env --version），禁止 --install",
+	"brew":     "Homebrew（macOS 常用，仅 list/search/info --version），禁止 install/uninstall",
+
+	// --- 编译/构建工具 ---
+	"gcc":        "GCC C 编译器（仅 --version/-v/-print-prog-name/-E/-S 编译到 stdout），禁止 -o 写到工作目录外",
+	"g++":        "G++ C++ 编译器（同 gcc 约束），仅限工作目录",
+	"clang":      "Clang 编译器（--version/-E/-S），仅限工作目录",
+	"clang++":    "Clang++ C++ 编译器（同 clang 约束）",
+	"cc":         "系统默认 C 编译器符号链接",
+	"make":       "Make 构建工具（仅工作目录内 Makefile，禁止 -C /etc /boot /usr）",
+	"cmake":      "CMake 配置工具（--version/--help），仅限工作目录",
+	"ninja":      "Ninja 构建工具（--version），仅限工作目录",
+	"meson":      "Meson 配置工具（--version/--help），仅限工作目录",
+	"autoconf":   "Autoconf（--version），仅限工作目录",
+	"automake":   "Automake（--version），仅限工作目录",
+	"libtool":    "GNU Libtool（--version），仅限工作目录",
+	"pkg-config": "查询编译库依赖信息（--version/--list-all/<mod>），仅限工作目录",
+
+	// --- VCS / 协作 ---
+	"git":        "Git 版本控制（status/log/diff/show/branch/remote/fetch/log/blame/ls-files/reflog/grep/stash list 等只读/查询操作）",
+	"git-log":    "git log（用户多次使用，可直接调用）",
+	"git-diff":   "git diff（工作区/暂存区差异）",
+	"git-status": "git status（查看仓库状态）",
+	"git-show":   "git show（查看提交/对象）",
+	"git-blame":  "git blame（定位修改行）",
+	"svn":        "Subversion（仅 log/info/status/diff/cat/look 等只读），禁止 commit/update/add",
+	"hg":         "Mercurial（仅 log/status/diff/cat 等只读），禁止 commit/update/add",
+	"gh":         "GitHub CLI（仅 repo view/pr view/issue view/status/--version），禁止 pr create/repo create/api 写操作",
+
+	// --- 网络 / API 调试开发期常用 ---
+	"httpie": "HTTPie（仅 http --offline GET / --version）",
+	"xh":     "Rust 写的 httpie 替代品（仅 GET / --version）",
+
+	// --- Linter / Formatter（多语言） ---
+	"shellcheck":  "Shell 脚本静态检查（仅工作目录内的 .sh 文件）",
+	"shfmt":       "Shell 脚本格式化（仅 -d/-l 打印差异，禁止 -w）",
+	"yamllint":    "YAML 静态检查（仅工作目录）",
+	"prettier":    "Prettier 格式化（仅 --check/-l 打印），禁止 --write",
+	"eslint":      "ESLint（仅 --version/--print-config 等只读），禁止 --fix",
+	"flake8":      "Python flake8（仅 --version/--statistics），仅限工作目录",
+	"ruff":        "Python ruff（仅 check --no-fix/--version），仅限工作目录",
+	"black":       "Python black（仅 --check/--diff --version），仅限工作目录",
+	"mypy":        "Python mypy（仅 --version/--no-incremental 工作目录）",
+	"gofmt-check": "等价 gofmt -l（用户多次使用，可直接调用）",
 
 	// ===== 常用辅助 =====
 	"env":     "打印当前环境变量，排查变量传递问题",
