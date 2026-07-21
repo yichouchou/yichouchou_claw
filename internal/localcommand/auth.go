@@ -85,3 +85,91 @@ func AuthorizationFromContext(ctx context.Context) AuthorizationScope {
 
 // Now 暴露给上层注入"测试时钟"，避免 time.Now 被硬编码到 IsDangerous。
 var Now = time.Now
+
+// =====================================================================
+// Session-backed AuthorizationScope —— 用于跨 ctx 边界的授权传递
+// =====================================================================
+//
+// 问题背景：
+//   eino ADK 的 ChatModelAgentMiddleware 只能修改 model call 节点作用域内的 ctx，
+//   而 ToolsNode 调用 tool 时使用的 ctx 是 graph 的根 ctx（不含 AuthorizationScope）。
+//   因此 AuthorizationMiddleware 通过 ctx.WithValue 注入的 AuthorizationScope
+//   无法抵达 tool.endpoint(ctx)，导致沙箱始终拿不到授权。
+//
+// 解决方案：
+//   eino 提供了 adk.AddSessionValue / adk.GetSessionValue 机制 —— session
+//   values 跨 ctx 边界传递（包含 sub-agent 和 ToolsNode 调用）。
+//   AuthorizationMiddleware 在写入 ctx 的同时也调用 adk.AddSessionValue 写入 session；
+//   Execute() 在读取 ctx 之前先尝试从 session 读取（adk.GetSessionValue）。
+//   当 ctx 中**已经存在** AuthorizationScope 时优先用 ctx（便于测试和注入）。
+
+// SessionAuthorizationKey 是 session 中存储 AuthorizationScope 的 key。
+const SessionAuthorizationKey = "localcommand.AuthorizationScope"
+
+// sessionWriteOp 是 session value 写入函数签名（避免直接依赖 adk 包导致循环引用）。
+type sessionWriteOp func(ctx context.Context, key string, value any)
+
+// sessionReadOp 是 session value 读取函数签名。
+type sessionReadOp func(ctx context.Context, key string) (any, bool)
+
+var (
+	writeSessionValueFn sessionWriteOp
+	readSessionValueFn  sessionReadOp
+)
+
+// RegisterSessionOps 注入 adk session 操作函数。
+// 由 adk/middlewares/messageHandler/auth.go 在 init() 中调用，避免循环依赖。
+func RegisterSessionOps(write sessionWriteOp, read sessionReadOp) {
+	writeSessionValueFn = write
+	readSessionValueFn = read
+}
+
+// WriteAuthorizationToSession 把 AuthorizationScope 写入 eino session（如果可用）。
+func WriteAuthorizationToSession(ctx context.Context, auth AuthorizationScope) {
+	if auth.IsEmpty() {
+		return
+	}
+	if writeSessionValueFn != nil {
+		writeSessionValueFn(ctx, SessionAuthorizationKey, auth)
+	}
+}
+
+// ReadAuthorizationFromSession 从 eino session 读取 AuthorizationScope（如果可用）。
+// 返回 (auth, true) 表示 session 中存在授权；返回 (zero, false) 表示无授权。
+func ReadAuthorizationFromSession(ctx context.Context) (AuthorizationScope, bool) {
+	if readSessionValueFn == nil {
+		return AuthorizationScope{}, false
+	}
+	v, ok := readSessionValueFn(ctx, SessionAuthorizationKey)
+	if !ok {
+		return AuthorizationScope{}, false
+	}
+	auth, ok := v.(AuthorizationScope)
+	if !ok {
+		return AuthorizationScope{}, false
+	}
+	return auth, true
+}
+
+// ResolveAuthorization 从 ctx 中按优先级解析 AuthorizationScope：
+//  1. ctx 中已存在的 AuthorizationScope（优先级最高，便于测试/注入）
+//  2. session 中的 AuthorizationScope（跨 ctx 边界的 fallback）
+//  3. 零值（无授权）
+//
+// 解析后会检查有效期，过期则返回零值（视为无授权）。
+func ResolveAuthorization(ctx context.Context) AuthorizationScope {
+	auth := AuthorizationFromContext(ctx)
+	if !auth.IsEmpty() {
+		// ctx 中已有，直接用
+		if !auth.Valid(Now()) {
+			return AuthorizationScope{}
+		}
+		return auth
+	}
+	if sessAuth, ok := ReadAuthorizationFromSession(ctx); ok {
+		if sessAuth.Valid(Now()) {
+			return sessAuth
+		}
+	}
+	return AuthorizationScope{}
+}

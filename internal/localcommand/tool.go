@@ -284,10 +284,7 @@ func IsDangerousWithContext(ctx context.Context, cmd string) (bool, string) {
 	}
 
 	// 3) 软禁止：依赖授权
-	auth := AuthorizationFromContext(ctx)
-	if !auth.Valid(Now()) {
-		auth = AuthorizationScope{} // 过期视为无授权
-	}
+	auth := ResolveAuthorization(ctx)
 
 	for _, pattern := range SoftForbiddenPatterns {
 		if !pattern.MatchString(cmd) {
@@ -692,10 +689,11 @@ func Execute(ctx context.Context, input *CommandInput) (*CommandOutput, error) {
 		return nil, fmt.Errorf("命令不能为空")
 	}
 
-	auth := AuthorizationFromContext(ctx)
+	auth := ResolveAuthorization(ctx)
 	authDesc := "none"
 	if !auth.IsEmpty() {
-		authDesc = fmt.Sprintf("Install=%v,Bash=%v,By=%s", auth.Install, auth.Bash, auth.GrantedBy)
+		authDesc = fmt.Sprintf("Install=%v,Bash=%v,Whitelist=%v,Valid=%v,ExpiresAt=%v,By=%s",
+			auth.Install, auth.Bash, auth.WhitelistAuth, auth.Valid(Now()), auth.ExpiresAt.Format("15:04:05"), auth.GrantedBy)
 	}
 	log.Printf("[LocalCommand][%s][auth=%s] Executing: %s", PlatformName, authDesc, cmd)
 

@@ -18,6 +18,7 @@ package messagehandler
 
 import (
 	"context"
+	"log"
 	"regexp"
 	"strings"
 	"time"
@@ -140,6 +141,14 @@ func (m *AuthorizationMiddleware) BeforeModelRewriteState(
 
 	// 写入 ctx 供 localcommand.Execute 使用
 	ctx = localcommand.WithAuthorization(ctx, auth)
+
+	// 同时写入 eino session（跨 ctx 边界：ToolsNode 调用 tool 时也能拿到）
+	// 这是关键修复 —— AuthorizationMiddleware 修改的 ctx 只在 model call 节点作用域内
+	// 生效，而 tool 调用走的是 graph 根 ctx，必须通过 session values 才能传递
+	localcommand.WriteAuthorizationToSession(ctx, auth)
+
+	log.Printf("[AuthorizationMiddleware] Wrote AuthorizationScope to ctx+session: Install=%v Bash=%v WhitelistAuth=%v WhitelistCmd=%q ExpiresAt=%v GrantedBy=%s",
+		auth.Install, auth.Bash, auth.WhitelistAuth, auth.WhitelistCmd, auth.ExpiresAt.Format("15:04:05"), auth.GrantedBy)
 
 	// 把授权摘要回填到 system message，让 LLM 知道自己已获得授权
 	notice := formatAuthNotice(auth)
@@ -268,4 +277,23 @@ func formatAuthNotice(a localcommand.AuthorizationScope) string {
 	exp := a.ExpiresAt.Format("15:04:05")
 	scope := strings.Join(parts, "+")
 	return "\n\n[系统提示] 用户已授权 " + scope + " 授权（至 " + exp + "）。本次会话内相关的安装/写操作/白名单外命令可以自动放行；硬禁止命令仍然不能执行。"
+}
+
+// init 把 eino adk session 操作函数注入到 localcommand 包。
+//
+// 这是 AuthorizationScope 跨 ctx 边界传递的关键：
+//   - eino ADK 的 ToolsNode 在调用 tool.endpoint 时使用的是 graph 的根 ctx，
+//     不包含 ChatModelAgentMiddleware 修改的 ctx 值。
+//   - 但是 eino session 的 values 是 graph 范围共享的，可以跨节点访问。
+//   - 通过 adk.AddSessionValue / adk.GetSessionValue 注册到 localcommand，
+//     让 ResolveAuthorization 能从 session 中 fallback 拿到授权。
+func init() {
+	localcommand.RegisterSessionOps(
+		func(ctx context.Context, key string, value any) {
+			adk.AddSessionValue(ctx, key, value)
+		},
+		func(ctx context.Context, key string) (any, bool) {
+			return adk.GetSessionValue(ctx, key)
+		},
+	)
 }
