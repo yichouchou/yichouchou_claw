@@ -61,7 +61,7 @@ func main() {
 		Agent:           a,
 	})
 
-	h := server.Default(server.WithHostPorts(":8080"))
+	h := server.Default(server.WithHostPorts(":28080"))
 
 	h.GET("/index.html", func(ctx context.Context, c *app.RequestContext) {
 		data, err := staticFiles.ReadFile("index.html")
@@ -85,9 +85,9 @@ func main() {
 		handleChat(ctx, c, runner, store)
 	})
 
-	log.Println("Server starting on http://localhost:8080")
-	log.Println("Open http://localhost:8080/index.html in your browser")
-	log.Println("Or try: curl -N 'http://localhost:8080/chat?session_id=demo&query=%E5%8C%97%E4%BA%AC%E5%A4%A9%E6%B0%94%E6%80%8E%E4%B9%88%E6%A0%B7'")
+	log.Println("Server starting on http://localhost:28080")
+	log.Println("Open http://localhost:28080/index.html in your browser")
+	log.Println("Or try: curl -N 'http://localhost:28080/chat?session_id=demo&query=%E5%8C%97%E4%BA%AC%E5%A4%A9%E6%B0%94%E6%80%8E%E4%B9%88%E6%A0%B7'")
 	h.Spin()
 }
 
