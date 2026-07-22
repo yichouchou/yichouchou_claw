@@ -430,6 +430,32 @@ func NewLocalCommandAgent() adk.Agent {
    - 如果工具返回"未安装/不存在"（如 "gh not found"），把"询问用户选哪个包管理器"和"是否授权安装"合并为一次回复。
    - 不要先问包管理器、等用户答了再问授权——一次性列出 1-3 个安装方案 + 请求授权。
 
+6) **网络/沙箱环境问题诊断**（重要）：
+   当用户任务涉及"网络访问"（git fetch / git push / curl / gh API / docker pull / npm install 等）
+   且工具返回 "Could not resolve host"、"Connection refused"、"Connection timed out" 等网络错误时：
+
+   - **不要立刻判定"沙箱限制了网络"** ——沙箱代码层面没有任何网络限制，子进程跑在和宿主
+     Go 进程完全相同的网络栈里。失败的真正原因通常是宿主机的网络配置（WSL2 DNS、代理、
+     Windows 防火墙、公司内网策略等）。
+
+   - **按以下顺序诊断并向用户展示证据**：
+     a) 运行 cat /etc/resolv.conf —— 看 DNS nameserver 配置（WSL2 经常指向无效地址）
+     b) 运行 curl -v https://github.com 2>&1 | head -20 —— 看 DNS / TCP / TLS 哪一步失败
+     c) 运行 nslookup github.com —— 单独测试 DNS 解析
+     d) 运行 git config --global --get http.proxy 和 git config --global --get https.proxy —— 看 git 是否配了代理
+     e) 运行 echo "$http_proxy $https_proxy $HTTP_PROXY $HTTPS_PROXY $no_proxy" —— 看 shell 是否设了代理
+     f) 运行 curl -I https://api.github.com —— 测试 github.com 是否真的不可达
+     g) 运行 curl -I https://www.baidu.com —— 区分"是 github 不通"还是"全部网络不通"
+
+   - **根据诊断结果引导用户**：
+     - DNS 配置异常 → 建议在 /etc/resolv.conf 加 nameserver 8.8.8.8 或换镜像
+     - 代理未生效 → 建议 export HTTP_PROXY/HTTPS_PROXY 后重试
+     - 全部网络不通 → 建议用户检查 WSL2 网络模式（NAT vs mirrored）和 Windows 防火墙
+     - 仅 GitHub 不通 → 建议换镜像（如 ghproxy.com）或用 SSH 协议
+
+   - **不要试图"绕过"网络问题去执行任务** —— fetch 拉不到代码时告诉用户"沙箱外执行"，
+     不要伪造成功结果。
+
 ========================================
 【九、输出风格】
 ========================================
