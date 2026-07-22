@@ -30,32 +30,40 @@ func killProcessGroup(cmd *exec.Cmd) {
 // sandboxEnv 返回沙箱内子进程使用的环境变量。
 //
 // 透传策略：
-//   - HOME / USERPROFILE 透传父进程设置，让子进程能读到用户真实配置
-//   - PATH 用 Windows 系统默认精简版
-//   - TZ 设为 Asia/Shanghai
-//   - LANG 设为 zh_CN.UTF-8
-//   - 其余环境变量不传，避免沙箱进程继承宿主机的随机配置
+//   - 完全透传宿主机环境，让子进程复用用户所有配置
+//   - 仅追加/覆盖 PATH、TZ、LANG（避免子进程找不到系统命令、日志时间本地化）
+//   - 不再做任何变量过滤，由硬禁止模式 + 软禁止授权机制负责安全拦截
 func sandboxEnv() []string {
-	env := []string{
-		"PATH=%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\",
-		"TZ=Asia/Shanghai",
-		"LANG=zh_CN.UTF-8",
-	}
-	// 透传 HOME / USERPROFILE
-	if h := os.Getenv("HOME"); h != "" {
-		env = append(env, "HOME="+h)
-	}
-	if u := os.Getenv("USERPROFILE"); u != "" {
-		env = append(env, "USERPROFILE="+u)
-	}
-	// 透传认证类环境变量
-	for _, key := range []string{
-		"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "GH_HOST",
-		"DOCKER_HOST", "KUBECONFIG",
-	} {
-		if v := os.Getenv(key); v != "" {
-			env = append(env, key+"="+v)
+	env := os.Environ() // 透传宿主机全部环境变量
+	hasPath := false
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") {
+			hasPath = true
+			break
 		}
+	}
+	if !hasPath {
+		env = append(env, "PATH=%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\")
+	}
+	hasTZ := false
+	for _, e := range env {
+		if strings.HasPrefix(e, "TZ=") {
+			hasTZ = true
+			break
+		}
+	}
+	if !hasTZ {
+		env = append(env, "TZ=Asia/Shanghai")
+	}
+	hasLANG := false
+	for _, e := range env {
+		if strings.HasPrefix(e, "LANG=") {
+			hasLANG = true
+			break
+		}
+	}
+	if !hasLANG {
+		env = append(env, "LANG=zh_CN.UTF-8")
 	}
 	return env
 }

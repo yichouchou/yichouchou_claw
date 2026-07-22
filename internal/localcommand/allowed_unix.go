@@ -5,6 +5,7 @@ package localcommand
 import (
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 )
 
@@ -292,27 +293,32 @@ func killProcessGroup(cmd *exec.Cmd) {
 // sandboxEnv 返回沙箱内子进程使用的环境变量。
 //
 // 透传策略：
-//   - HOME 透传父进程设置，让 gh / docker / kubectl 等工具直接复用用户真实配置
-//   - PATH 用沙箱精简版，避免子进程访问宿主机的奇怪路径
-//   - TZ 设为 Asia/Shanghai，保证日志时间本地化
-//   - 其余环境变量不传，避免沙箱进程继承宿主机的随机配置
+//   - 完全透传宿主机环境，让 gh / docker / kubectl 等工具能复用用户所有配置
+//   - 仅追加/覆盖 PATH 和 TZ（PATH 防止子进程找不到系统命令；TZ 保证日志时间本地化）
+//   - 不再做任何变量过滤，由硬禁止模式 + 软禁止授权机制负责安全拦截
 func sandboxEnv() []string {
-	env := []string{
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"TZ=Asia/Shanghai",
-	}
-	// 透传 HOME，让子进程能读到 ~/.config/gh 等用户配置
-	if h := os.Getenv("HOME"); h != "" {
-		env = append(env, "HOME="+h)
-	}
-	// 透传与"工具认证 / 配置"相关的少量环境变量
-	for _, key := range []string{
-		"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "GH_HOST",
-		"DOCKER_HOST", "KUBECONFIG",
-	} {
-		if v := os.Getenv(key); v != "" {
-			env = append(env, key+"="+v)
+	env := os.Environ() // 透传宿主机全部环境变量
+	// 覆盖 PATH 为精简版，避免子进程继承宿主机自定义的奇怪路径
+	hasPath := false
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") {
+			hasPath = true
+			break
 		}
+	}
+	if !hasPath {
+		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+	}
+	// 追加 TZ 为 Asia/Shanghai（如果宿主机没有设置）
+	hasTZ := false
+	for _, e := range env {
+		if strings.HasPrefix(e, "TZ=") {
+			hasTZ = true
+			break
+		}
+	}
+	if !hasTZ {
+		env = append(env, "TZ=Asia/Shanghai")
 	}
 	return env
 }

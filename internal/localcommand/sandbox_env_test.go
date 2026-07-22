@@ -6,92 +6,121 @@ import (
 	"testing"
 )
 
-// TestSandboxEnv_PassesThroughHome 验证 HOME 被透传给子进程，让 gh / docker 等工具
-// 能读到用户的 ~/.config/gh 等配置。沙箱不再做 HOME 隔离，由用户自行控制风险。
-func TestSandboxEnv_PassesThroughHome(t *testing.T) {
-	const fakeHome = "/home/test-user-fake-home"
-	originalHome := os.Getenv("HOME")
-	os.Setenv("HOME", fakeHome)
+// TestSandboxEnv_PassesThroughHostEnv 验证 sandboxEnv 透传宿主机所有环境变量。
+// 这是当前策略：放弃 env 隔离，让 gh / docker / kubectl 等工具直接复用用户配置。
+// 安全由硬禁止模式 + 软禁止授权机制负责。
+func TestSandboxEnv_PassesThroughHostEnv(t *testing.T) {
+	const customVar = "CUSTOM_TEST_VAR_FOR_SANDBOX_ENV"
+	const customVal = "should-be-forwarded-12345"
+
+	// 父进程设置一个具有唯一值的测试变量（避免和宿主机上已有变量冲突）
+	os.Setenv(customVar, customVal)
+	defer os.Unsetenv(customVar)
+
+	env := sandboxEnv()
+
+	hasCustom := false
+	for _, e := range env {
+		if e == customVar+"="+customVal {
+			hasCustom = true
+			break
+		}
+	}
+	if !hasCustom {
+		t.Fatalf("sandboxEnv must pass through arbitrary env var %s=%s; got env (first 5)=%v",
+			customVar, customVal, env[:min(5, len(env))])
+	}
+}
+
+// TestSandboxEnv_EnsuresPathAndTZ 验证 sandboxEnv 始终包含 PATH 和 TZ（如果宿主机没有）。
+// 防止子进程因为 PATH 为空而找不到系统命令、TZ 未设置而日志时间是 UTC。
+func TestSandboxEnv_EnsuresPathAndTZ(t *testing.T) {
+	// 临时 unset 父进程的 PATH 和 TZ
+	originalPath := os.Getenv("PATH")
+	originalTZ := os.Getenv("TZ")
+	os.Unsetenv("PATH")
+	os.Unsetenv("TZ")
 	defer func() {
-		if originalHome == "" {
-			os.Unsetenv("HOME")
-		} else {
-			os.Setenv("HOME", originalHome)
+		if originalPath != "" {
+			os.Setenv("PATH", originalPath)
+		}
+		if originalTZ != "" {
+			os.Setenv("TZ", originalTZ)
 		}
 	}()
 
 	env := sandboxEnv()
 
-	found := false
+	hasPath := false
+	hasTZ := false
 	for _, e := range env {
-		if e == "HOME="+fakeHome {
-			found = true
-			break
+		if strings.HasPrefix(e, "PATH=") {
+			hasPath = true
+		}
+		if strings.HasPrefix(e, "TZ=") {
+			hasTZ = true
 		}
 	}
-	if !found {
-		t.Fatalf("sandboxEnv must pass through HOME=%s; got env=%v", fakeHome, env)
+	if !hasPath {
+		t.Fatalf("sandboxEnv must ensure PATH=... when missing; got env=%v", env)
+	}
+	if !hasTZ {
+		t.Fatalf("sandboxEnv must ensure TZ=... when missing; got env=%v", env)
 	}
 }
 
-// TestSandboxEnv_PassesThroughAuthTokens 验证用户主动 export 的认证 token 会被透传。
-// 解决 gh / docker / kubectl 等工具无法复用用户凭证的问题。
-func TestSandboxEnv_PassesThroughAuthTokens(t *testing.T) {
-	const fakeToken = "ghp_fakeTestTokenForUnitTest1234567890abcdef"
-	const fakeConfigDir = "/home/user/.config/gh-fake"
-	os.Setenv("GH_TOKEN", fakeToken)
-	os.Setenv("GH_CONFIG_DIR", fakeConfigDir)
-	defer os.Unsetenv("GH_TOKEN")
-	defer os.Unsetenv("GH_CONFIG_DIR")
+// TestSandboxEnv_PreservesExistingPathAndTZ 验证宿主机已经设置了 PATH / TZ 时，
+// sandboxEnv 不会重复追加（避免冲突）。
+func TestSandboxEnv_PreservesExistingPathAndTZ(t *testing.T) {
+	const customPATH = "/usr/local/bin:/custom/path"
+	const customTZ = "Europe/Paris"
+	originalPATH := os.Getenv("PATH")
+	originalTZ := os.Getenv("TZ")
+	os.Setenv("PATH", customPATH)
+	os.Setenv("TZ", customTZ)
+	defer func() {
+		if originalPATH == "" {
+			os.Unsetenv("PATH")
+		} else {
+			os.Setenv("PATH", originalPATH)
+		}
+		if originalTZ == "" {
+			os.Unsetenv("TZ")
+		} else {
+			os.Setenv("TZ", originalTZ)
+		}
+	}()
 
 	env := sandboxEnv()
 
-	assertContains := func(key, want string) {
-		for _, e := range env {
-			if strings.HasPrefix(e, key+"=") {
-				if e != want {
-					t.Fatalf("sandboxEnv %s mismatch: got %q, want %q", key, e, want)
-				}
-				return
+	pathCount := 0
+	tzCount := 0
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") {
+			pathCount++
+			if e != "PATH="+customPATH {
+				t.Fatalf("sandboxEnv mutated PATH: got %q, want %q", e, "PATH="+customPATH)
 			}
 		}
-		t.Fatalf("sandboxEnv missing %s (full env=%v)", key, env)
+		if strings.HasPrefix(e, "TZ=") {
+			tzCount++
+			if e != "TZ="+customTZ {
+				t.Fatalf("sandboxEnv mutated TZ: got %q, want %q", e, "TZ="+customTZ)
+			}
+		}
 	}
-
-	assertContains("GH_TOKEN", "GH_TOKEN="+fakeToken)
-	assertContains("GH_CONFIG_DIR", "GH_CONFIG_DIR="+fakeConfigDir)
-}
-
-// TestSandboxEnv_DoesNotPassUnrelatedEnv 验证非白名单环境变量不会被透传。
-// 防止沙箱进程意外继承宿主机上的随机敏感变量（如 AWS_SECRET_ACCESS_KEY）。
-func TestSandboxEnv_DoesNotPassUnrelatedEnv(t *testing.T) {
-	os.Setenv("AWS_SECRET_ACCESS_KEY", "should-not-be-forwarded")
-	os.Setenv("RANDOM_GARBAGE_VAR", "should-not-be-forwarded")
-	defer os.Unsetenv("AWS_SECRET_ACCESS_KEY")
-	defer os.Unsetenv("RANDOM_GARBAGE_VAR")
-
-	env := sandboxEnv()
-
-	for _, e := range env {
-		if strings.HasPrefix(e, "AWS_SECRET_ACCESS_KEY=") {
-			t.Fatalf("sandboxEnv leaked AWS_SECRET_ACCESS_KEY: %s", e)
-		}
-		if strings.HasPrefix(e, "RANDOM_GARBAGE_VAR=") {
-			t.Fatalf("sandboxEnv leaked RANDOM_GARBAGE_VAR: %s", e)
-		}
+	if pathCount != 1 {
+		t.Fatalf("sandboxEnv should have exactly 1 PATH entry; got %d", pathCount)
+	}
+	if tzCount != 1 {
+		t.Fatalf("sandboxEnv should have exactly 1 TZ entry; got %d", tzCount)
 	}
 }
 
-// TestSandboxEnv_HandlesEmptyTokenGracefully 验证父进程未设置 token 时不会写入空值。
-// 防止环境变量被设为空字符串后导致子进程行为异常。
-func TestSandboxEnv_HandlesEmptyTokenGracefully(t *testing.T) {
-	os.Unsetenv("GH_TOKEN")
-
-	env := sandboxEnv()
-
-	for _, e := range env {
-		if strings.HasPrefix(e, "GH_TOKEN=") {
-			t.Fatalf("sandboxEnv should not pass empty GH_TOKEN; got %s", e)
-		}
+// min 是 Go 1.21+ 内置，但为了测试文件可独立编译显式定义
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
+	return b
 }
