@@ -3,6 +3,7 @@
 package localcommand
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -292,12 +293,29 @@ func killProcessGroup(cmd *exec.Cmd) {
 
 // sandboxEnv 返回沙箱内子进程使用的环境变量。
 // 限制 PATH、HOME、时区，避免子进程访问宿主机的敏感环境。
+//
+// 透传策略：
+//   - HOME 固定为 /tmp，隔离 ~/.ssh / ~/.bash_history / ~/.aws 等敏感目录
+//   - GH_TOKEN / GITHUB_TOKEN / GH_CONFIG_DIR 透传父进程设置，
+//     解决 gh / git 等工具需要用户已登录凭证的问题
+//   - 其他环境变量不传，避免沙箱进程继承宿主机的随机配置
 func sandboxEnv() []string {
-	return []string{
+	env := []string{
 		"HOME=/tmp",
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"TZ=Asia/Shanghai",
 	}
+	// 透传与"工具认证 / 配置"相关的少量环境变量；这些是
+	// 用户主动在 shell 里 export 的，传递它们能避免沙箱内工具需要重复登录。
+	for _, key := range []string{
+		"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "GH_HOST",
+		"DOCKER_HOST", "KUBECONFIG",
+	} {
+		if v := os.Getenv(key); v != "" {
+			env = append(env, key+"="+v)
+		}
+	}
+	return env
 }
 
 // sandboxWorkDir 返回沙箱工作目录。
