@@ -324,7 +324,7 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string) adk.Agent {
 
 	a, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:        "LocalCommandAgent",
-		Description: "本机命令执行 agent：唯一有权调用 local_command 工具，负责在受限沙箱中执行主机 bash 命令（系统查询、文件查看、网络诊断、用户授权后的安装/写操作等）。不擅长闲聊、概念解释、天气查询等非命令执行类请求。",
+		Description: "本机命令执行 agent：唯一有权调用 local_command 工具，负责在受限沙箱中执行主机 bash 命令（系统查询、文件查看、网络诊断、项目代码 review、用户授权后的安装/写操作等）。能读项目目录代码做架构 review，能跑 gh CLI 提交 issue。**不**擅长闲聊、概念解释、天气查询等非命令执行类请求。",
 		Instruction: `你是 yichouchou_claw 的"本机命令执行 agent"。RouterAgent 会把"涉及主机 bash / 操作系统命令"的请求转给你处理。
 
 ========================================
@@ -534,7 +534,9 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string) adk.Agent {
 // 技术方案讨论、代码 review、文档整理、翻译等不需要执行命令的任务。
 func NewChatAgent(ctx context.Context, skillsDir string) adk.Agent {
 	// 构造 skill 中间件（skillsDir 下属的 chat/ 目录里的 skill 列表会被加载）。
-	// 涵盖 general_chat（闲聊风格）/ code_review（代码 review 模板）等。
+	// 涵盖 general_chat（闲聊风格）等。code_review skill 已迁到
+	// LocalCommandAgent 下，因为代码 review 任务通常需要读项目目录代码，
+	// 必须由 LocalCommandAgent 用 local_command 工具读代码后完成。
 	skillMw, err := buildSkillMiddleware(ctx, filepath.Join(skillsDir, "chat"))
 	if err != nil {
 		log.Fatalf("ChatAgent skill middleware: %v", err)
@@ -609,14 +611,21 @@ func NewRouterAgent(store *session.Store) adk.Agent {
 【路由判定规则（按顺序）】
 0. **复合任务拆分（最优先）**：如果一条消息同时包含"分析 / 评审 / 解释 / review 文本"
    和"提交 / 跑命令 / 创建 / 执行" 等多个动词，**视为复合任务**：
-   - "分析 X 然后提交 issue"、"review 然后写文件"、"看完帮我执行 Y" 这种
-     "分析 → 执行" 复合任务，**优先转 ChatAgent**——ChatAgent 做 review 后会
-     自然给用户结果（用户可后续单独说"提交 issue"再走 LocalCommandAgent）。
-   - 不要因为消息尾部出现"提交 issue"、"执行命令"就路由到 LocalCommandAgent，
-     让 LocalCommandAgent 一次性塞 20 个 cat 命令来"收集代码"——那是 review 任务
-     不该 LocalCommandAgent 做，会触发 max iterations 错误。
-   - 如果复合任务里"执行"部分完全依赖 review 结果（如 "review + 自动提交"），
-     转 ChatAgent，让 ChatAgent 给出最终建议；用户认可后再单独触发执行任务。
+   - "进入 X 目录 review 代码 + 提交 issue"、"分析代码然后写文件"、"看完帮我跑 Y"
+     这种"进入项目 → review → 执行"复合任务，**统一转 LocalCommandAgent**——
+     LocalCommandAgent 能用 local_command 工具读项目代码（cat / ls / wc / tree），
+     加载 code_review skill 做架构 review，最后跑 gh issue create 等命令自动完成。
+     ChatAgent 没有 local_command 工具、不能读磁盘代码，转 ChatAgent 只能让它
+     问"请把代码贴进来"——这等于让流程卡住，**不要这么做**。
+   - 反例（**不**算复合任务，转 ChatAgent）：
+     - 纯 review 类提问："帮我看下 main.go 的设计思路"、"review 这段代码怎么写更好"
+       ——用户没说要执行任何事，纯讨论 → 转 ChatAgent。
+     - 用户已经贴了代码 / 项目结构到对话里 → 转 ChatAgent 做 review。
+   - 例外：复合任务里"执行"部分是**纯本地写文件 / 部署**而非"提交到外部服务"，
+     仍转 LocalCommandAgent（用户通常希望"一条龙"跑完）。
+   - **【MaxIterations 触顶防护】**：LocalCommandAgent 单次 ChatModel 输出
+     禁止超过 5 个工具调用。如果任务需要看 10+ 个文件，应该拆成"先 ls → 再 cat
+     关键文件 → 再综合 review"几轮，不要一次性把 20 个 cat 全塞进去。
 
 1. **强语义优先**：消息里包含明确关键词
    - 包含 "天气"、"温度"、"下雨"、"湿度"、"风速"、"穿什么" 等 → 转 WeatherAgent。
