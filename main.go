@@ -20,6 +20,7 @@ import (
 	"context"
 	"embed"
 	"log"
+	"net/url"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
@@ -47,15 +48,27 @@ func main() {
 
 	weatherAgent := subagents.NewWeatherAgent()
 	chatAgent := subagents.NewChatAgent()
-	// 包装 LocalCommandAgent：禁止其转出到 RouterAgent。
-	// 原因：LocalCommandAgent 没有 sub-agent 可转，但 eino 框架会自动给所有
-	// 被设为 sub-agent 的 agent 添加 transfer_to_agent 工具，且默认目标包含父 agent。
-	// LLM 偶尔会误调这个工具试图转回 RouterAgent（或更糟：误以为自己本身就是
-	// sub-agent 之一），导致 "agent 'X' not found when transferring from 'Y'" 错误。
-	// 用 adk.WithDisallowTransferToParent() 关闭这条路径，并从工具列表中彻底移除。
+	// 包装 ChatAgent / WeatherAgent / LocalCommandAgent：禁止它们转回 RouterAgent。
+	// 原因：这三个 sub-agent 都没有子 agent，但 eino 框架会自动给所有 sub-agent
+	// 添加 transfer_to_agent 工具，且默认目标包含父 agent（RouterAgent）。
+	// LLM 偶尔会误调这个工具（如 ChatAgent 调 transfer_to_agent(LocalCommandAgent)，
+	// 或者甚至误以为可以 transfer_to_agent(自己)），导致
+	// "agent 'X' not found when transferring from 'Y'" 错误。
+	// 用 adk.WithDisallowTransferToParent() 关闭这条路径，从工具列表里彻底移除
+	// transfer_to_agent 工具，让 LLM 看不到就不会调。
 	localCmdAgent := adk.AgentWithOptions(
 		context.Background(),
 		subagents.NewLocalCommandAgent(),
+		adk.WithDisallowTransferToParent(),
+	)
+	chatAgent = adk.AgentWithOptions(
+		context.Background(),
+		chatAgent,
+		adk.WithDisallowTransferToParent(),
+	)
+	weatherAgent = adk.AgentWithOptions(
+		context.Background(),
+		weatherAgent,
 		adk.WithDisallowTransferToParent(),
 	)
 	// RouterAgent 挂上 PersistMiddleware，让最外层 ChatModelAgent 维护 messages。
@@ -102,8 +115,10 @@ func main() {
 	})
 
 	log.Println("Server starting on http://localhost:28080")
-	log.Println("Open http://localhost:28080/index.html in your browser")
-	log.Println("Or try: curl -N 'http://localhost:28080/chat?session_id=demo&query=%E5%8C%97%E4%BA%AC%E5%A4%A9%E6%B0%94%E6%80%8E%E4%B9%88%E6%A0%B7'")
+	// 示例 URL 中的 query 参数是 "北京天气怎样" 的 URL 编码。
+	// 用普通字符串（不是 Printf 格式串）避免 go vet 警告 %E 等占位符。
+	log.Println("Or try: curl -N \"http://localhost:28080/chat?session_id=demo&query=" +
+		url.QueryEscape("北京天气怎样") + "\"")
 	h.Spin()
 }
 
