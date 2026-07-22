@@ -292,21 +292,22 @@ func killProcessGroup(cmd *exec.Cmd) {
 }
 
 // sandboxEnv 返回沙箱内子进程使用的环境变量。
-// 限制 PATH、HOME、时区，避免子进程访问宿主机的敏感环境。
 //
 // 透传策略：
-//   - HOME 固定为 /tmp，隔离 ~/.ssh / ~/.bash_history / ~/.aws 等敏感目录
-//   - GH_TOKEN / GITHUB_TOKEN / GH_CONFIG_DIR 透传父进程设置，
-//     解决 gh / git 等工具需要用户已登录凭证的问题
-//   - 其他环境变量不传，避免沙箱进程继承宿主机的随机配置
+//   - HOME 透传父进程设置，让 gh / docker / kubectl 等工具直接复用用户真实配置
+//   - PATH 用沙箱精简版，避免子进程访问宿主机的奇怪路径
+//   - TZ 设为 Asia/Shanghai，保证日志时间本地化
+//   - 其余环境变量不传，避免沙箱进程继承宿主机的随机配置
 func sandboxEnv() []string {
 	env := []string{
-		//"HOME=/tmp",
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"TZ=Asia/Shanghai",
 	}
-	// 透传与"工具认证 / 配置"相关的少量环境变量；这些是
-	// 用户主动在 shell 里 export 的，传递它们能避免沙箱内工具需要重复登录。
+	// 透传 HOME，让子进程能读到 ~/.config/gh 等用户配置
+	if h := os.Getenv("HOME"); h != "" {
+		env = append(env, "HOME="+h)
+	}
+	// 透传与"工具认证 / 配置"相关的少量环境变量
 	for _, key := range []string{
 		"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "GH_HOST",
 		"DOCKER_HOST", "KUBECONFIG",
