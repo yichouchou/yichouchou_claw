@@ -301,7 +301,7 @@ func killProcessGroup(cmd *exec.Cmd) {
 //   - 其他环境变量不传，避免沙箱进程继承宿主机的随机配置
 func sandboxEnv() []string {
 	env := []string{
-		"HOME=/tmp",
+		//"HOME=/tmp",
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"TZ=Asia/Shanghai",
 	}
