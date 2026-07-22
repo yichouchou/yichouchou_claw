@@ -160,8 +160,6 @@ var AllowedCommands = map[string]string{
 
 	// ===== 容器与虚拟化（只读排查） =====
 	"docker":  "Docker 容器查询（仅 ps/images/logs/inspect/top/stat/stats），禁止 run/exec/pull/push/rm",
-	"podman":  "Podman 容器查询（仅 ps/images/logs/inspect/top/stat），禁止 run/exec/rm",
-	"ctr":     "containerd CLI 仅查询（containers/tasks/images），禁止 run/exec/rm",
 	"crictl":  "Kubernetes CRI 仅查询（ps/images/logs/inspectp/stats），禁止 run/exec",
 	"kubectl": "Kubernetes 集群查询（仅 get/describe/logs），禁止 apply/delete/edit/exec/scale",
 
