@@ -52,7 +52,7 @@ yichouchou_claw/
 │   └── localcommand/
 │       └── tool.go            # LocalCommandTool - 沙箱化本地命令执行工具（白名单机制）
 ├── subagents/
-│   └── chatmodel.go           # Agent 定义：RouterAgent / ChatAgent / WeatherAgent
+│   └── chatmodel.go           # Agent 定义：RouterAgent / ChatAgent / WeatherAgent / LocalCommandAgent
 ├── index.html                 # Web 演示页面
 ├── Dockerfile
 ├── go.mod
@@ -65,10 +65,11 @@ yichouchou_claw/
 - **adk/common/tool** — 通用工具封装：审批、追问复核、GraphTool 断点续存。
 - **internal/session** — 多轮对话状态管理，通过 `AfterAgent` 钩子同步 eino SDK 内部 messages，避免 tool_call_id 不匹配问题。
 - **internal/message** — 将 eino AgentEvent 转换为 SSE 事件流。
-- **subagents** — 三个 Agent：
+- **subagents** — 四个 Agent：
   - `RouterAgent`：智能路由（天气 → WeatherAgent，闲聊 → ChatAgent）
   - `WeatherAgent`：提供 `get_weather` 工具
   - `ChatAgent`：通用对话
+  - `LocalCommandAgent`：沙箱化本地命令执行（白名单机制，支持用户授权放行）
 
 ## 功能特性
 
