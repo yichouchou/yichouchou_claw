@@ -6,32 +6,37 @@ import (
 	"testing"
 )
 
-// TestSandboxEnv_AlwaysOverridesHome 验证 sandboxEnv 始终把 HOME 设为隔离目录。
-// Linux 是 /tmp，Windows 是 %TEMP%；这是核心安全策略：
-// 隔离 ~/.ssh / ~/.bash_history / ~/.aws 等敏感目录。
-func TestSandboxEnv_AlwaysOverridesHome(t *testing.T) {
+// TestSandboxEnv_PassesThroughHome 验证 HOME 被透传给子进程，让 gh / docker 等工具
+// 能读到用户的 ~/.config/gh 等配置。沙箱不再做 HOME 隔离，由用户自行控制风险。
+func TestSandboxEnv_PassesThroughHome(t *testing.T) {
+	const fakeHome = "/home/test-user-fake-home"
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", fakeHome)
+	defer func() {
+		if originalHome == "" {
+			os.Unsetenv("HOME")
+		} else {
+			os.Setenv("HOME", originalHome)
+		}
+	}()
+
 	env := sandboxEnv()
+
 	found := false
 	for _, e := range env {
-		if strings.HasPrefix(e, "HOME=") {
-			// 不能继承宿主机的真实 HOME（否则沙箱内命令能读到 ~/.ssh 等）
-			if e != "HOME=/tmp" && e != "HOME=%TEMP%" {
-				t.Fatalf("sandboxEnv HOME entry suspicious: %q (must be HOME=/tmp or HOME=%%TEMP%%)", e)
-			}
+		if e == "HOME="+fakeHome {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("sandboxEnv must contain a HOME=... entry; got env=%v", env)
+		t.Fatalf("sandboxEnv must pass through HOME=%s; got env=%v", fakeHome, env)
 	}
 }
 
 // TestSandboxEnv_PassesThroughAuthTokens 验证用户主动 export 的认证 token 会被透传。
-// 修复前：沙箱把所有 env 重置为空，gh / docker / kubectl 等工具无法复用用户凭证。
-// 修复后：GH_TOKEN / DOCKER_HOST / KUBECONFIG 等白名单变量会从父进程继承。
+// 解决 gh / docker / kubectl 等工具无法复用用户凭证的问题。
 func TestSandboxEnv_PassesThroughAuthTokens(t *testing.T) {
-	// 模拟用户在 shell 里 export 了 GH_TOKEN
 	const fakeToken = "ghp_fakeTestTokenForUnitTest1234567890abcdef"
 	const fakeConfigDir = "/home/user/.config/gh-fake"
 	os.Setenv("GH_TOKEN", fakeToken)
@@ -60,7 +65,6 @@ func TestSandboxEnv_PassesThroughAuthTokens(t *testing.T) {
 // TestSandboxEnv_DoesNotPassUnrelatedEnv 验证非白名单环境变量不会被透传。
 // 防止沙箱进程意外继承宿主机上的随机敏感变量（如 AWS_SECRET_ACCESS_KEY）。
 func TestSandboxEnv_DoesNotPassUnrelatedEnv(t *testing.T) {
-	// 模拟父进程有一些与"工具认证"无关的环境变量
 	os.Setenv("AWS_SECRET_ACCESS_KEY", "should-not-be-forwarded")
 	os.Setenv("RANDOM_GARBAGE_VAR", "should-not-be-forwarded")
 	defer os.Unsetenv("AWS_SECRET_ACCESS_KEY")
@@ -81,7 +85,6 @@ func TestSandboxEnv_DoesNotPassUnrelatedEnv(t *testing.T) {
 // TestSandboxEnv_HandlesEmptyTokenGracefully 验证父进程未设置 token 时不会写入空值。
 // 防止环境变量被设为空字符串后导致子进程行为异常。
 func TestSandboxEnv_HandlesEmptyTokenGracefully(t *testing.T) {
-	// 显式 unset 确保初始状态干净
 	os.Unsetenv("GH_TOKEN")
 
 	env := sandboxEnv()

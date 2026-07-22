@@ -28,19 +28,27 @@ func killProcessGroup(cmd *exec.Cmd) {
 }
 
 // sandboxEnv 返回沙箱内子进程使用的环境变量。
-// Windows 上尽量精简，仅保留 LANG/TZ/PATH。
 //
 // 透传策略：
-//   - HOME 固定为 %TEMP%，隔离用户目录下的敏感文件
-//   - 部分认证相关环境变量（GH_TOKEN / GH_CONFIG_DIR / DOCKER_HOST / KUBECONFIG）
-//     从父进程透传，便于工具复用用户已配置的凭证
+//   - HOME / USERPROFILE 透传父进程设置，让子进程能读到用户真实配置
+//   - PATH 用 Windows 系统默认精简版
+//   - TZ 设为 Asia/Shanghai
+//   - LANG 设为 zh_CN.UTF-8
+//   - 其余环境变量不传，避免沙箱进程继承宿主机的随机配置
 func sandboxEnv() []string {
 	env := []string{
-		"HOME=%TEMP%",
 		"PATH=%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\",
 		"TZ=Asia/Shanghai",
 		"LANG=zh_CN.UTF-8",
 	}
+	// 透传 HOME / USERPROFILE
+	if h := os.Getenv("HOME"); h != "" {
+		env = append(env, "HOME="+h)
+	}
+	if u := os.Getenv("USERPROFILE"); u != "" {
+		env = append(env, "USERPROFILE="+u)
+	}
+	// 透传认证类环境变量
 	for _, key := range []string{
 		"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "GH_HOST",
 		"DOCKER_HOST", "KUBECONFIG",
