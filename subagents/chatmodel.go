@@ -280,6 +280,11 @@ B. 【需要 Bash 授权才放行】其它受限操作：
 【九、调用约束】
 ========================================
 - 一次只调用一次 local_command（不要连续串多条，自己组装 || 管道）
+- **绝对禁止**在同一次 ChatModel 输出里塞超过 5 个 local_command / skill 工具调用——
+  eino 框架默认 MaxIterations=20；一次输出塞 20 个 tool_call 会在循环执行时
+  立即触发 "exceeds max iterations" 错误，让整个任务崩掉。
+  即使你"想收集信息"，也应该拆成 2-3 个 round：先 ls / 看结构 → 再 cat 关键文件
+  → 再综合判断。**不要**一次性把"cat X / cat Y / cat Z / wc -l A / wc -l B ..."全塞进去。
 - 只调用本平台允许的命令
 - 凭据相关：禁止读取 ~/.ssh / ~/.bash_history 等；token 必须从用户侧注入
 - 当遇到软禁止时，**优先**用一次"提示 + 等用户授权"的方式，而不是换其他命令绕过
@@ -513,6 +518,10 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string) adk.Agent {
 			messagehandler.NewAuthorizationMiddleware(),
 			messagehandler.NewRetryHintMiddleware(),
 		}, skillMw),
+		// 一次 ChatModel 生成 cycle 默认上限是 20。复杂排障场景下需要跑
+		// 大量命令（如 git fetch 失败 → 跑 7 步网络诊断），20 次会触顶报错
+		// "exceeds max iterations"。提到 50 留足余量。
+		MaxIterations: 50,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -598,12 +607,25 @@ func NewRouterAgent(store *session.Store) adk.Agent {
 等等
 
 【路由判定规则（按顺序）】
+0. **复合任务拆分（最优先）**：如果一条消息同时包含"分析 / 评审 / 解释 / review 文本"
+   和"提交 / 跑命令 / 创建 / 执行" 等多个动词，**视为复合任务**：
+   - "分析 X 然后提交 issue"、"review 然后写文件"、"看完帮我执行 Y" 这种
+     "分析 → 执行" 复合任务，**优先转 ChatAgent**——ChatAgent 做 review 后会
+     自然给用户结果（用户可后续单独说"提交 issue"再走 LocalCommandAgent）。
+   - 不要因为消息尾部出现"提交 issue"、"执行命令"就路由到 LocalCommandAgent，
+     让 LocalCommandAgent 一次性塞 20 个 cat 命令来"收集代码"——那是 review 任务
+     不该 LocalCommandAgent 做，会触发 max iterations 错误。
+   - 如果复合任务里"执行"部分完全依赖 review 结果（如 "review + 自动提交"），
+     转 ChatAgent，让 ChatAgent 给出最终建议；用户认可后再单独触发执行任务。
+
 1. **强语义优先**：消息里包含明确关键词
    - 包含 "天气"、"温度"、"下雨"、"湿度"、"风速"、"穿什么" 等 → 转 WeatherAgent。
    - 包含 "CPU"、"内存"、"磁盘"、"进程"、"系统状态"、"看日志"、"查端口"、
      "跑测试"、"go test"、"装个"、"安装"、"删除"、"卸载"、"查看配置"、
      "执行命令"、"shell"、"bash"、"命令行" 等系统查询/执行关键词 → 转 LocalCommandAgent。
-   - 包含纯闲聊、技术讨论、方案对比、概念解释、"你觉得"、"你怎么看"、代码 review → 转 ChatAgent。
+   - 包含纯闲聊、技术讨论、方案对比、概念解释、"你觉得"、"你怎么看"、
+     "代码 review"、"review 代码"、"评审代码"、"分析代码"、"代码分析"、
+     "帮我看下 main.go"、"代码 bug"、"提建议" → 转 ChatAgent。
 
 2. **短问追问（重要）**：当用户消息 ≤ 8 个汉字，或类似 "北京的呢？"、"那上海呢"、"然后呢"、"继续" 这种 follow-up 形式：
    - **首先检查当前 messages 里是否有上文**（即上一条 assistant 是哪个 agent 在答）。
