@@ -3,6 +3,7 @@
 package localcommand
 
 import (
+	"os"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -28,13 +29,27 @@ func killProcessGroup(cmd *exec.Cmd) {
 
 // sandboxEnv 返回沙箱内子进程使用的环境变量。
 // Windows 上尽量精简，仅保留 LANG/TZ/PATH。
+//
+// 透传策略：
+//   - HOME 固定为 %TEMP%，隔离用户目录下的敏感文件
+//   - 部分认证相关环境变量（GH_TOKEN / GH_CONFIG_DIR / DOCKER_HOST / KUBECONFIG）
+//     从父进程透传，便于工具复用用户已配置的凭证
 func sandboxEnv() []string {
-	return []string{
+	env := []string{
 		"HOME=%TEMP%",
 		"PATH=%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\",
 		"TZ=Asia/Shanghai",
 		"LANG=zh_CN.UTF-8",
 	}
+	for _, key := range []string{
+		"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "GH_HOST",
+		"DOCKER_HOST", "KUBECONFIG",
+	} {
+		if v := os.Getenv(key); v != "" {
+			env = append(env, key+"="+v)
+		}
+	}
+	return env
 }
 
 // sandboxWorkDir 返回沙箱工作目录。Windows 上用 %TEMP%。
