@@ -28,20 +28,10 @@ func (m *LanguageConstraintMiddleware) BeforeModelRewriteState(
 		return ctx, state, nil
 	}
 
-	var latestUserContent string
-	for i := len(state.Messages) - 1; i >= 0; i-- {
-		msg := state.Messages[i]
-		if msg.Role == schema.User {
-			latestUserContent = msg.Content
-			break
-		}
-	}
-
-	if latestUserContent == "" {
+	lang := detectLanguageFromHistory(state.Messages)
+	if lang == "unknown" {
 		return ctx, state, nil
 	}
-
-	lang := detectLanguage(latestUserContent)
 
 	var constraint string
 	switch lang {
@@ -63,6 +53,19 @@ func (m *LanguageConstraintMiddleware) BeforeModelRewriteState(
 	return ctx, state, nil
 }
 
+// detectLanguageFromHistory 优先看"最早一条 user message"——它反映了用户最初的语种偏好；
+// 若该 message 含英文字母命令（如 gh auth login），不会影响中文判定（因为中文比例远高于命令）。
+// 仅当整条 history 全英文时才返回 "en"。
+func detectLanguageFromHistory(messages []*schema.Message) string {
+	for _, msg := range messages {
+		if msg.Role != schema.User {
+			continue
+		}
+		return detectLanguage(msg.Content)
+	}
+	return "unknown"
+}
+
 func detectLanguage(text string) string {
 	chineseCount := 0
 	englishCount := 0
@@ -75,14 +78,15 @@ func detectLanguage(text string) string {
 		}
 	}
 
-	total := chineseCount + englishCount
-	if total == 0 {
+	if chineseCount == 0 && englishCount == 0 {
 		return "unknown"
 	}
 
-	chineseRatio := float64(chineseCount) / float64(total)
-
-	if chineseRatio >= 0.5 {
+	// 策略：消息含任意中文字符即判 zh。
+	// 理由：用户消息常中英混排（如 "在我的主机上执行 github登录，gh auth login"），
+	// 此时"中文 = 用户意图说明"，英文 = 命令片段或专有名词；中文比例被英文命令稀释，
+	// 仅靠比例阈值会误判。英文用户全用英文时不带中文字符，仍能正确判 en。
+	if chineseCount > 0 {
 		return "zh"
 	}
 	return "en"
