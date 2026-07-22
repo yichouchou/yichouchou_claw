@@ -20,8 +20,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"path/filepath"
 
+	"github.com/cloudwego/eino-ext/adk/backend/local"
 	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/adk/middlewares/skill"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
 	"github.com/cloudwego/eino/compose"
@@ -31,6 +34,31 @@ import (
 	"github.com/yichouchou/yichouchou_claw/internal/localcommand"
 	"github.com/yichouchou/yichouchou_claw/internal/session"
 )
+
+// buildSkillMiddleware 用本地文件系统 backend 创建 skill 中间件，
+// skillsDir 是包含若干 <skill-name>/SKILL.md 的根目录。
+//
+// 若 skillsDir 为空字符串，返回 (nil, nil)，调用方应跳过。
+// 若目录不存在或读 SKILL.md 失败，返回 error 由调用方决定是否 fatal。
+func buildSkillMiddleware(ctx context.Context, skillsDir string) (adk.ChatModelAgentMiddleware, error) {
+	if skillsDir == "" {
+		return nil, nil
+	}
+	be, err := local.NewBackend(ctx, &local.Config{})
+	if err != nil {
+		return nil, fmt.Errorf("local backend: %w", err)
+	}
+	backend, err := skill.NewBackendFromFilesystem(ctx, &skill.BackendFromFilesystemConfig{
+		Backend: be,
+		BaseDir: skillsDir,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("skill backend (%s): %w", skillsDir, err)
+	}
+	return skill.NewMiddleware(ctx, &skill.Config{
+		Backend: backend,
+	})
+}
 
 type GetWeatherInput struct {
 	City string `json:"city"`
@@ -263,7 +291,13 @@ B. 【需要 Bash 授权才放行】其它受限操作：
 // 这是本仓库"执行类"操作的唯一入口。它持有 local_command 工具，
 // 注册了 AuthorizationMiddleware 用于软禁止授权；
 // 不持有聊天工具——一旦完成命令执行就直接转回 RouterAgent / 用户。
-func NewLocalCommandAgent() adk.Agent {
+func NewLocalCommandAgent(ctx context.Context, skillsDir string) adk.Agent {
+	// 构造 skill 中间件（skillsDir 下属的 localcommand/ 目录里的 skill 列表会被加载）。
+	// 涵盖 system_diagnosis / git_operations / network_diagnosis 等命令模板。
+	skillMw, err := buildSkillMiddleware(ctx, filepath.Join(skillsDir, "localcommand"))
+	if err != nil {
+		log.Fatalf("LocalCommandAgent skill middleware: %v", err)
+	}
 	localCmdTool, err := utils.InferTool(
 		"local_command",
 		localCommandToolDesc,
@@ -474,11 +508,11 @@ func NewLocalCommandAgent() adk.Agent {
 				Tools: []tool.BaseTool{localCmdTool},
 			},
 		},
-		Handlers: []adk.ChatModelAgentMiddleware{
+		Handlers: append([]adk.ChatModelAgentMiddleware{
 			messagehandler.NewLanguageConstraintMiddleware(),
 			messagehandler.NewAuthorizationMiddleware(),
 			messagehandler.NewRetryHintMiddleware(),
-		},
+		}, skillMw),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -486,12 +520,16 @@ func NewLocalCommandAgent() adk.Agent {
 	return a
 }
 
-// NewChatAgent 创建"纯对话"agent。
-//
 // 不再持有 local_command 工具——所有"主机命令执行"类请求由 RouterAgent
 // 直接委派给 LocalCommandAgent 处理；ChatAgent 只负责闲聊、概念解释、
 // 技术方案讨论、代码 review、文档整理、翻译等不需要执行命令的任务。
-func NewChatAgent() adk.Agent {
+func NewChatAgent(ctx context.Context, skillsDir string) adk.Agent {
+	// 构造 skill 中间件（skillsDir 下属的 chat/ 目录里的 skill 列表会被加载）。
+	// 涵盖 general_chat（闲聊风格）/ code_review（代码 review 模板）等。
+	skillMw, err := buildSkillMiddleware(ctx, filepath.Join(skillsDir, "chat"))
+	if err != nil {
+		log.Fatalf("ChatAgent skill middleware: %v", err)
+	}
 	a, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:        "ChatAgent",
 		Description: "通用对话 agent：日常闲聊、通用知识问答、技术方案讨论、概念解释、代码 review、文档整理、翻译。**不**执行任何主机命令——命令执行类请求由 LocalCommandAgent 处理。",
@@ -530,9 +568,9 @@ func NewChatAgent() adk.Agent {
 - 不要伪造"已执行"的输出
 - 不要在 ChatAgent 里假装做了命令执行；如需执行，明确告诉用户会路由到 LocalCommandAgent`,
 		Model: model.NewChatModel(),
-		Handlers: []adk.ChatModelAgentMiddleware{
+		Handlers: append([]adk.ChatModelAgentMiddleware{
 			messagehandler.NewLanguageConstraintMiddleware(),
-		},
+		}, skillMw),
 	})
 	if err != nil {
 		log.Fatal(err)

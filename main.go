@@ -21,6 +21,8 @@ import (
 	"embed"
 	"log"
 	"net/url"
+	"os"
+	"path/filepath"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
@@ -46,8 +48,16 @@ func main() {
 	// 把 SDK 内部维护的完整多轮 messages 写回这里 —— 这是一个 eino 原生方案。
 	store := session.NewStore(maxConversationRounds)
 
+	// 解析 skills 根目录。约定：workdir/skills/chat/<skill>/SKILL.md
+	// 和 workdir/skills/localcommand/<skill>/SKILL.md。
+	//
+	// 用 exe 所在目录（server 启动目录）的"workdir/skills"——保证从任何 cwd 调用都能找到 skills。
+	// 找不到目录时不报错——subagents.NewXxx 会 fallback 到"无 skill"模式。
+	wd, _ := os.Getwd()
+	skillsRoot := filepath.Join(wd, "workdir", "skills")
+
 	weatherAgent := subagents.NewWeatherAgent()
-	chatAgent := subagents.NewChatAgent()
+	chatAgent := subagents.NewChatAgent(context.Background(), skillsRoot)
 	// 包装 ChatAgent / WeatherAgent / LocalCommandAgent：禁止它们转回 RouterAgent。
 	// 原因：这三个 sub-agent 都没有子 agent，但 eino 框架会自动给所有 sub-agent
 	// 添加 transfer_to_agent 工具，且默认目标包含父 agent（RouterAgent）。
@@ -58,7 +68,7 @@ func main() {
 	// transfer_to_agent 工具，让 LLM 看不到就不会调。
 	localCmdAgent := adk.AgentWithOptions(
 		context.Background(),
-		subagents.NewLocalCommandAgent(),
+		subagents.NewLocalCommandAgent(context.Background(), skillsRoot),
 		adk.WithDisallowTransferToParent(),
 	)
 	chatAgent = adk.AgentWithOptions(
