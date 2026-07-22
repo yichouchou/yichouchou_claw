@@ -47,7 +47,17 @@ func main() {
 
 	weatherAgent := subagents.NewWeatherAgent()
 	chatAgent := subagents.NewChatAgent()
-	localCmdAgent := subagents.NewLocalCommandAgent()
+	// 包装 LocalCommandAgent：禁止其转出到 RouterAgent。
+	// 原因：LocalCommandAgent 没有 sub-agent 可转，但 eino 框架会自动给所有
+	// 被设为 sub-agent 的 agent 添加 transfer_to_agent 工具，且默认目标包含父 agent。
+	// LLM 偶尔会误调这个工具试图转回 RouterAgent（或更糟：误以为自己本身就是
+	// sub-agent 之一），导致 "agent 'X' not found when transferring from 'Y'" 错误。
+	// 用 adk.WithDisallowTransferToParent() 关闭这条路径，并从工具列表中彻底移除。
+	localCmdAgent := adk.AgentWithOptions(
+		context.Background(),
+		subagents.NewLocalCommandAgent(),
+		adk.WithDisallowTransferToParent(),
+	)
 	// RouterAgent 挂上 PersistMiddleware，让最外层 ChatModelAgent 维护 messages。
 	routerAgent := subagents.NewRouterAgent(store)
 
