@@ -317,6 +317,14 @@ func IsDangerousWithAgent(ctx context.Context, agentName string, cmd string) (bo
 		return true, reason
 	}
 
+	// 1.5) Shell-only 重定向检测：沙箱用 strings.Fields 切 argv,不解析 shell
+	//      重定向。如果命令里含 2>&1 / 2>/dev/null / 1>&2 / >file / <file 等,
+	//      这些 token 会被当成命令参数,而不是 shell 语义,导致命令行为异常。
+	//      检测到就拒绝并告诉 LLM "重定向在沙箱里没意义,沙箱会自动捕获 stderr"。
+	if redirectErr := checkShellOnlyRedirect(cmd); redirectErr != "" {
+		return true, redirectErr
+	}
+
 	// 2) 敏感路径兜底
 	lowerCmd := strings.ToLower(cmd)
 	for _, path := range SensitivePaths {
@@ -384,6 +392,85 @@ func IsDangerousWithAgent(ctx context.Context, agentName string, cmd string) (bo
 
 // isInstallClassPattern 判断某个软禁止正则是否属于"安装类"。
 // 这些规则在有了 Install 授权后即可放行。
+// checkShellOnlyRedirect 检测命令里是否包含 shell-only 重定向语法,
+// 这些语法在沙箱里不生效（沙箱用 strings.Fields 切 argv,不调用 shell），
+// 必须主动拒绝并提示 LLM 改用沙箱的 stderr 字段。
+//
+// 检测的模式:
+//   - 2>&1 / 2>&2 / 1>&2 / &>file      (fd 复制)
+//   - 2>/dev/null / 1>/dev/null / &>/dev/null  (fd 重定向到黑洞)
+//   - 2>file / 1>file / >file / >>file  (写重定向)
+//   - <file / 0<file                    (读重定向)
+//   - <<EOF / <<'EOF'                   (here-doc)
+//
+// 注意:跳过单/双引号内的内容,因为引号内是字面量。
+//
+// 返回值：空字符串表示无重定向,非空字符串表示拒绝原因。
+func checkShellOnlyRedirect(cmd string) string {
+	redirectPatterns := []string{
+		// fd 复制 (含带空格和不带空格两种)
+		`2>&1`, `2>&2`, `1>&2`, `&>`, `2 > &1`, `1 > &2`,
+		// fd 重定向到黑洞 / 文件
+		`2>/dev/null`, `1>/dev/null`, `2>/dev/`, `1>/dev/`,
+		`&>/dev/null`, `&>/dev/`,
+		// 写重定向（不区分 > / >>）
+		`2>`, `1>`, `>>`,
+		// 读重定向
+		`< `, `0<`,
+		// here-doc
+		`<<`,
+	}
+	// 用一个简化的"跳过引号"扫描器
+	stripped := stripQuoted(cmd)
+	for _, p := range redirectPatterns {
+		if strings.Contains(stripped, p) {
+			return fmt.Sprintf(
+				"命令含 shell-only 重定向 %q,沙箱不解析 shell 语义（用 strings.Fields 切 argv）。"+
+					"这些 token 会被当成命令参数,而非重定向符号,导致命令行为异常。"+
+					"沙箱已经自动捕获 stderr,不需要在命令里加 2>&1 / 2>/dev/null 等。"+
+					"请去掉重定向符号后重试,例如 'cat foo' 而不是 'cat foo 2>&1'。",
+				p)
+		}
+	}
+	return ""
+}
+
+// stripQuoted 去掉命令里的单/双引号包裹内容,返回只剩 shell 语法部分的字符串。
+// 用于检测"命令里恰好含 2>&1 这个文本但被引号包着,不是真的重定向"的情况。
+func stripQuoted(s string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		// 单引号区段:整段跳过(里面所有字符都是字面量)
+		if s[i] == '\'' {
+			i++
+			for i < len(s) && s[i] != '\'' {
+				i++
+			}
+			if i < len(s) {
+				i++ // 跳过闭合单引号
+			}
+			b.WriteByte(' ')
+			continue
+		}
+		// 双引号区段:整段跳过($ 反引号 \\ 在双引号里仍有 shell 语义,但为简化判断,统一跳过)
+		if s[i] == '"' {
+			i++
+			for i < len(s) && s[i] != '"' {
+				i++
+			}
+			if i < len(s) {
+				i++
+			}
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
 func isInstallClassPattern(p *regexp.Regexp) bool {
 	src := p.String()
 	installKeywords := []string{
@@ -694,31 +781,48 @@ func executeWithShell(ctx context.Context, cmd string) (*CommandOutput, error) {
 		}
 	}
 
-	// 空 stdout 检测：exit 0 但 stdout 为空，常发生在 Claude Code CLI 等外部
-	// 工具被错误路由到 MiniMax / OpenAI 等不可用 provider 时。给 LLM 一个明确
-	// 提示,让它知道"成功了但没东西"是异常,而不是"OK 答完了"。
+	// 空 stdout 检测：常见于以下场景，给 LLM 一个明确提示,避免它误判"成功":
+	//   1. claude / node 等外部工具被错误路由到 MiniMax（ARK_BASE_URL 被读）
+	//   2. claude -p 跑完但 prompt 被路由到不同模型,空 stdout
+	//   3. 进程被 timeout 杀掉(exit -1),stdout 没机会 flush
 	argv := strings.Fields(cmd)
 	cmdName := ""
 	if len(argv) > 0 {
 		cmdName = argv[0]
 	}
-	if out.ExitCode == 0 && strings.TrimSpace(out.Stdout) == "" &&
-		strings.TrimSpace(out.Stderr) == "" {
-		// exit 0 + stdout 空 + stderr 空 —— "静默成功",极有可能是路由问题
-		out.Stderr = fmt.Sprintf(
-			"[沙箱警告] 命令 %q 退出码 0 但 stdout 和 stderr 都是空。\n"+
-				"常见原因:\n"+
-				"  1. Claude Code CLI 被路由到 MiniMax / OpenAI 等不可用 provider\n"+
-				"     (项目 .env 里的 ARK_BASE_URL / ARK_MODEL 可能被误读)\n"+
-				"     本次沙箱已剥离 ARK_ / OPENAI_ / VOLCENGINE_ 等前缀,如仍为空请检查 ANTHROPIC_API_KEY\n"+
-				"  2. claude CLI 启动失败但 exit code 仍 0\n"+
-				"  3. --add-dir 路径不存在或权限不足,claude CLI 提前退出\n"+
-				"建议: 加 --output-format json 看看是否同样空;或先用 claude auth status 确认认证\n",
-			cmdName)
-	} else if out.ExitCode == 0 && strings.TrimSpace(out.Stdout) == "" &&
-		strings.TrimSpace(out.Stderr) != "" {
-		// exit 0 + stdout 空 + stderr 非空 —— stderr 里有诊断信息但 LLM 容易忽略
-		out.Stderr += "\n\n[沙箱提示] 退出码 0 但 stdout 为空,stderr 包含诊断信息,请优先查看上面的错误输出。"
+	stdoutEmpty := strings.TrimSpace(out.Stdout) == ""
+	stderrEmpty := strings.TrimSpace(out.Stderr) == ""
+	if stdoutEmpty && stderrEmpty {
+		// 全空：exit 0 静默成功 / exit -1 timeout / exit 1 异常退出
+		switch {
+		case out.ExitCode == 0:
+			out.Stderr = fmt.Sprintf(
+				"[沙箱警告] 命令 %q 退出码 0 但 stdout 和 stderr 都是空。\n"+
+					"常见原因:\n"+
+					"  1. Claude Code CLI 被路由到 MiniMax / OpenAI 等不可用 provider\n"+
+					"     (项目 .env 里的 ARK_BASE_URL / ARK_MODEL 可能被误读)\n"+
+					"     本次沙箱已剥离 ARK_ / OPENAI_ / VOLCENGINE_ 等前缀,如仍为空请检查 ANTHROPIC_API_KEY\n"+
+					"  2. claude CLI 启动失败但 exit code 仍 0\n"+
+					"  3. --add-dir 路径不存在或权限不足,claude CLI 提前退出\n"+
+					"建议: 加 --output-format json 看看是否同样空;或先用 claude auth status 确认认证\n",
+				cmdName)
+		case out.ExitCode == -1:
+			out.Stderr = fmt.Sprintf(
+				"[沙箱警告] 命令 %q 被 sandbox timeout 杀掉(exit -1),stdout 未 flush。\n"+
+					"常见原因:\n"+
+					"  1. 命令运行时间超过沙箱默认 60s 超时\n"+
+					"  2. claude -p 等待网络响应过久\n"+
+					"建议: 加 --max-duration / 增大 timeout;或在沙箱外直接跑;或先用更短 prompt 验证链路\n",
+				cmdName)
+		default:
+			out.Stderr = fmt.Sprintf(
+				"[沙箱警告] 命令 %q 退出码 %d 但 stdout 和 stderr 都是空,无任何输出可供诊断。\n"+
+					"建议: 用 --verbose / --debug 重跑,或加 2>&1 让 stderr 流到 stdout(注:沙箱不解析 2>&1,本提示会报错,改用 echo 替代)\n",
+				cmdName, out.ExitCode)
+		}
+	} else if stdoutEmpty && !stderrEmpty {
+		// stderr 有诊断信息但 LLM 容易忽略
+		out.Stderr += "\n\n[沙箱提示] stdout 为空但 stderr 有输出,优先查看上面的错误/诊断信息。"
 	}
 	return out, nil
 }
