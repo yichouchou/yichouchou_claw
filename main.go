@@ -34,6 +34,7 @@ import (
 
 	"github.com/yichouchou/yichouchou_claw/internal/config"
 	"github.com/yichouchou/yichouchou_claw/internal/localcommand"
+	"github.com/yichouchou/yichouchou_claw/internal/memory"
 	"github.com/yichouchou/yichouchou_claw/internal/message"
 	"github.com/yichouchou/yichouchou_claw/internal/session"
 	"github.com/yichouchou/yichouchou_claw/subagents"
@@ -57,6 +58,20 @@ func main() {
 	// 找不到目录时不报错——subagents.NewXxx 会 fallback 到"无 skill"模式。
 	wd, _ := os.Getwd()
 	skillsRoot := filepath.Join(wd, "workdir", "skills")
+	memoryRoot := filepath.Join(wd, "workdir")
+
+	// 初始化 trace 记忆 recorder。默认写到 <workdir>/memory/；
+	// 通过 YICHOUCHOU_MEMORY=off 环境变量可整体关闭。
+	memRecorder, err := memory.NewMarkdownRecorder(memoryRoot)
+	if err != nil {
+		log.Fatalf("[main] failed to init memory recorder: %v", err)
+	}
+	if memRecorder != nil {
+		memory.SetRecorder(memRecorder)
+		log.Printf("[main] memory recorder enabled at %s", memRecorder.Root())
+	} else {
+		log.Printf("[main] memory recorder disabled")
+	}
 
 	// 加载执行审批配置（白名单/黑名单从 JSON 喂给沙箱）。
 	// 文件不存在 / 解析失败时不阻塞启动：沙箱会退回到"全部走 WhitelistAuth 授权"。
@@ -77,8 +92,8 @@ func main() {
 	}
 	log.Printf("[main] exec-approvals.json applied to %d agent(s): %v", loaded, config.ListAgentNames())
 
-	weatherAgent := subagents.NewWeatherAgent()
-	chatAgent := subagents.NewChatAgent(context.Background(), skillsRoot)
+	weatherAgent := subagents.NewWeatherAgent(memory.NewMemoryMiddleware("WeatherAgent"))
+	chatAgent := subagents.NewChatAgent(context.Background(), skillsRoot, memory.NewMemoryMiddleware("ChatAgent"))
 	// 包装 ChatAgent / WeatherAgent / LocalCommandAgent：禁止它们转回 RouterAgent。
 	// 原因：这三个 sub-agent 都没有子 agent，但 eino 框架会自动给所有 sub-agent
 	// 添加 transfer_to_agent 工具，且默认目标包含父 agent（RouterAgent）。
@@ -89,7 +104,7 @@ func main() {
 	// transfer_to_agent 工具，让 LLM 看不到就不会调。
 	localCmdAgent := adk.AgentWithOptions(
 		context.Background(),
-		subagents.NewLocalCommandAgent(context.Background(), skillsRoot),
+		subagents.NewLocalCommandAgent(context.Background(), skillsRoot, memory.NewMemoryMiddleware("LocalCommandAgent")),
 		adk.WithDisallowTransferToParent(),
 	)
 	chatAgent = adk.AgentWithOptions(
@@ -103,7 +118,7 @@ func main() {
 		adk.WithDisallowTransferToParent(),
 	)
 	// RouterAgent 挂上 PersistMiddleware，让最外层 ChatModelAgent 维护 messages。
-	routerAgent := subagents.NewRouterAgent(store)
+	routerAgent := subagents.NewRouterAgent(store, memory.NewMemoryMiddleware("RouterAgent"))
 
 	ctx := context.Background()
 	// 三个子 agent：纯对话 / 查天气 / 本机命令执行（沙箱+授权）
