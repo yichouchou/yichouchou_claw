@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -252,11 +253,31 @@ func IsHardForbidden(cmd string) (bool, string) {
 // IsDangerous 检查命令是否危险。
 //
 // 兼容旧签名（无 ctx）：等价于 IsDangerousWithContext(context.Background(), cmd)。
+// IsDangerous 兼容旧签名：默认以 "main" 作为 agent 名（兼容单元测试）。
 func IsDangerous(cmd string) (bool, string) {
-	return IsDangerousWithContext(context.Background(), cmd)
+	return IsDangerousWithAgent(context.Background(), "main", cmd)
 }
 
-// IsDangerousWithContext 在知道授权上下文的情况下判断命令是否危险。
+// IsDangerousWithContext 在知道授权上下文的情况下判断命令是否危险（agent="main"）。
+//
+// 兼容旧调用方；新代码请使用 IsDangerousWithAgent 并显式传入 agentName。
+func IsDangerousWithContext(ctx context.Context, cmd string) (bool, string) {
+	return IsDangerousWithAgent(ctx, "main", cmd)
+}
+
+// IsDangerousWithAgent 在知道授权上下文和 agent 名的前提下判断命令是否危险。
+//
+// agentName 在 per-agent 白/黑名单缓存里查策略：
+//   - 命中（命令名在 allowlist）→ 放行
+//   - 未命中 → 落 WhitelistAuth 授权分支
+//   - agentName 未在 cache 里加载过 → 沙箱"无黑白名单"，所有命令一律走授权
+//
+// 判定顺序：
+//
+// agentName：当前发起调用的 agent 名（"RouterAgent" / "LocalCommandAgent" /
+//
+//	"WeatherAgent" 等），用于在 per-agent 缓存里查自己的白/黑名单。未传或
+//	传空字符串 → 沙箱里"无黑白名单"，所有命令一律落 WhitelistAuth 授权兜底。
 //
 // 判定顺序：
 //  1. 命中 HardForbiddenPatterns → 硬禁止（永远拒绝）
@@ -269,7 +290,19 @@ func IsDangerous(cmd string) (bool, string) {
 //     - WhitelistAuth=true 且 (WhitelistCmd 为空或等于命令名) → 放行
 //     - 否则 → 拒绝（ErrNotInWhitelist）
 //  5. 未命中 → 放行
-func IsDangerousWithContext(ctx context.Context, cmd string) (bool, string) {
+//
+// agentName 解析优先级：
+//  1. 入参 agentName（非空）→ 用它
+//  2. ctx 中的 agentName（eino 工具调用入口通过 WithAgentName 注入）
+//  3. 都没传 → 用 "main" 作为兜底（保留旧的 IsDangerous / IsDangerousWithContext
+//     行为兼容旧测试）
+func IsDangerousWithAgent(ctx context.Context, agentName string, cmd string) (bool, string) {
+	if agentName == "" {
+		agentName = AgentNameFromContext(ctx)
+	}
+	if agentName == "" {
+		agentName = "main"
+	}
 	// 1) 硬禁止：永远拒绝
 	if dangerous, reason := IsHardForbidden(cmd); dangerous {
 		return true, reason
@@ -305,8 +338,17 @@ func IsDangerousWithContext(ctx context.Context, cmd string) (bool, string) {
 			pattern.String())
 	}
 
-	// 4) 白名单检查：命令不在白名单时，需要 WhitelistAuth 授权才能放行
-	if !isCommandAllowed(cmd) && !strings.Contains(cmd, "/") {
+	// 4) denylist 检查（per-agent）：用户配置层的"绝对禁止"，优先级高于白名单与所有授权。
+	//    denylist 命中的命令任何授权（包括 Bash / WhitelistAuth）都不能放行。
+	if isCommandDenied(agentName, cmd) {
+		cmdName := strings.Fields(cmd)[0]
+		return true, fmt.Sprintf("denylist 拒绝（任何授权都不能放行）: %s", cmdName)
+	}
+
+	// 5) 白名单检查（per-agent）：命令不在白名单时，需要 WhitelistAuth 授权才能放行。
+	//    注意：absolute path（"/" in cmd）走路径直跳分支，不做白名单校验
+	//    （这是历史行为，保留兼容性）。
+	if !isCommandAllowed(agentName, cmd) && !strings.Contains(cmd, "/") {
 		cmdName := strings.Fields(cmd)[0]
 		// WhitelistAuth=true 且（未指定具体命令 OR 指定的就是这条命令）→ 放行
 		if auth.WhitelistAuth && (auth.WhitelistCmd == "" || auth.WhitelistCmd == cmdName) {
@@ -351,15 +393,42 @@ type CommandOutput struct {
 	Duration string `json:"duration"`
 }
 
-// isCommandAllowed 检查命令是否在白名单
-func isCommandAllowed(cmd string) bool {
+// isCommandAllowed 检查命令是否在 agentName 对应的白名单。
+//
+// 白名单来源：workdir/config/exec-approvals.json 的 agents.<name>.allowlist。
+// 启动时由 main.go 遍历 config.ListAgentNames()，对每个 agent 调用一次
+// SetAllowedCommands(name) 注入到 allowedByAgent[name]。
+//
+// 行为：
+//   - agentName 未加载（cache 里查不到）→ 返回 false（沙箱"无白名单"，
+//     命令一律落 WhitelistAuth 授权兜底分支）
+//   - 否则按小写归一化的命令名查自己的那段 allowlist
+func isCommandAllowed(agentName string, cmd string) bool {
 	cmdName := strings.Fields(cmd)[0]
+	cache := allowedForAgent(agentName)
+	if cache == nil {
+		return false
+	}
 	if strings.Contains(cmd, "/") {
 		baseName := filepath.Base(cmdName)
-		_, ok := AllowedCommands[baseName]
+		_, ok := cache[strings.ToLower(baseName)]
 		return ok
 	}
-	_, ok := AllowedCommands[cmdName]
+	_, ok := cache[strings.ToLower(cmdName)]
+	return ok
+}
+
+// isCommandDenied 检查命令是否在 agentName 对应的 denylist（显式拒绝）。
+//
+// denylist 的优先级高于 allowlist：denylist 命中的命令即便出现在 allowlist
+// 也直接拒绝（这是双重保险，与 shell 调用方式无关）。
+func isCommandDenied(agentName string, cmd string) bool {
+	cmdName := strings.Fields(cmd)[0]
+	cache := deniedForAgent(agentName)
+	if cache == nil {
+		return false
+	}
+	_, ok := cache[strings.ToLower(cmdName)]
 	return ok
 }
 
@@ -681,12 +750,20 @@ func cleanupProcessGroup(cmds []*exec.Cmd) {
 
 // Execute 执行命令
 //
-// 从 ctx 中读取 AuthorizationScope；硬禁止永远拦截，
-// 软禁止根据授权决定是否放行。
+// 从 ctx 中读取 AuthorizationScope 与 agentName；硬禁止永远拦截，
+// 软禁止根据授权决定是否放行；per-agent 白/黑名单按 agentName 取自己那段。
 func Execute(ctx context.Context, input *CommandInput) (*CommandOutput, error) {
 	cmd := input.Command
 	if cmd == "" {
 		return nil, fmt.Errorf("命令不能为空")
+	}
+
+	// agentName 从 ctx 解析：先取 WithAgentName 注入的，否则 fallback 到 "main"。
+	// 若调用方通过 WithAgentName 注入了具体 agent（例如 LocalCommandAgent），
+	// 这里就拿到该名字，per-agent 白/黑名单缓存才能命中。
+	agentName := AgentNameFromContext(ctx)
+	if agentName == "" {
+		agentName = "main"
 	}
 
 	auth := ResolveAuthorization(ctx)
@@ -726,10 +803,10 @@ func Execute(ctx context.Context, input *CommandInput) (*CommandOutput, error) {
 			continue
 		}
 
-		// 安全检查（带授权感知）
-		// 白名单未命中会被 IsDangerousWithContext 当作软禁止处理，
+		// 安全检查（带授权感知 + per-agent 白/黑名单）
+		// 白名单未命中会被 IsDangerousWithAgent 当作软禁止处理，
 		// 由 AuthorizationScope.WhitelistAuth 授权后即可放行。
-		if dangerous, reason := IsDangerousWithContext(ctx, part); dangerous {
+		if dangerous, reason := IsDangerousWithAgent(ctx, agentName, part); dangerous {
 			hint := authorizationHint(reason, AuthorizationFromContext(ctx), part)
 			return &CommandOutput{
 				Stdout:   "",
@@ -951,13 +1028,34 @@ func firstLine(s string) string {
 	return ""
 }
 
-// GetAllowedCommands 返回允许的命令列表（带当前平台标识，方便 LLM 区分）
+// GetAllowedCommands 返回允许的命令列表（带当前平台标识，方便 LLM 区分）。
+//
+// 数据源：per-agent 白名单（来自 workdir/config/exec-approvals.json）。
+// 把所有已加载 agent 的白名单合并展示，便于 LLM 看到完整可用命令集合。
+// 若未加载（启动失败/未调用 SetAllowedCommands），返回"# 当前平台: X\n# 配置未加载"。
 func GetAllowedCommands() string {
-	header := fmt.Sprintf("# 当前平台: %s\n# 以下命令为 %s 平台允许的白名单命令：\n\n",
-		PlatformName, PlatformName)
-	var cmds []string
-	for name, desc := range AllowedCommands {
-		cmds = append(cmds, fmt.Sprintf("  %s: %s", name, desc))
+	header := fmt.Sprintf("# 当前平台: %s\n", PlatformName)
+	loaded := LoadedAgentNames()
+	if len(loaded) == 0 {
+		return header + "# 配置未加载：所有命令都需要 WhitelistAuth 授权。\n"
 	}
-	return header + strings.Join(cmds, "\n")
+	var lines []string
+	lines = append(lines, header+"# 以下命令为白名单命令（来自 exec-approvals.json）：")
+	for _, agentName := range loaded {
+		set := allowedForAgent(agentName)
+		if set == nil || len(set) == 0 {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("\n## agent=%s (allowlist)", agentName))
+		// 按命令名字典序输出，便于 LLM 阅读
+		keys := make([]string, 0, len(set))
+		for k := range set {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, name := range keys {
+			lines = append(lines, fmt.Sprintf("  %s: %s", name, set[name]))
+		}
+	}
+	return strings.Join(lines, "\n")
 }

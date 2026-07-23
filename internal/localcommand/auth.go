@@ -83,6 +83,35 @@ func AuthorizationFromContext(ctx context.Context) AuthorizationScope {
 	return v
 }
 
+// =====================================================================
+// agentName 上下文传递：per-agent 白/黑名单缓存的 key
+// =====================================================================
+//
+// 工具调用入口（adk/middlewares/...）通过 WithAgentName(ctx, "LocalCommandAgent")
+// 把"当前 agent 名"注入 ctx；IsDangerousWithAgent 从 ctx 里读取后，
+// 在 cache.go 的 allowedByAgent / deniedByAgent 里查自己那段策略。
+//
+// 若 ctx 里没注入 agentName（典型场景：直接单元测试 IsDangerous()），
+// 返回空字符串 → 沙箱按"未加载"处理（命令一律落 WhitelistAuth 授权兜底）。
+
+// agentNameContextKey 用于把当前 agent 名存入 context.Value。
+type agentNameContextKey struct{}
+
+// WithAgentName 把当前 agent 名写入 ctx。
+// 空字符串不会写入（视为不设置，调用方走默认 agent 名）。
+func WithAgentName(ctx context.Context, name string) context.Context {
+	if name == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, agentNameContextKey{}, name)
+}
+
+// AgentNameFromContext 从 ctx 读取当前 agent 名；不存在返回空字符串。
+func AgentNameFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(agentNameContextKey{}).(string)
+	return v
+}
+
 // Now 暴露给上层注入"测试时钟"，避免 time.Now 被硬编码到 IsDangerous。
 var Now = time.Now
 
