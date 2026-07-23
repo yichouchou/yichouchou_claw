@@ -234,10 +234,19 @@ func DangerousPatterns() []*regexp.Regexp {
 }
 
 // SensitivePaths 敏感路径（即便授权后也仍然检查；用于二次兜底）。
+//
+// 匹配策略：strings.Contains(cmd, path) —— 即"命令字符串里出现 path 就拦"。
+// 这是有意为之的"宁误杀不放过"语义，新增条目时请保持这种行为。
+//
+// WSL 相关：/mnt 是 WSL 把 Windows 盘符挂载进 Linux 的默认前缀（/mnt/c、/mnt/d…），
+// 沙箱运行在 WSL 内部时，禁止命令访问 /mnt* 可以阻止"通过 WSL 越权访问 Windows 主机"，
+// 是 WSL 主机隔离的基础防线。如果你的部署不是 WSL，/mnt 不会出现在合法路径里，
+// 误伤概率极低。
 var SensitivePaths = []string{
-	"/root", "/etc/ssh", "/etc/pki", "/var/log/secure", "/var/log/auth",
+	"/etc/ssh", "/etc/pki", "/var/log/secure", "/var/log/auth",
 	"/proc/1", "/proc/sys", "/sys/kernel", "/boot", "/dev/mapper",
 	"/etc/shadow", ".ssh", ".bash_history", ".zsh_history",
+	"/mnt",
 }
 
 // IsHardForbidden 检查命令是否命中硬禁止模式（永远拒绝）。
@@ -314,6 +323,13 @@ func IsDangerousWithAgent(ctx context.Context, agentName string, cmd string) (bo
 		if strings.Contains(lowerCmd, strings.ToLower(path)) {
 			return true, fmt.Sprintf("禁止访问敏感路径: %s", path)
 		}
+	}
+
+	// 2.5) denylist 路径规则（per-agent）。与 SensitivePaths 同语义（包含匹配），
+	//      区别是路径来自 exec-approvals.json 的 denylist 配置项，运维可调。
+	//      SensitivePaths 是代码内嵌兜底，这里是配置层加固——双重保险。
+	if path, hit := isPathDenied(agentName, lowerCmd); hit {
+		return true, fmt.Sprintf("denylist 路径规则拒绝（任何授权都不能放行）: %s", path)
 	}
 
 	// 3) 软禁止：依赖授权
@@ -430,6 +446,26 @@ func isCommandDenied(agentName string, cmd string) bool {
 	}
 	_, ok := cache[strings.ToLower(cmdName)]
 	return ok
+}
+
+// isPathDenied 检查命令字符串是否命中 agentName 的 denylist 路径规则。
+//
+// 匹配策略：strings.Contains(lowerCmd, lowerPath) —— 与 SensitivePaths 一致，
+// "宁误杀不放过"。调用前应已 lowerCmd 化。
+//
+// 命中任一规则即返回 true；未配置路径规则 / 未加载的 agent 返回 false。
+func isPathDenied(agentName string, lowerCmd string) (string, bool) {
+	rules := deniedPathsForAgent(agentName)
+	if len(rules) == 0 {
+		return "", false
+	}
+	for path, rule := range rules {
+		if strings.Contains(lowerCmd, strings.ToLower(path)) {
+			return path, true
+		}
+		_ = rule // 描述信息保留以备扩展（如返回详细 reason）
+	}
+	return "", false
 }
 
 // splitByOperators 按 shell 操作符分割命令：

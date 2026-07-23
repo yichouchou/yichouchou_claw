@@ -231,7 +231,8 @@
         {"bash": "chmod", "description": "修改文件/目录权限；写操作，由 Bash 授权覆盖；denylist 作为用户层额外保险"},
         {"bash": "sh", "description": "进入子 shell；shell 元编程入口，框架已在硬禁止中拦截 eval/exec/fork，sh 单独禁掉避免被当逃生通道"},
         {"bash": "sudo", "description": "提权执行；任何形式的 sudo 都不允许——越权操作"},
-        {"bash": "reboot", "description": "重启主机；高危，硬禁止模式已拦截，denylist 双保险"}
+        {"bash": "reboot", "description": "重启主机；高危，硬禁止模式已拦截，denylist 双保险"},
+        {"path": "/mnt", "description": "WSL 把 Windows 盘符挂载进 Linux 的默认前缀（/mnt/c、/mnt/d…）；沙箱运行在 WSL 内部时，禁止命令访问 /mnt* 以阻止「通过 WSL 越权访问 Windows 主机」——WSL 主机隔离的基础防线。代码层 SensitivePaths 已加 /mnt 作兜底，这里是配置层加固"}
       ]
     }
   }
