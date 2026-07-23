@@ -370,7 +370,13 @@ func IsDangerousWithAgent(ctx context.Context, agentName string, cmd string) (bo
 		if auth.WhitelistAuth && (auth.WhitelistCmd == "" || auth.WhitelistCmd == cmdName) {
 			return false, ""
 		}
-		return true, fmt.Sprintf("命令不在白名单中: %s", cmdName)
+		// 抛出包含"具体 bash 命令名 + 原命令片段"的错误信息，便于 LLM 诊断。
+		// 例如："命令不在白名单中: head (整条命令: 'cat foo.txt | head -200')"
+		cmdSnippet := cmd
+		if len(cmdSnippet) > 120 {
+			cmdSnippet = cmdSnippet[:120] + "..."
+		}
+		return true, fmt.Sprintf("命令不在白名单中: %s (整条命令: %q)", cmdName, cmdSnippet)
 	}
 
 	return false, ""
@@ -911,23 +917,30 @@ func authorizationHint(reason string, auth AuthorizationScope, cmd string) strin
 	// 白名单未命中：建议 WhitelistAuth 授权
 	if strings.HasPrefix(reason, "命令不在白名单中") {
 		cmdName := strings.Fields(cmd)[0]
+		// 提取整条命令片段（reason 中可能已经包含），用于诊断
+		cmdSnippet := cmd
+		if len(cmdSnippet) > 120 {
+			cmdSnippet = cmdSnippet[:120] + "..."
+		}
 		if auth.IsEmpty() {
 			return fmt.Sprintf(
-				`[授权提示] 命令 %q 不在本平台白名单中。`+
+				`[授权提示] bash 命令 %q 不在本平台白名单中。`+
+					`完整命令: %s。`+
 					`请用户在对话中明确授权，例如："授权运行 %s" / "我授权 %s" / "whitelist auth for %s" / "auth whitelist"。`+
-					`授权后我会自动重试执行。`,
-				cmdName, cmdName, cmdName, cmdName)
+					`授权后我会自动重试执行。`+
+					`若希望长期可用，可同时将该命令加入 workdir/config/exec-approvals.json 的 allowlist。`,
+				cmdName, cmdSnippet, cmdName, cmdName, cmdName)
 		}
 		if !auth.WhitelistAuth {
 			return fmt.Sprintf(
-				`[授权提示] 当前仅有 Install / Bash 授权，不含 WhitelistAuth。请用户授权白名单：`+
+				`[授权提示] 当前仅有 Install / Bash 授权，不含 WhitelistAuth。bash 命令 %q（完整命令: %s）需要用户授权白名单：`+
 					`"我授权运行 %s" / "whitelist auth for %s"。`,
-				cmdName, cmdName)
+				cmdName, cmdSnippet, cmdName, cmdName)
 		}
 		if auth.WhitelistAuth && auth.WhitelistCmd != "" && auth.WhitelistCmd != cmdName {
 			return fmt.Sprintf(
-				`[授权提示] 当前 WhitelistAuth 仅授权 %q，不含 %q。请用户追加授权或改为通用白名单放宽。`,
-				auth.WhitelistCmd, cmdName)
+				`[授权提示] 当前 WhitelistAuth 仅授权 %q，不含 %q（完整命令: %s）。请用户追加授权或改为通用白名单放宽。`,
+				auth.WhitelistCmd, cmdName, cmdSnippet)
 		}
 	}
 	// 软禁止：按需建议授权类型
