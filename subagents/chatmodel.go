@@ -313,6 +313,9 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string, extraHandlers .
 		"local_command",
 		localCommandToolDesc,
 		func(ctx context.Context, input *localcommand.CommandInput) (string, error) {
+			// 把 agent 名注入到 ctx,沙箱里的 per-agent 白/黑名单缓存才能命中。
+			// 否则 fallback 到 "main",沙箱里"无白名单",所有命令都会被报"不在白名单"。
+			ctx = localcommand.WithAgentName(ctx, "LocalCommandAgent")
 			// Execute 内部会从 ctx 读取 AuthorizationScope 决定是否放行软禁止
 			result, err := localcommand.Execute(ctx, input)
 			if err != nil {
