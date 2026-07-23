@@ -209,6 +209,11 @@ var AllowedCommands = map[string]string{
 	"node":    "Node.js 运行时（-v/-e/-p 等），仅限工作目录，禁止 -e 执行远程代码",
 	"npm":     "npm 包管理器（仅 list/view/ls/--version/audit/outdated），禁止 install/uninstall/update/run",
 
+	// ===== 外部 AI CLI 桥接 =====
+	// Anthropic Claude Code CLI（外部程序，通过 local_command 调用）。
+	// 仅暴露顶层命令名，参数级别的安全由 localcommand 软禁止 + 白名单兜底。
+	"claude-code": "Anthropic Claude Code CLI（query/task/docs/info 子命令），调用主机上的 claude-code 程序完成 Claude Code 官方文档查询与编码任务分发；禁止参数中携带 Authorization/Cookie/API Key 等敏感凭据，禁止走 --data/-F/-T 等敏感体上传",
+
 	// --- 包管理器（Linux） ---
 	"apt":      "APT 前端（仅 list/search/show/depends 等只读查询），禁止 install/remove/update/upgrade",
 	"apt-get":  "APT 后端（仅 list/search 等只读查询），禁止 install/remove/update",
