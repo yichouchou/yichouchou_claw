@@ -39,8 +39,9 @@ import (
 
 var (
 	cacheMu            sync.RWMutex
-	allowedByAgent     = map[string]map[string]string{} // agentName -> cmd -> description
-	deniedByAgent      = map[string]map[string]string{} // agentName -> cmd -> description
+	allowedByAgent     = map[string]map[string]string{}              // agentName -> cmd -> description
+	deniedByAgent      = map[string]map[string]string{}              // agentName -> cmd -> description（denylist 命令规则）
+	deniedPathByAgent  = map[string]map[string]config.DenylistRule{} // agentName -> path -> DenylistRule（denylist 路径规则）
 	loadedAgentNamesMu sync.RWMutex
 	loadedAgentNames   []string
 )
@@ -72,21 +73,34 @@ func SetAllowedCommands(agentName string) {
 }
 
 // SetDeniedCommands 把 agentName 的 denylist 注入到 per-agent 缓存。
+//
+// 同时处理两类规则：
+//   - DenylistRule.Bash 非空 → 注入 deniedByAgent[agentName]
+//   - DenylistRule.Path 非空 → 注入 deniedPathByAgent[agentName]
 func SetDeniedCommands(agentName string) {
 	policy := config.GetPolicy(agentName)
-	var newSet map[string]string
+
+	var cmdSet map[string]string
+	var pathSet map[string]config.DenylistRule
 	if policy != nil {
-		set := config.DenyCommandSet(policy)
-		newSet = make(map[string]string, len(set))
-		for cmd, rule := range set {
-			newSet[cmd] = rule.Description
+		cmds := config.DenyCommandSet(policy)
+		cmdSet = make(map[string]string, len(cmds))
+		for cmd, rule := range cmds {
+			cmdSet[cmd] = rule.Description
+		}
+		paths := config.DenyPathSet(policy)
+		pathSet = make(map[string]config.DenylistRule, len(paths))
+		for path, rule := range paths {
+			pathSet[path] = rule
 		}
 	} else {
-		newSet = map[string]string{}
+		cmdSet = map[string]string{}
+		pathSet = map[string]config.DenylistRule{}
 	}
 
 	cacheMu.Lock()
-	deniedByAgent[agentName] = newSet
+	deniedByAgent[agentName] = cmdSet
+	deniedPathByAgent[agentName] = pathSet
 	cacheMu.Unlock()
 
 	markLoaded(agentName)
@@ -135,6 +149,17 @@ func deniedForAgent(agentName string) map[string]string {
 	cacheMu.RLock()
 	defer cacheMu.RUnlock()
 	m, ok := deniedByAgent[agentName]
+	if !ok {
+		return nil
+	}
+	return m
+}
+
+// deniedPathsForAgent 取 agentName 的 denylist 路径规则缓存（只读视图）。
+func deniedPathsForAgent(agentName string) map[string]config.DenylistRule {
+	cacheMu.RLock()
+	defer cacheMu.RUnlock()
+	m, ok := deniedPathByAgent[agentName]
 	if !ok {
 		return nil
 	}

@@ -52,12 +52,37 @@ import (
 	"sync"
 )
 
-// CommandRule 一条命令规则。
+// CommandRule 一条命令规则（用于 allowlist；denylist 用 DenylistRule）。
 type CommandRule struct {
 	// Bash 命令名（如 ls / git / claude-code）。
 	Bash string `json:"bash"`
 	// Description 命令说明（喂给 LLM 帮助它理解语义；不做安全判定依据）。
 	Description string `json:"description"`
+}
+
+// DenylistRule 一条拒绝规则。支持两种规则类型：
+//
+//   - {"bash": "<cmd>",  "description": "..."} —— 命令名规则，匹配 argv[0]
+//   - {"path": "<path>", "description": "..."} —— 路径规则，匹配命令字符串里的路径
+//
+// 两条规则同时启用，命中任一即拒绝（沙箱在 "硬禁止" 之后、"软禁止" 之前检查）。
+type DenylistRule struct {
+	// Bash 命令名（与 Path 二选一）。
+	Bash string `json:"bash,omitempty"`
+	// Path 敏感路径前缀（与 Bash 二选一）。
+	Path string `json:"path,omitempty"`
+	// Description 规则说明（不参与判定）。
+	Description string `json:"description"`
+}
+
+// IsCommandRule 返回是否命令名规则。
+func (r DenylistRule) IsCommandRule() bool {
+	return strings.TrimSpace(r.Bash) != ""
+}
+
+// IsPathRule 返回是否路径规则。
+func (r DenylistRule) IsPathRule() bool {
+	return strings.TrimSpace(r.Path) != ""
 }
 
 // AgentPolicy 单个 agent 的执行审批策略。
@@ -70,8 +95,8 @@ type AgentPolicy struct {
 	Description string `json:"description"`
 	// Allowlist 允许执行的命令清单。
 	Allowlist []CommandRule `json:"allowlist"`
-	// Denylist 显式拒绝的命令清单（在 allowlist 之外叠加生效）。
-	Denylist []CommandRule `json:"denylist"`
+	// Denylist 显式拒绝的规则清单（命令名 + 路径），在 allowlist 之外叠加生效。
+	Denylist []DenylistRule `json:"denylist"`
 }
 
 // ExecApprovals 整个 exec-approvals.json 文件的根结构。
@@ -117,8 +142,8 @@ func Load(path string) error {
 			}
 		}
 		for i, r := range policy.Denylist {
-			if strings.TrimSpace(r.Bash) == "" {
-				return fmt.Errorf("config: %s.denylist[%d]: bash must be non-empty", agentName, i)
+			if !r.IsCommandRule() && !r.IsPathRule() {
+				return fmt.Errorf("config: %s.denylist[%d]: bash or path must be non-empty", agentName, i)
 			}
 		}
 	}
@@ -202,18 +227,42 @@ func AllowCommandSet(p *AgentPolicy) map[string]CommandRule {
 	return out
 }
 
-// DenyCommandSet 返回 policy 中所有 denylist 命令名的小写 set。
-func DenyCommandSet(p *AgentPolicy) map[string]CommandRule {
+// DenyCommandSet 返回 policy 中所有 denylist 命令名规则的小写 set。
+// 仅收集 IsCommandRule() 为真的条目；路径规则不计入。
+func DenyCommandSet(p *AgentPolicy) map[string]DenylistRule {
 	if p == nil {
 		return nil
 	}
-	out := make(map[string]CommandRule, len(p.Denylist))
+	out := make(map[string]DenylistRule, len(p.Denylist))
 	for _, r := range p.Denylist {
+		if !r.IsCommandRule() {
+			continue
+		}
 		key := strings.ToLower(strings.TrimSpace(r.Bash))
 		if key == "" {
 			continue
 		}
 		out[key] = r
+	}
+	return out
+}
+
+// DenyPathSet 返回 policy 中所有 denylist 路径规则的 map。
+// 仅收集 IsPathRule() 为真的条目；命令规则不计入。
+func DenyPathSet(p *AgentPolicy) map[string]DenylistRule {
+	if p == nil {
+		return nil
+	}
+	out := make(map[string]DenylistRule, len(p.Denylist))
+	for _, r := range p.Denylist {
+		if !r.IsPathRule() {
+			continue
+		}
+		path := strings.TrimSpace(r.Path)
+		if path == "" {
+			continue
+		}
+		out[path] = r
 	}
 	return out
 }
