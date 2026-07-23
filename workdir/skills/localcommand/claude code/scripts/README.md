@@ -1,212 +1,150 @@
 ---
 name: claude-code-scripts
-description: claude-code skill 的脚本资源说明。展示如何在 Eino 框架下集成 Claude Code 能力：通过 local_command 工具调用 claude-code CLI；通过 AgentAsTool 机制把 claude-code sub-agent 包装为可被其他 agent 调用的工具。覆盖 query / task / docs / info 四类命令。适用场景：编码助手、文档查阅、AI 开发工作流编排。
+description: claude-code skill 的脚本资源说明。展示如何在 eino 框架下通过 local_command 工具调用主机上的 claude CLI(Anthropic Claude Code 主入口)。覆盖 -p / --add-dir / --output-format / --model 等真实 CLI 选项。适用场景:编码助手、代码评审、自动化重构、架构 review、AI 开发工作流编排。
 context: inline
 ---
 
-# Claude Code Skill（Eino 适配版）
+# Claude Code Skill(eino 适配版)脚本说明
 
-将 Claude Code 的 AI 辅助开发能力整合进 Eino 框架：官方文档查询、编码任务管理、Claude Code sub-agent 调度、开发最佳实践与常见排障指南。
+本 skill 把 Anthropic Claude Code CLI 的能力集成进 eino 框架:非交互式编码任务(`-p`)、工作目录注入(`--add-dir`)、输出格式控制(`--output-format`)、模型覆盖(`--model`)等。
 
-> **职责说明**：本 skill 是一个"操作手册 + 工作流引导"。所有底层命令执行都依赖 Eino 内置的 `local_command` 工具；所有 sub-agent 调度都基于 Eino 的 `AgentAsTool` 委派机制。
+> **职责说明**:本文件是"脚本资源 + 工作流引导"。所有底层命令执行依赖 eino 内置的 `local_command` 工具;本 skill 不在 eino 内部实现 Claude Code 子 agent。
 
 ## 适用场景
 
-### 📚 文档查询
-- 查询 Claude Code 官方文档（subagents / agent-teams / best-practices / settings / mcp / plugins / troubleshooting）
-- 获取编码最佳实践与典型工作流
-- 排查常见问题
+### 📚 代码评审与理解
 
-### 🤖 编码任务管理
-- 创建编码 sub-agent 执行复杂任务
-- 管理 agent 团队
-- 自动化代码评审与 PR 工作流
+- PR diff 评审(给路径或文件给 `--add-dir`)
+- 全仓架构 review(指定 `--add-dir .`)
+- 解释陌生代码库(`claude -p "explain this repo"`)
 
-### 🛠️ 开发工作流
-- AI 辅助编码最佳实践
-- 通用工作流与模式
-- 自定义 settings 与配置
-- 故障排查指南
+### 🤖 自动化编码
 
-## 调用方式
+- 实现新功能(`claude -p "实现 X" --add-dir ./src --allowedTools Read,Edit`)
+- 重构(`claude -p "refactor X to Y" --model claude-sonnet-4-5`)
+- 测试编写(`claude -p "为 X 写单元测试"`)
 
-### 通过 local_command 直接调用 Claude Code CLI
+### 🛠️ 排障与调试
 
-```bash
-claude-code query "subagents"
-claude-code query "best-practices"
-claude-code task --description "Fix the login bug" --priority high
-claude-code docs
-claude-code info
-```
+- 复杂 Bug 修复工作流
+- 性能瓶颈定位
+- 配置文件语义分析
 
-### 通过 AgentAsTool 委派给 Claude Code sub-agent
-
-```go
-claudeCodeTool := adk.NewAgentTool(ctx, claudeCodeAgent)
-
-chatAgent, _ := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-    Name:        "ChatAgent",
-    Description: "通用对话 agent，可委派 Claude Code sub-agent 处理编码任务",
-    ToolsConfig: adk.ToolsConfig{
-        ToolsNodeConfig: compose.ToolsNodeConfig{
-            Tools: []tool.BaseTool{claudeCodeTool},
-        },
-    },
-})
-```
-
-主 agent 通过 `claude_code(task="...")` 形式触发子 agent，子 agent 在隔离 context 中跑 claude-code CLI，把结果汇总回主 agent。
-
-## 命令详解
-
-### query — 文档查询
+## 真实 CLI 接口(Anthropic Claude Code)
 
 ```bash
-claude-code query <topic>
+# 非交互模式 —— sandbox 里 LLM 最常用
+claude -p "explain the auth flow"
+claude -p "find all SQL injection risks" --add-dir ./src
+
+# 输出格式
+claude -p "..." --output-format text          # 默认
+claude -p "..." --output-format json         # 结构化
+claude -p "..." --output-format stream-json  # 流式
+
+# 模型覆盖
+claude -p "..." --model claude-sonnet-4-5
+claude -p "..." --model claude-opus-4-1
+
+# 工具白/黑名单
+claude --allowedTools "Bash,Read,Edit" -p "..."
+claude --disallowedTools "WebSearch,WebFetch" -p "..."
+
+# 会话继续
+claude -c -p "再列出 3 个待办"
 ```
 
-**示例**：
+**详细选项**:见主 SKILL.md 的"选项速查"表。
 
-```bash
-claude-code query "subagents"
-claude-code query "agent-teams"
-claude-code query "best practices"
-claude-code query "common workflows"
-claude-code query "settings"
-claude-code query "troubleshooting"
-claude-code query "mcp"
-```
+## ⚠️ 命令名澄清
 
-**支持的主题**：subagents / agent-teams / best-practices / common-workflows / settings / troubleshooting / plugins / mcp / Headless / Programmatic 用法
+| 名称 | 状态 | 备注 |
+|---|---|---|
+| `claude` | ✅ 真实存在 | Anthropic Claude Code CLI 主入口 |
+| `claude-code` | ❌ 不存在 | OpenClaw 旧命令名,调了会 "command not found" |
+| `claude-code query/task/docs/info` | ❌ 不存在 | OpenClaw 旧 CLI 假语法,LLM 不要调 |
 
-### task — 创建编程任务
+## 与 eino 框架的集成
 
-```bash
-claude-code task --description "<任务描述>" [--priority <level>] [--model <model-name>]
-```
-
-**选项**：
-- `--description, -d`：任务描述（必填）
-- `--priority, -p`：优先级（low / medium / high，默认 medium）
-- `--model, -m`：指定模型（可选）
-
-**示例**：
-
-```bash
-claude-code task --description "实现用户认证模块"
-claude-code task --description "重构数据库查询" --priority high
-claude-code task --description "编写 API 单元测试" --model claude-3-5-sonnet
-```
-
-### docs — 文档章节概览
-
-```bash
-claude-code docs [section]
-```
-
-**章节**：
-
-- `quickstart` — 入门指南
-- `best-practices` — AI 编码最佳实践
-- `common-workflows` — 典型开发工作流
-- `settings` — 自定义选项
-- `troubleshooting` — 常见问题与解决方案
-- `all` — 完整文档概览（默认）
-
-**示例**：
-
-```bash
-claude-code docs
-claude-code docs quickstart
-claude-code docs best-practices
-claude-code docs troubleshooting
-```
-
-### info — 显示配置状态
-
-```bash
-claude-code info
-```
-
-**输出**：版本信息 / 可用 sub-agents / 已配置模型 / MCP servers 状态
-
-## 与 Eino 框架的集成
-
-- **Sub-agent 委派**：Claude Code sub-agent 通过 Eino 的 AgentAsTool 机制被其他 agent 调用，主 agent 在隔离 context 中接收结果
-- **命令执行**：通过 Eino 的 `local_command` 工具在受限沙箱中执行 claude-code CLI，保留硬禁止 / 软禁止授权机制
-- **文件管理**：与 Eino 的 filesystem 中间件组合，实现完整代码库读写
-- **会话管理**：Claude Code 任务继承 Eino 的 session / store 机制
-- **流式输出**：AgentAsTool 配置 `EmitInternalEvents` 后，Claude Code sub-agent 的内部事件可实时转发给终端用户
+- **命令执行**:通过 eino 的 `local_command` 工具在受限沙箱中执行 `claude` CLI,保留硬禁止 / 软禁止授权机制
+- **白名单**:`workdir/config/exec-approvals.json` 中 `claude` 已在 allowlist
+- **env 净化**:localcommand 沙箱默认剥离 `ARK_*` / `OPENAI_*` / `VOLCENGINE_*` / `COZE_*` / `MINIMAX_*`,只透传 `ANTHROPIC_*` / `CLAUDE_*`,确保 `claude` 走真实 Anthropic API
+- **路径隔离**:SensitivePaths 与 denylist path `/mnt` 双重拦截,WSL 内禁止访问 Windows 主机
+- **会话管理**:Claude Code 自己的会话机制(`claude -c`),与 eino session.Store 互不干涉
 
 ## 工作流示例
 
 ### 复杂 Bug 修复
 
 ```bash
-claude-code query "debugging best practices"
-claude-code task --description "定位并修复 userService.js 中的空指针异常" --priority high
-claude-code query "code review best practices"
+# 1. 先让 Claude 列出可能根因
+claude -p "分析 userService.js 中 NPE 的可能根因,输出 3 个最可能的" \
+  --add-dir ./src --output-format text
+
+# 2. 再让 Claude 写修复 patch
+claude -p "基于上述根因,输出修复后的 userService.js 完整代码" \
+  --add-dir ./src --allowedTools "Read,Edit"
 ```
 
 ### 新功能开发
 
 ```bash
-claude-code query "API design best practices"
-claude-code task --description "实现用户管理的 REST API" --priority medium
-claude-code query "code style settings"
+# 1. 设计评审
+claude -p "评审我打算给用户管理加 REST API 的方案,给出 3 个改进点" \
+  --add-dir ./docs/api-design.md
+
+# 2. 实现
+claude -p "按评审意见实现 user API" \
+  --add-dir ./src --output-format text
 ```
 
 ### 自动化代码评审
 
 ```bash
-claude-code query "PR review workflows"
-claude-code task --description "评审过去一周的所有 PR" --priority low
+claude -p "评审以下 diff,按严重度(高/中/低)列出问题" \
+  --add-dir ./pr-1234.diff --output-format json | \
+  jq '.[] | select(.severity=="high")'
 ```
+
+## ⚠️ scripts/ 目录说明
+
+| 文件 | 状态 | 用途 |
+|---|---|---|
+| `install.sh` | ✅ 有用 | Linux 安装脚本,把 skill 拷到另一个 eino 项目的 skills 目录(可选) |
+| `README.md` | ✅ 当前文件 | 本文档,解释脚本与用法 |
+| `claude-code.py` | ❌ 不被本 skill 调用 | OpenClaw 旧封装,保留仅为历史兼容;**LLM 不要调它** |
 
 ## 配置
 
 ### 环境变量
 
-基础使用无需配置。Claude Code 集成通过 Eino 的原生能力调用 LLM，复用 Eino 已配置的 ChatModel。
+- `ANTHROPIC_API_KEY` —— 必填其一,或在首次使用时 OAuth 登录
+- `CLAUDE_*` —— 透传到沙箱子进程
+- `ARK_*` / `OPENAI_*` / `VOLCENGINE_*` / `COZE_*` / `MINIMAX_*` —— 会被沙箱剥离,不会污染 `claude` CLI 的 base_url
 
 ### 模型
 
-使用 Eino 的默认 ChatModel。可通过 Eino 的 ChatModel 配置（`adk/common/model/`）全局切换，或在 `claude-code task` 调用时通过 `--model` 覆盖。
-
-### Sub-agent 数量限制
-
-由 Eino 的 sub-agent 配置管理（`adk.AgentWithOptions(WithMaxIterations(N))`）。当前默认 MaxIterations=50，足以支撑复杂排障场景。
+- 默认使用 Claude Code CLI 默认模型
+- 通过 `--model` 在每次调用覆盖(如 `--model claude-sonnet-4-5`)
 
 ## 与原 Claude Code CLI 共存
 
-如果你在主机上同时安装了 Claude Code CLI：
-
 ```bash
-claude-code query "API design"   # 本 skill（通过 local_command）
-claude code "implement API"      # Claude Code CLI（直接调用，需登录）
+claude -p "implement X"     # Claude Code CLI(Anthropic 官方)
 ```
 
-两套体系可以共存：
-
-- **本 skill**：通过 Eino 沙箱走 LLM 调度，所有命令受白名单 + 授权约束
-- **Claude Code CLI**：直接与 Anthropic 服务交互，需要 Anthropic 账号
+无 OpenClaw "claude-code" 二进制共存的问题 —— `claude-code` 命令在本机不存在。
 
 ## 注意事项
 
-- 本 skill 是 Claude Code 工作流的封装层，所有 LLM 调用走 Eino 已配置的 ChatModel
-- 复杂编码任务通过 Eino 的 sub-agent 系统执行，受沙箱边界保护
-- claude-code CLI 的完整能力需要单独安装 Claude Code（见 https://claude.com/code）
-- 任务执行均通过 Eino 的安全 agent 基础设施
+- 本 skill 是 Claude Code CLI 的薄封装层,所有 LLM 调用由 Claude Code CLI 自行处理
+- 任务执行走主机 Claude Code,**不**经过 eino 的 sub-agent 系统
+- Claude Code CLI 的完整能力需要在主机上单独安装(见 <https://claude.com/code>)
+- 所有命令执行受 localcommand 的五段链路约束(硬禁止 / 软禁止 / 白名单 / 敏感路径 / denylist path)
+- `scripts/claude-code.py` 是历史遗留,不要调用
 
 ## 参考资料
 
-- Claude Code 官方文档：https://code.claude.com/docs
-- Eino 框架：https://github.com/cloudwego/eino
-- 最佳实践：源自 Claude Code 指南并适配 Eino 概念
-
-## 版本
-
-- 当前版本：1.0.0（Eino 适配版）
-- 兼容性：Eino v0.x / cloudwego/eino-adk
-- 最后更新：基于原 OpenClaw claude-code skill 1.0.0 转译
+- Claude Code 官方文档:<https://code.claude.com/docs>
+- Claude Code 安装:<https://claude.com/code>
+- eino 框架:<https://github.com/cloudwego/eino>
