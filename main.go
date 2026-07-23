@@ -32,6 +32,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/hertz-contrib/sse"
 
+	"github.com/yichouchou/yichouchou_claw/internal/config"
+	"github.com/yichouchou/yichouchou_claw/internal/localcommand"
 	"github.com/yichouchou/yichouchou_claw/internal/message"
 	"github.com/yichouchou/yichouchou_claw/internal/session"
 	"github.com/yichouchou/yichouchou_claw/subagents"
@@ -55,6 +57,25 @@ func main() {
 	// 找不到目录时不报错——subagents.NewXxx 会 fallback 到"无 skill"模式。
 	wd, _ := os.Getwd()
 	skillsRoot := filepath.Join(wd, "workdir", "skills")
+
+	// 加载执行审批配置（白名单/黑名单从 JSON 喂给沙箱）。
+	// 文件不存在 / 解析失败时不阻塞启动：沙箱会退回到"全部走 WhitelistAuth 授权"。
+	approvalsPath := filepath.Join(wd, "workdir", "config", "exec-approvals.json")
+	if err := config.Load(approvalsPath); err != nil {
+		log.Fatalf("[main] failed to parse %s: %v", approvalsPath, err)
+	}
+	// 把白名单/黑名单从内存 config 注入到沙箱缓存。
+	// 遍历 exec-approvals.json 里所有 agent 配置（RouterAgent / ChatAgent /
+	// LocalCommandAgent / WeatherAgent …），每个 agent 各取自己那段策略。
+	// 配置里没列的 agent 不会被遍历到，沙箱里"无黑白名单"——命令一律落到
+	// WhitelistAuth 授权分支，由用户授权后才能放行。
+	loaded := 0
+	for _, agentName := range config.ListAgentNames() {
+		localcommand.SetAllowedCommands(agentName)
+		localcommand.SetDeniedCommands(agentName)
+		loaded++
+	}
+	log.Printf("[main] exec-approvals.json applied to %d agent(s): %v", loaded, config.ListAgentNames())
 
 	weatherAgent := subagents.NewWeatherAgent()
 	chatAgent := subagents.NewChatAgent(context.Background(), skillsRoot)
