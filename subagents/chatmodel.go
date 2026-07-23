@@ -505,7 +505,14 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string) adk.Agent {
 - 当 [授权提示] 出现时，原样转给用户，不要自己改写措辞
 
 【强约束】
-- 你没有可以转出的 sub-agent，**严禁**调用 transfer_to_agent 或任何形式的转出工具
+- 你没有可以转出的 sub-agent，**严禁**调用 transfer_to_agent 或任何形式的转出工具。
+  框架已经把你的 transfer_to_agent 工具从 toolsNode 中移除（WithDisallowTransferToParent），
+  你**看不到**这个工具；如果你的训练惯性让你输出了 "transfer_to_agent(...)" 的 tool_call，
+  框架会立刻报 "[NodeRunError] tool transfer_to_agent not found in toolsNode indexes"，
+  **这条错误不可恢复，必须立即停止重试**，转为文本回答用户。
+- **不要重复发起 transfer_to_agent**：你已经在 LocalCommandAgent 里了，再 transfer 是死循环。
+  如果某一步"看上去"需要"转回 RouterAgent / ChatAgent"，直接用文本回答用户即可，
+  不要试图转移（LocalCommandAgent 没兄弟 agent）。
 - 永远不要为了绕过沙箱而重新表述或编码软禁止命令；遇到就老老实实告诉用户需要授权`,
 		Model: model.NewChatModel(),
 		ToolsConfig: adk.ToolsConfig{
@@ -655,6 +662,10 @@ func NewRouterAgent(store *session.Store) adk.Agent {
 【强约束】
 - 不要在 instruction 中复述任何工具调用细节给用户听。
 - 不要重复发起 transfer_to_agent；一次请求最多一次路由。
+  如果上一轮已经成功转给 LocalCommandAgent（tool result 含 "successfully transferred to agent"），
+  当前轮你已经在 LocalCommandAgent 内执行后续动作，不需要再 transfer。
+  如果再次调 transfer_to_agent，框架会因工具不可见而报 "[NodeRunError] tool transfer_to_agent not found"，
+  这条错误会导致整个 run 失败，必须避免。
 - 你自己不要回答业务问题；永远先把任务委派给最合适的 agent。
 - LocalCommandAgent 处理完后用户可以继续追问命令执行相关内容；后续追问应优先转回 LocalCommandAgent，而不是 ChatAgent。`,
 		Model: model.NewChatModel(),
