@@ -222,7 +222,8 @@
         {"bash": "apropos", "description": "按关键词搜索 man 页面"},
         {"bash": "whereis", "description": "定位命令的二进制/源码/man 路径"},
         {"bash": "command", "description": "POSIX shell builtin，配合 -v/-V 定位可执行文件，等价于 which/type；其他用法见 builtin 白名单"},
-        {"bash": "claude-code", "description": "Anthropic Claude Code CLI（query/task/docs/info 子命令），调用主机上的 claude-code 程序完成 Claude Code 官方文档查询与编码任务分发"}
+        {"bash": "claude-code", "description": "Anthropic Claude Code CLI（query/task/docs/info 子命令），调用主机上的 claude-code 程序完成 Claude Code 官方文档查询与编码任务分发"},
+        {"bash": "claude", "description": "Anthropic Claude Code CLI 主入口（-p/--add-dir/--output-format 等），与 claude-code 同义，区别是它是 anthropic 官方默认命令名；调用主机上的 claude 程序"}
       ],
       "denylist": [
         {"bash": "rm", "description": "任意 rm（包括 rm file / rm -f file / rm -rf 等）；已被硬禁止模式与软禁止授权覆盖，denylist 是用户配置层的最后一道保险"},
