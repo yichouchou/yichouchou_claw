@@ -64,7 +64,7 @@ type GetWeatherInput struct {
 	City string `json:"city"`
 }
 
-func NewWeatherAgent() adk.Agent {
+func NewWeatherAgent(extraHandlers ...adk.ChatModelAgentMiddleware) adk.Agent {
 	weatherTool, err := utils.InferTool(
 		"get_weather",
 		"获取指定城市的当前天气。",
@@ -75,6 +75,10 @@ func NewWeatherAgent() adk.Agent {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	handlers := append([]adk.ChatModelAgentMiddleware{
+		messagehandler.NewLanguageConstraintMiddleware(),
+	}, extraHandlers...)
 
 	a, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:        "WeatherAgent",
@@ -93,9 +97,7 @@ func NewWeatherAgent() adk.Agent {
 				Tools: []tool.BaseTool{weatherTool},
 			},
 		},
-		Handlers: []adk.ChatModelAgentMiddleware{
-			messagehandler.NewLanguageConstraintMiddleware(),
-		},
+		Handlers: handlers,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -296,7 +298,11 @@ B. 【需要 Bash 授权才放行】其它受限操作：
 // 这是本仓库"执行类"操作的唯一入口。它持有 local_command 工具，
 // 注册了 AuthorizationMiddleware 用于软禁止授权；
 // 不持有聊天工具——一旦完成命令执行就直接转回 RouterAgent / 用户。
-func NewLocalCommandAgent(ctx context.Context, skillsDir string) adk.Agent {
+//
+// extraHandlers 追加到默认的中间件（language / authorization / retry / skill）
+// 之后；用于在不改这个函数的前提下注入额外的 ChatModelAgentMiddleware
+// （例如 internal/memory.MemoryMiddleware）。
+func NewLocalCommandAgent(ctx context.Context, skillsDir string, extraHandlers ...adk.ChatModelAgentMiddleware) adk.Agent {
 	// 构造 skill 中间件（skillsDir 下属的 localcommand/ 目录里的 skill 列表会被加载）。
 	// 涵盖 system_diagnosis / git_operations / network_diagnosis 等命令模板。
 	skillMw, err := buildSkillMiddleware(ctx, filepath.Join(skillsDir, "localcommand"))
@@ -520,11 +526,11 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string) adk.Agent {
 				Tools: []tool.BaseTool{localCmdTool},
 			},
 		},
-		Handlers: append([]adk.ChatModelAgentMiddleware{
+		Handlers: append(append([]adk.ChatModelAgentMiddleware{
 			messagehandler.NewLanguageConstraintMiddleware(),
 			messagehandler.NewAuthorizationMiddleware(),
 			messagehandler.NewRetryHintMiddleware(),
-		}, skillMw),
+		}, skillMw), extraHandlers...),
 		// 一次 ChatModel 生成 cycle 默认上限是 20。复杂排障场景下需要跑
 		// 大量命令（如 git fetch 失败 → 跑 7 步网络诊断），20 次会触顶报错
 		// "exceeds max iterations"。提到 50 留足余量。
@@ -539,7 +545,7 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string) adk.Agent {
 // 不再持有 local_command 工具——所有"主机命令执行"类请求由 RouterAgent
 // 直接委派给 LocalCommandAgent 处理；ChatAgent 只负责闲聊、概念解释、
 // 技术方案讨论、代码 review、文档整理、翻译等不需要执行命令的任务。
-func NewChatAgent(ctx context.Context, skillsDir string) adk.Agent {
+func NewChatAgent(ctx context.Context, skillsDir string, extraHandlers ...adk.ChatModelAgentMiddleware) adk.Agent {
 	// 构造 skill 中间件（skillsDir 下属的 chat/ 目录里的 skill 列表会被加载）。
 	// 涵盖 general_chat（闲聊风格）等。code_review skill 已迁到
 	// LocalCommandAgent 下，因为代码 review 任务通常需要读项目目录代码，
@@ -586,9 +592,9 @@ func NewChatAgent(ctx context.Context, skillsDir string) adk.Agent {
 - 不要伪造"已执行"的输出
 - 不要在 ChatAgent 里假装做了命令执行；如需执行，明确告诉用户会路由到 LocalCommandAgent`,
 		Model: model.NewChatModel(),
-		Handlers: append([]adk.ChatModelAgentMiddleware{
+		Handlers: append(append([]adk.ChatModelAgentMiddleware{
 			messagehandler.NewLanguageConstraintMiddleware(),
-		}, skillMw),
+		}, skillMw), extraHandlers...),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -604,7 +610,7 @@ func NewChatAgent(ctx context.Context, skillsDir string) adk.Agent {
 //   - ChatAgent：闲聊、通用问答、技术讨论
 //   - WeatherAgent：查天气
 //   - LocalCommandAgent：执行主机 bash 命令（含沙箱授权）
-func NewRouterAgent(store *session.Store) adk.Agent {
+func NewRouterAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMiddleware) adk.Agent {
 	a, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:        "RouterAgent",
 		Description: "一个智能任务路由器，负责将任务分配给其他专家 agent。",
@@ -671,11 +677,11 @@ func NewRouterAgent(store *session.Store) adk.Agent {
 		Model: model.NewChatModel(),
 		// 只在 RouterAgent 上注册 PersistMiddleware，让最外层 agent 在每次成功结束后
 		// 把完整 messages 写入 store；子 agent（ChatAgent / WeatherAgent / LocalCommandAgent）不会触发。
-		Handlers: []adk.ChatModelAgentMiddleware{
+		Handlers: append([]adk.ChatModelAgentMiddleware{
 			session.NewPersistMiddleware(store),
 			messagehandler.NewLanguageConstraintMiddleware(),
 			messagehandler.NewAuthorizationMiddleware(),
-		},
+		}, extraHandlers...),
 	})
 	if err != nil {
 		log.Fatal(err)
