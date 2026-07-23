@@ -748,7 +748,26 @@ func Execute(ctx context.Context, input *CommandInput) (*CommandOutput, error) {
 
 	out, err := ExecuteChain(ctx, stages)
 	if err != nil {
-		return out, err
+		// 启动失败（命令找不到 / PATH 中不存在 / 权限拒绝等）→ 不要把 raw error
+		// 抛给 eino 框架包装成 NodeRunError，而是转成结构化 CommandOutput，
+		// 让 LLM 能看到诊断信息并自行决定下一步（换命令 / 装软件 / 告知用户）。
+		firstArg := ""
+		if len(stages) > 0 && len(stages[0].Argv) > 0 {
+			firstArg = stages[0].Argv[0]
+		}
+		stderr := err.Error()
+		hint := commandNotFoundHint(firstArg, stderr)
+		if hint == "" {
+			hint = fmt.Sprintf("[诊断] 命令 %q 启动失败（%s）。\n"+
+				"请 LLM 判断：是否命令未安装（让用户安装）？是否平台差异（改用本平台等价命令）？是否参数错误？",
+				firstArg, firstLine(stderr))
+		}
+		return &CommandOutput{
+			Stdout:   "",
+			Stderr:   stderr + "\n\n" + hint,
+			ExitCode: -1,
+			Duration: "0s",
+		}, nil
 	}
 
 	// 平台提示：如果命令找不到（Windows 上常见的 Linux 工具），附加解释。
