@@ -1,3 +1,5 @@
 .env
 *.log
 workdir/memory/*
+workdir/memory/
+workdir/memory
