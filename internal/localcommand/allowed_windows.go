@@ -166,6 +166,20 @@ var AllowedCommands = map[string]string{
 	"help":            "CMD/PowerShell 内置，命令帮助（替代 man）",
 	"get-help":        "PowerShell 内置，详细帮助",
 
+	// --- Python / Node / 通用脚本运行时 ---
+	"python":  "Python 解释器入口（2.x/3.x，-c/-m/-V/-h 等），仅限工作目录；禁止 -c 执行远程代码",
+	"python3": "Python 3 解释器入口（-c/-m/-V/-h 等），仅限工作目录；禁止 -c 执行远程代码",
+	"py":      "Windows Python Launcher（按指定版本号启动已安装的 Python，如 py -3），仅限工作目录",
+	"pip":     "pip 包管理器（仅 list/show/check/freeze 等只读查询），禁止 install/uninstall",
+	"pip3":    "pip3 包管理器（仅 list/show/check/freeze 等只读查询），禁止 install/uninstall",
+	"node":    "Node.js 运行时（-v/-e/-p 等），仅限工作目录，禁止 -e 执行远程代码",
+	"npm":     "npm 包管理器（仅 list/view/ls/--version/audit/outdated），禁止 install/uninstall/update/run",
+
+	// --- 外部 AI CLI 桥接 ---
+	// Anthropic Claude Code CLI（外部程序，通过 local_command 调用）。
+	// 仅暴露顶层命令名，参数级别的安全由 localcommand 软禁止 + 白名单兜底。
+	"claude-code": "Anthropic Claude Code CLI（query/task/docs/info 子命令），调用主机上的 claude-code 程序完成 Claude Code 官方文档查询与编码任务分发；禁止参数中携带 Authorization/Cookie/API Key 等敏感凭据，禁止走 --data/-F/-T 等敏感体上传",
+
 	// ===== 防火墙与安全 =====
 	"netsh advfirewall show allprofiles": "查看所有防火墙 profile 状态",
 	"get-netfirewallrule":                "PowerShell 内置，查看防火墙规则（替代 iptables -L）",
