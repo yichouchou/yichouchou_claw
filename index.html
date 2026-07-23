@@ -339,8 +339,8 @@
         .thinking-icon {
             transition: transform 0.2s;
         }
-        .thinking-block.collapsed .thinking-icon {
-            transform: rotate(-90deg);
+        .thinking-block:not(.collapsed) .thinking-icon {
+            transform: rotate(90deg);
         }
         .thinking-block.collapsed .thinking-body {
             display: none;
@@ -749,9 +749,9 @@
                             <span>yichouchou_claw</span>
                             <span class="agent-tag"></span>
                         </div>
-                        <div class="thinking-block" style="display:none">
+                        <div class="thinking-block collapsed" style="display:none">
                             <div class="thinking-header" onclick="toggleThinking(this)">
-                                <span class="thinking-icon">▼</span>
+                                <span class="thinking-icon">▶</span>
                                 <span><span class="thinking-dot"></span>已深度思考</span>
                             </div>
                             <div class="thinking-body"></div>
