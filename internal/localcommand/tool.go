@@ -693,6 +693,33 @@ func executeWithShell(ctx context.Context, cmd string) (*CommandOutput, error) {
 			}
 		}
 	}
+
+	// 空 stdout 检测：exit 0 但 stdout 为空，常发生在 Claude Code CLI 等外部
+	// 工具被错误路由到 MiniMax / OpenAI 等不可用 provider 时。给 LLM 一个明确
+	// 提示,让它知道"成功了但没东西"是异常,而不是"OK 答完了"。
+	argv := strings.Fields(cmd)
+	cmdName := ""
+	if len(argv) > 0 {
+		cmdName = argv[0]
+	}
+	if out.ExitCode == 0 && strings.TrimSpace(out.Stdout) == "" &&
+		strings.TrimSpace(out.Stderr) == "" {
+		// exit 0 + stdout 空 + stderr 空 —— "静默成功",极有可能是路由问题
+		out.Stderr = fmt.Sprintf(
+			"[沙箱警告] 命令 %q 退出码 0 但 stdout 和 stderr 都是空。\n"+
+				"常见原因:\n"+
+				"  1. Claude Code CLI 被路由到 MiniMax / OpenAI 等不可用 provider\n"+
+				"     (项目 .env 里的 ARK_BASE_URL / ARK_MODEL 可能被误读)\n"+
+				"     本次沙箱已剥离 ARK_ / OPENAI_ / VOLCENGINE_ 等前缀,如仍为空请检查 ANTHROPIC_API_KEY\n"+
+				"  2. claude CLI 启动失败但 exit code 仍 0\n"+
+				"  3. --add-dir 路径不存在或权限不足,claude CLI 提前退出\n"+
+				"建议: 加 --output-format json 看看是否同样空;或先用 claude auth status 确认认证\n",
+			cmdName)
+	} else if out.ExitCode == 0 && strings.TrimSpace(out.Stdout) == "" &&
+		strings.TrimSpace(out.Stderr) != "" {
+		// exit 0 + stdout 空 + stderr 非空 —— stderr 里有诊断信息但 LLM 容易忽略
+		out.Stderr += "\n\n[沙箱提示] 退出码 0 但 stdout 为空,stderr 包含诊断信息,请优先查看上面的错误输出。"
+	}
 	return out, nil
 }
 

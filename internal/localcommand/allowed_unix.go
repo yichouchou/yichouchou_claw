@@ -3,9 +3,7 @@
 package localcommand
 
 import (
-	"os"
 	"os/exec"
-	"strings"
 	"syscall"
 )
 
@@ -32,32 +30,17 @@ func killProcessGroup(cmd *exec.Cmd) {
 // sandboxEnv 返回沙箱内子进程使用的环境变量。
 //
 // 透传策略：
-//   - 完全透传宿主机环境，让 gh / docker / kubectl 等工具能复用用户所有配置
+//   - 透传宿主机环境，让 gh / docker / kubectl 等工具能复用用户所有配置
 //   - 仅追加/覆盖 PATH 和 TZ（PATH 防止子进程找不到系统命令；TZ 保证日志时间本地化）
-//   - 不再做任何变量过滤，由硬禁止模式 + 软禁止授权机制负责安全拦截
+//   - 关键：剥离"其他 LLM 提供方"前缀（ARK_ / OPENAI_ / VOLCENGINE_ / COZE_ /
+//     MINIMAX_ 等），避免 Claude Code CLI 启动时被路由到 MiniMax/OpenAI 等
+//     不可用 provider 导致 claude -p 输出空 stdout 或无响应。
+//   - 保留 ANTHROPIC_* / CLAUDE_*，确保 Claude Code CLI 能拿到真实 API key。
+//
+// 实现委托给 sandboxBaseEnv（无 build tag，跨平台共享），本文件只保留
+// Unix 特有的 platformSysProcAttr / killProcessGroup。
 func sandboxEnv() []string {
-	env := os.Environ() // 透传宿主机全部环境变量
-	hasPath := false
-	for _, e := range env {
-		if strings.HasPrefix(e, "PATH=") {
-			hasPath = true
-			break
-		}
-	}
-	if !hasPath {
-		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-	}
-	hasTZ := false
-	for _, e := range env {
-		if strings.HasPrefix(e, "TZ=") {
-			hasTZ = true
-			break
-		}
-	}
-	if !hasTZ {
-		env = append(env, "TZ=Asia/Shanghai")
-	}
-	return env
+	return sandboxBaseEnv()
 }
 
 // sandboxWorkDir 返回沙箱工作目录。
