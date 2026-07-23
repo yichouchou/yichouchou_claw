@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
@@ -150,6 +151,25 @@ func handleStreamingMessage(s *sse.Stream, event *adk.AgentEvent, stream *schema
 			ToolCalls: concatenatedMsg.ToolCalls,
 		}); err != nil {
 			return err
+		}
+	}
+
+	// Fallback：streaming chunk 里如果完全没下发 ToolCalls（某些 LLM 后端 / 模型
+	// 在 streaming 模式下只回 content 不回 tool_calls），上面的累积 map 是空的，
+	// 就直接拿 event.Output.MessageOutput.Message（非 streaming 路径下 eino 会
+	// 把完整 message 放在这里）兜底提取 tool_calls 并推一次 SSE。
+	if len(toolCallsMap) == 0 && event.Output != nil && event.Output.MessageOutput != nil {
+		if m := event.Output.MessageOutput.Message; m != nil && len(m.ToolCalls) > 0 {
+			log.Printf("[streamMessageOutput] fallback tool_calls from event.Message count=%d agent=%s",
+				len(m.ToolCalls), event.AgentName)
+			if err := SendSSEEvent(s, SSEEvent{
+				Type:      "tool_calls",
+				AgentName: event.AgentName,
+				RunPath:   formatRunPath(event.RunPath),
+				ToolCalls: m.ToolCalls,
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
