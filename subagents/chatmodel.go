@@ -25,9 +25,11 @@ import (
 	"github.com/cloudwego/eino-ext/adk/backend/local"
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/adk/middlewares/skill"
+	einomodel "github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
 	"github.com/cloudwego/eino/compose"
+	"github.com/cloudwego/eino/schema"
 
 	"github.com/yichouchou/yichouchou_claw/adk/common/model"
 	messagehandler "github.com/yichouchou/yichouchou_claw/adk/middlewares/messageHandler"
@@ -58,6 +60,39 @@ func buildSkillMiddleware(ctx context.Context, skillsDir string) (adk.ChatModelA
 	return skill.NewMiddleware(ctx, &skill.Config{
 		Backend: backend,
 	})
+}
+
+// NewChatModelForRefiner 返回一个独立的 ChatModel 实例,专供 memory LLM
+// refine worker 使用。与 ChatModelAgent 共享同一个 model.NewChatModel()
+// 工厂(同一 provider/配置),但**不挂在 agent 链上**,refine worker 直接
+// 调 Generate 不依赖 adk 框架。
+//
+// 注意:返回 nil 表示环境未配置 ChatModel(API key 缺失等),
+// 调用方需判空后禁用 refine。
+func NewChatModelForRefiner() einomodel.ToolCallingChatModel {
+	// model.NewChatModel 在出错时 log.Fatalf — 不能在 refine 启动时让主进程挂。
+	// 用 defer recover 兜底。
+	var cm einomodel.ToolCallingChatModel
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[subagents] NewChatModelForRefiner panic: %v (memory refine disabled)", r)
+				cm = nil
+			}
+		}()
+		cm = model.NewChatModel()
+	}()
+	if cm == nil {
+		return nil
+	}
+	// 包装:ToolCallingChatModel.WithTools 返回新实例(并发安全),让 refine
+	// 走的 ChatModel 是"空 tools"副本,不会被外部 tool 配置影响。
+	wrapped, err := cm.WithTools([]*schema.ToolInfo{})
+	if err != nil {
+		log.Printf("[subagents] WithTools wrap failed: %v (refine uses raw ChatModel)", err)
+		return cm
+	}
+	return wrapped
 }
 
 type GetWeatherInput struct {

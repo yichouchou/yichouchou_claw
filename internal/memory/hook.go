@@ -4,20 +4,16 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 )
 
-// hookLogPrefix is the log tag used by the MemoryMiddleware.
-const hookLogPrefix = "[memory.hook]"
-
 // MaxContentPreview caps the size of LLM input / output payloads dumped to
-// the sessions/ summary file. The dedicated inputs/ and outputs/ files
-// receive the full payload. 8 KiB is enough to debug a prompt without
-// making the review log unreadable.
+// the summary file. 8 KiB is enough to debug a prompt without making the
+// review log unreadable. The dedicated inputs/ and outputs/ files receive
+// the full payload.
 const MaxContentPreview = 8 * 1024
 
 // sessionCtxKey is the key under which main.go stores the session id in
@@ -25,40 +21,41 @@ const MaxContentPreview = 8 * 1024
 // main.go don't drift.
 const sessionCtxKey = "session_id"
 
-// MemoryMiddleware implements adk.ChatModelAgentMiddleware. It captures
-// five kinds of events:
+// requestGroupIDCtxKey 会话中传递 request_group_id 的 ctx key。
 //
-//  1. session start  (BeforeAgent)
-//  2. LLM input      (BeforeModelRewriteState — model-bound messages)
-//  3. LLM output     (AfterModelRewriteState — last assistant message)
-//  4. tool error     (WrapInvokableToolCall — catches non-nil error returns)
-//  5. session end    (AfterAgent)
+// main.go 在 adk.WithSessionValues 里同时注入 session_id 和 request_group_id,
+// memory middleware 从 ctx 读 request_group_id 后注入到 ctx values(memory.WithRequestGroupID),
+// 让下游 RecordLLMInput/RecordLLMOutput 写 front-matter 时拿到这个 ID。
 //
-// All events go through the package-wide Recorder. If no recorder is set
-// (SetRecorder never called, or YICHOUCHOU_MEMORY=off), the middleware is
-// a silent no-op: no allocations, no logging, no overhead beyond one map
-// lookup per method invocation.
+// 必须与 session.KeyRequestGID 字面值一致,以便同一 request_group_id 在 SDK
+// chain 与 memory 包之间无障碍传递。
+const hookRequestGroupIDKey = "request_group_id"
+
+// MemoryMiddleware 实现 adk.ChatModelAgentMiddleware。
 //
-// Per-agent wiring: each ChatModelAgent gets its own MemoryMiddleware
-// instance with the agent name baked in, so the markdown files distinguish
-// RouterAgent from ChatAgent / LocalCommandAgent / WeatherAgent.
+// 三个核心职责:
+//  1. 注入 llm_trace_id:每次 BeforeModelRewriteState 前生成新 UUID,让后续
+//     RecordLLMInput / RecordLLMOutput 配对
+//  2. 把模型调用的 input / output 落盘到 inputs/ outputs/,完整 payload
+//  3. 捕获工具错误,落到 errors/
+//
+// 异步契约:每个 hook 调 SafeRecord* fire-and-forget,worker 异步写盘。
+//
+// Per-agent wiring:每个 ChatModelAgent 自己的 MemoryMiddleware 实例,
+// agent name 注入到每条 entry 的 front-matter。
 type MemoryMiddleware struct {
 	*adk.BaseChatModelAgentMiddleware
 
-	// AgentName is written verbatim into each markdown entry. Required.
+	// AgentName 写到每条 entry 的 front-matter。必填。
 	AgentName string
 }
 
-// NewMemoryMiddleware constructs a middleware bound to AgentName. Pass
-// the same agent name you used in ChatModelAgentConfig.Name so log lines
-// can be traced back to the agent that produced them.
+// NewMemoryMiddleware 构造绑了 AgentName 的 middleware。
+// 用法和 ChatModelAgentConfig.Name 一致。
 func NewMemoryMiddleware(agentName string) *MemoryMiddleware {
 	return &MemoryMiddleware{AgentName: agentName}
 }
 
-// agentName returns the configured agent name, falling back to "unknown"
-// if the caller forgot to set it. We never panic: a misconfigured agent
-// is far less damaging than a panic in the request path.
 func (m *MemoryMiddleware) agentName() string {
 	if m == nil || m.AgentName == "" {
 		return "unknown"
@@ -66,8 +63,7 @@ func (m *MemoryMiddleware) agentName() string {
 	return m.AgentName
 }
 
-// sessionID extracts the session id injected by main.go via
-// adk.WithSessionValues. Empty string means "not in a request scope".
+// sessionID 提取 main.go 通过 adk.WithSessionValues 注入的 session id。
 func (m *MemoryMiddleware) sessionID(ctx context.Context) string {
 	if v, ok := adk.GetSessionValue(ctx, sessionCtxKey); ok {
 		if s, ok := v.(string); ok {
@@ -77,38 +73,53 @@ func (m *MemoryMiddleware) sessionID(ctx context.Context) string {
 	return ""
 }
 
-// BeforeAgent records a session_start marker. We don't dump messages
-// here because BeforeModelRewriteState will fire before the first model
-// call and will dump the full conversation as "input".
-func (m *MemoryMiddleware) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
-	if GetRecorder() == nil {
-		return ctx, runCtx, nil
+// requestGroupID 提取 main.go 通过 adk.WithSessionValues 注入的 request_group_id。
+// 用于把本次浏览器请求触发的所有 LLM 调用 entry(user_request + N 个 llm +
+// user_response)在 front-matter 串联起来。
+func (m *MemoryMiddleware) requestGroupID(ctx context.Context) string {
+	if v, ok := adk.GetSessionValue(ctx, hookRequestGroupIDKey); ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
 	}
-	sid := m.sessionID(ctx)
-	GetRecorder().RecordSessionStart(sid, m.agentName())
-	return ctx, runCtx, nil
+	return ""
 }
 
-// BeforeModelRewriteState dumps the messages that are about to be sent
-// to the model. State is the SDK's authoritative view (already includes
-// any prior tool results), so we don't have to re-walk the agent.
+// BeforeModelRewriteState 在 eino 把 state 发给 ChatModel 之前:
+//  1. 生成新 llm_trace_id 注入 ctx(后续 RecordLLMOutput 自动配对)
+//  2. 把 messages 完整 payload 落盘到 inputs/
+//
+// state.Messages 是 SDK 权威视图(已含之前工具结果),无需重走 agent。
 func (m *MemoryMiddleware) BeforeModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, _ *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
 	if GetRecorder() == nil {
 		return ctx, state, nil
 	}
+
+	// 每次 ChatModel 调用一个新 llm_trace_id 注入 ctx
+	// 即使 sid 为空也注入,让下游(AfterModelRewriteState / WrapInvokableToolCall)
+	// 能拿到配对 ID。Recording 跳过即可。
+	traceID := NewLLMTraceID()
+	ctx = WithLLMTraceID(ctx, traceID)
+	ctx = WithAgentName(ctx, m.agentName())
+
 	sid := m.sessionID(ctx)
 	if sid == "" {
 		return ctx, state, nil
 	}
+
+	// 把 adk.WithSessionValues 注入的 request_group_id 桥接到 memory.WithRequestGroupID,
+	// 让 AsyncMarkdownRecorder.RecordLLMInput/Output 自动写到 front-matter。
+	if gid := m.requestGroupID(ctx); gid != "" {
+		ctx = WithRequestGroupID(ctx, RequestGroupID(gid))
+	}
+
 	body := formatMessagesAsInput(state.Messages)
-	safeInput(sid, m.agentName(), []byte(body))
+	SafeRecordLLMInput(ctx, sid, traceID, m.agentName(), []byte(body))
 	return ctx, state, nil
 }
 
-// AfterModelRewriteState dumps the assistant message that the model just
-// produced (the last entry in state.Messages). If the model issued
-// tool_calls, we render the call list as well so the markdown review log
-// shows *what the model asked for* without needing to scroll to outputs/.
+// AfterModelRewriteState 把 ChatModel 刚生成的助手消息落盘到 outputs/。
+// 配对规则:从 ctx 取 LLMTraceID,与 BeforeModelRewriteState 注入的同一 ID。
 func (m *MemoryMiddleware) AfterModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, _ *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
 	if GetRecorder() == nil {
 		return ctx, state, nil
@@ -117,53 +128,39 @@ func (m *MemoryMiddleware) AfterModelRewriteState(ctx context.Context, state *ad
 	if sid == "" || len(state.Messages) == 0 {
 		return ctx, state, nil
 	}
+
+	traceID := LLMTraceIDFromContext(ctx) // BeforeModelRewriteState 注入
+	if traceID == "" {
+		traceID = NewLLMTraceID() // fallback(理论上不会发生)
+	}
+
 	last := state.Messages[len(state.Messages)-1]
 	body := formatMessageAsOutput(last)
-	safeOutput(sid, m.agentName(), []byte(body))
+	SafeRecordLLMOutput(ctx, sid, traceID, m.agentName(), []byte(body))
 	return ctx, state, nil
 }
 
-// AfterAgent records a session_end marker. We do NOT dump messages here
-// because the same data already appears in inputs/ and outputs/.
-func (m *MemoryMiddleware) AfterAgent(ctx context.Context, _ *adk.ChatModelAgentState) (context.Context, error) {
-	r := GetRecorder()
-	if r == nil {
-		return ctx, nil
-	}
-	sid := m.sessionID(ctx)
-	if sid == "" {
-		return ctx, nil
-	}
-	if err := r.RecordSessionEnd(sid, m.agentName()); err != nil {
-		log.Printf("%s RecordSessionEnd err=%v", hookLogPrefix, err)
-	}
-	return ctx, nil
-}
-
-// WrapInvokableToolCall intercepts tool errors. Streamed tool calls
-// (WrapStreamableToolCall) are left alone: a stream error is logged by
-// the framework, and the invokable path covers local_command / get_weather
-// which is where most actionable errors surface.
+// WrapInvokableToolCall 拦截工具错误(同步路径)。
+// 流式路径(WrapStreamableToolCall)留空:框架已 log,invokable 路径覆盖
+// 大部分可操作错误(local_command / get_weather 等)。
 //
-// The wrapper is transparent on success: same return value, same error.
+// 透明包装:成功时同样返回,只捕获 error。
 func (m *MemoryMiddleware) WrapInvokableToolCall(ctx context.Context, endpoint adk.InvokableToolCallEndpoint, tCtx *adk.ToolContext) (adk.InvokableToolCallEndpoint, error) {
 	wrapped := func(c context.Context, args string, opts ...tool.Option) (string, error) {
 		out, err := endpoint(c, args, opts...)
 		if err != nil {
 			sid := m.sessionID(c)
+			traceID := LLMTraceIDFromContext(c)
 			ctxStr := fmt.Sprintf("tool=%s call_id=%s args=%s",
-				tCtx.Name, tCtx.CallID, truncate(args, 200))
-			safeError(sid, m.agentName(), err, ctxStr)
+				tCtx.Name, tCtx.CallID, TruncateBytes(args, 200))
+			SafeRecordError(c, sid, traceID, m.agentName(), err, ctxStr)
 		}
 		return out, err
 	}
 	return wrapped, nil
 }
 
-// formatMessagesAsInput renders a multi-line text view of all messages
-// that are about to be sent to the model. The format is intentionally
-// human-readable (not JSON) so a reviewer can grep through a day's
-// traces without parsing tooling.
+// formatMessagesAsInput 把即将发给模型的多轮 messages 渲染成可读文本。
 func formatMessagesAsInput(msgs []*schema.Message) string {
 	if len(msgs) == 0 {
 		return "(no messages)"
@@ -189,8 +186,7 @@ func formatMessagesAsInput(msgs []*schema.Message) string {
 	return buf.String()
 }
 
-// formatMessageAsOutput renders a single assistant message. If the
-// message carries tool_calls, each call is dumped on its own line.
+// formatMessageAsOutput 渲染一条助手消息(含 tool_calls)。
 func formatMessageAsOutput(msg *schema.Message) string {
 	if msg == nil {
 		return "(nil message)"
@@ -214,8 +210,6 @@ func formatMessageAsOutput(msg *schema.Message) string {
 	return buf.String()
 }
 
-// truncate keeps the first n bytes of s and appends an ellipsis marker.
-// Used by input / output dumps to keep markdown viewable.
 func truncate(s string, n int) string {
 	if n <= 0 || len(s) <= n {
 		return s

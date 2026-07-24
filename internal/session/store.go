@@ -14,6 +14,16 @@ const storeLogPrefix = "[session]"
 // 通过 adk.WithSessionValues 注入到 ctx，middleware 可从 ctx 中读取。
 const KeySessionID = "session_id"
 
+// KeyRequestGID 是 SessionValues 中用来传递"本次浏览器请求组 ID"的 key。
+//
+// 一个浏览器请求(用户视角:一次 request + 一次 response)可能触发 N 次
+// LLM 调用(Router → ChatAgent → 工具 → 再调用)。用 request_group_id
+// 把这 N 次 LLM 调用聚合起来,方便 sessions 目录的回溯与精修定位。
+//
+// 由 main.go handleChat 在请求开始时生成,通过 adk.WithSessionValues
+// 注入 ctx,middleware 从 ctx 中读取。
+const KeyRequestGID = "request_group_id"
+
 // Store 是一个简单的内存版多轮对话会话存储。
 // 同一 sessionID 共享一段对话历史，最多保留最近 MaxRounds 轮上下文。
 type Store struct {
