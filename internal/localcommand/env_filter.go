@@ -55,7 +55,7 @@ func stripOtherLLMEnv(env []string) []string {
 // 或时间/语言异常。这是沙箱"最小 env 集"保证,与 stripOtherLLMEnv 组合使用。
 func ensureBaseEnv(env []string) []string {
 	if !hasEnvPrefix(env, "PATH=") {
-		env = append(env, defaultPATH())
+		env = append(env, "PATH="+defaultPATH())
 	}
 	if !hasEnvPrefix(env, "TZ=") {
 		env = append(env, "TZ=Asia/Shanghai")

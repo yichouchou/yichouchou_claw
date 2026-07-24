@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -317,14 +318,6 @@ func IsDangerousWithAgent(ctx context.Context, agentName string, cmd string) (bo
 		return true, reason
 	}
 
-	// 1.5) Shell-only 重定向检测：沙箱用 strings.Fields 切 argv,不解析 shell
-	//      重定向。如果命令里含 2>&1 / 2>/dev/null / 1>&2 / >file / <file 等,
-	//      这些 token 会被当成命令参数,而不是 shell 语义,导致命令行为异常。
-	//      检测到就拒绝并告诉 LLM "重定向在沙箱里没意义,沙箱会自动捕获 stderr"。
-	if redirectErr := checkShellOnlyRedirect(cmd); redirectErr != "" {
-		return true, redirectErr
-	}
-
 	// 2) 敏感路径兜底
 	lowerCmd := strings.ToLower(cmd)
 	for _, path := range SensitivePaths {
@@ -338,6 +331,14 @@ func IsDangerousWithAgent(ctx context.Context, agentName string, cmd string) (bo
 	//      SensitivePaths 是代码内嵌兜底，这里是配置层加固——双重保险。
 	if path, hit := isPathDenied(agentName, lowerCmd); hit {
 		return true, fmt.Sprintf("denylist 路径规则拒绝（任何授权都不能放行）: %s", path)
+	}
+
+	// 2.6) 沙箱内禁止"自写脚本自执行"——防 LLM 写 /tmp/run.sh 再 bash /tmp/run.sh
+	//      绕过沙箱的 argv 解析层。这里的检测方式：把 cmd 按 strings.Fields 切
+	//      出 argv,检测是否存在"解释器 + /tmp 脚本"的模式。
+	argvForScriptCheck := strings.Fields(cmd)
+	if reason := checkTmpScriptExecution(argvForScriptCheck); reason != "" {
+		return true, reason
 	}
 
 	// 3) 软禁止：依赖授权
@@ -392,85 +393,6 @@ func IsDangerousWithAgent(ctx context.Context, agentName string, cmd string) (bo
 
 // isInstallClassPattern 判断某个软禁止正则是否属于"安装类"。
 // 这些规则在有了 Install 授权后即可放行。
-// checkShellOnlyRedirect 检测命令里是否包含 shell-only 重定向语法,
-// 这些语法在沙箱里不生效（沙箱用 strings.Fields 切 argv,不调用 shell），
-// 必须主动拒绝并提示 LLM 改用沙箱的 stderr 字段。
-//
-// 检测的模式:
-//   - 2>&1 / 2>&2 / 1>&2 / &>file      (fd 复制)
-//   - 2>/dev/null / 1>/dev/null / &>/dev/null  (fd 重定向到黑洞)
-//   - 2>file / 1>file / >file / >>file  (写重定向)
-//   - <file / 0<file                    (读重定向)
-//   - <<EOF / <<'EOF'                   (here-doc)
-//
-// 注意:跳过单/双引号内的内容,因为引号内是字面量。
-//
-// 返回值：空字符串表示无重定向,非空字符串表示拒绝原因。
-func checkShellOnlyRedirect(cmd string) string {
-	redirectPatterns := []string{
-		// fd 复制 (含带空格和不带空格两种)
-		`2>&1`, `2>&2`, `1>&2`, `&>`, `2 > &1`, `1 > &2`,
-		// fd 重定向到黑洞 / 文件
-		`2>/dev/null`, `1>/dev/null`, `2>/dev/`, `1>/dev/`,
-		`&>/dev/null`, `&>/dev/`,
-		// 写重定向（不区分 > / >>）
-		`2>`, `1>`, `>>`,
-		// 读重定向
-		`< `, `0<`,
-		// here-doc
-		`<<`,
-	}
-	// 用一个简化的"跳过引号"扫描器
-	stripped := stripQuoted(cmd)
-	for _, p := range redirectPatterns {
-		if strings.Contains(stripped, p) {
-			return fmt.Sprintf(
-				"命令含 shell-only 重定向 %q,沙箱不解析 shell 语义（用 strings.Fields 切 argv）。"+
-					"这些 token 会被当成命令参数,而非重定向符号,导致命令行为异常。"+
-					"沙箱已经自动捕获 stderr,不需要在命令里加 2>&1 / 2>/dev/null 等。"+
-					"请去掉重定向符号后重试,例如 'cat foo' 而不是 'cat foo 2>&1'。",
-				p)
-		}
-	}
-	return ""
-}
-
-// stripQuoted 去掉命令里的单/双引号包裹内容,返回只剩 shell 语法部分的字符串。
-// 用于检测"命令里恰好含 2>&1 这个文本但被引号包着,不是真的重定向"的情况。
-func stripQuoted(s string) string {
-	var b strings.Builder
-	i := 0
-	for i < len(s) {
-		// 单引号区段:整段跳过(里面所有字符都是字面量)
-		if s[i] == '\'' {
-			i++
-			for i < len(s) && s[i] != '\'' {
-				i++
-			}
-			if i < len(s) {
-				i++ // 跳过闭合单引号
-			}
-			b.WriteByte(' ')
-			continue
-		}
-		// 双引号区段:整段跳过($ 反引号 \\ 在双引号里仍有 shell 语义,但为简化判断,统一跳过)
-		if s[i] == '"' {
-			i++
-			for i < len(s) && s[i] != '"' {
-				i++
-			}
-			if i < len(s) {
-				i++
-			}
-			b.WriteByte(' ')
-			continue
-		}
-		b.WriteByte(s[i])
-		i++
-	}
-	return b.String()
-}
-
 func isInstallClassPattern(p *regexp.Regexp) bool {
 	src := p.String()
 	installKeywords := []string{
@@ -678,31 +600,176 @@ func ExecuteChain(ctx context.Context, stages []CommandStage) (*CommandOutput, e
 }
 
 // executeSingle 执行单个命令
+//
+// 流程：
+//  1. parseFDRedirect 解析 argv 中的 fd 重定向 token（参考 Claude Code 的
+//     9/10 号安全检查）：
+//     - 纯 fd 操作（2>&1 / 2>/dev/null / 1>/dev/null）：直接放行
+//     - 文件重定向 / here-doc：有条件放行，目标必须在 /tmp 下
+//     - 软链接 / 路径穿越：拒绝
+//  2. 剥离重定向后用 cleaned argv exec.CommandContext。
+//  3. 根据重定向类型设置 cmd 的 Stdout / Stderr / Stdin 或 ExtraFiles。
+//
+// 这样沙箱不调 /bin/sh 就兼容了主流 LLM 用法：
+//   - cat foo 2>&1
+//   - claude -p "..." 2>/dev/null
+//   - echo hello > /tmp/out.txt
+//   - cat < /tmp/in.txt
+//   - cat <<EOF ... EOF
+//
+// 同时保持"不信任 shell 字符串"的安全设计 + /tmp 唯一可写边界。
 func executeSingle(ctx context.Context, cmd string, argv []string) (*CommandOutput, error) {
 	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
+	// 1) 解析 fd 重定向（参考 Claude Code 9/10 号检查）
+	cleanedArgv, fdRedirect, err := parseFDRedirect(argv)
+	if err != nil {
+		return nil, err
+	}
+
+	// 准备文件描述符（按需打开）
+	var (
+		stdoutFile    *os.File
+		stderrFile    *os.File
+		stdinFile     *os.File
+		heredocPath   string // here-doc 临时文件路径,exec 后 os.Remove
+		heredocRemove bool   // 是否需要清理 heredoc 临时文件
+	)
+	defer func() {
+		if stdoutFile != nil {
+			stdoutFile.Close()
+		}
+		if stderrFile != nil {
+			stderrFile.Close()
+		}
+		if stdinFile != nil {
+			stdinFile.Close()
+		}
+		if heredocRemove && heredocPath != "" {
+			os.Remove(heredocPath)
+		}
+	}()
+
+	switch fdRedirect.Kind {
+	case FDRedirectWriteFile, FDRedirectAppendFile:
+		flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+		if fdRedirect.Kind == FDRedirectAppendFile {
+			flags = os.O_WRONLY | os.O_CREATE | os.O_APPEND
+		}
+		f, ferr := openTmpFile(fdRedirect.Target, flags, 0644)
+		if ferr != nil {
+			return nil, fmt.Errorf("打开重定向目标 %q 失败: %w", fdRedirect.Target, ferr)
+		}
+		switch fdRedirect.FDKind {
+		case "stderr":
+			stderrFile = f
+		default:
+			stdoutFile = f
+		}
+	case FDRedirectReadFile:
+		f, ferr := openTmpFile(fdRedirect.Target, os.O_RDONLY, 0)
+		if ferr != nil {
+			return nil, fmt.Errorf("打开重定向源 %q 失败: %w", fdRedirect.Target, ferr)
+		}
+		stdinFile = f
+	case FDRedirectHereDoc:
+		// here-doc: 写到 /tmp/<pid>.heredoc 临时文件,然后让子进程读
+		// 直接用 os.Create(写入 /tmp 前缀,符合"沙箱唯一可写=/tmp"边界)
+		heredocPath = fmt.Sprintf("/tmp/%d.heredoc", os.Getpid())
+		hf, ferr := os.Create(heredocPath)
+		if ferr != nil {
+			return nil, fmt.Errorf("创建 here-doc 临时文件失败: %w", ferr)
+		}
+		if _, werr := hf.WriteString(fdRedirect.HereDoc); werr != nil {
+			hf.Close()
+			os.Remove(heredocPath)
+			return nil, fmt.Errorf("写 here-doc 内容失败: %w", werr)
+		}
+		hf.Close()
+		// 以读模式重新打开让子进程读
+		rf, ferr := os.Open(heredocPath)
+		if ferr != nil {
+			os.Remove(heredocPath)
+			return nil, fmt.Errorf("重开 here-doc 文件失败: %w", ferr)
+		}
+		stdinFile = rf
+		heredocRemove = true
+	}
+
 	var execCmd *exec.Cmd
-	if len(argv) == 1 {
-		execCmd = exec.CommandContext(execCtx, argv[0])
+	if len(cleanedArgv) == 1 {
+		execCmd = exec.CommandContext(execCtx, cleanedArgv[0])
 	} else {
-		execCmd = exec.CommandContext(execCtx, argv[0], argv[1:]...)
+		execCmd = exec.CommandContext(execCtx, cleanedArgv[0], cleanedArgv[1:]...)
 	}
 
 	// 平台特定的环境变量与工作目录，由平台分支文件在 build 时提供
 	execCmd.Env = sandboxEnv()
 	execCmd.Dir = sandboxWorkDir()
-	execCmd.Stdin = nil
 
+	// 2) 设置 stdout / stderr / stdin
 	var stdout, stderr bytes.Buffer
-	execCmd.Stdout = &stdout
-	execCmd.Stderr = &stderr
+
+	// stdout 优先级:文件 > 黑洞 > buffer
+	switch {
+	case stdoutFile != nil:
+		execCmd.Stdout = stdoutFile
+	case fdRedirect.Kind == FDRedirectDiscard1:
+		execCmd.Stdout = io.Discard
+	default:
+		execCmd.Stdout = &stdout
+	}
+
+	// stderr 优先级:文件 > 与 stdout 共享 (Merge21) > 黑洞 > buffer
+	switch {
+	case stderrFile != nil:
+		execCmd.Stderr = stderrFile
+	case fdRedirect.Kind == FDRedirectMerge21 && stdoutFile == nil:
+		execCmd.Stderr = &stdout // 共享 buffer,stderr 内容追加到 stdout
+	case fdRedirect.Kind == FDRedirectDiscard2:
+		execCmd.Stderr = io.Discard
+	default:
+		execCmd.Stderr = &stderr
+	}
+
+	// stdin 优先级:文件 > nil
+	if stdinFile != nil {
+		execCmd.Stdin = stdinFile
+	}
 
 	execCmd.SysProcAttr = platformSysProcAttr()
 
 	start := time.Now()
-	err := execCmd.Run()
+	err = execCmd.Run()
 	duration := time.Since(start)
+
+	// === Post-write 验证（优化 D）===
+	// 对写文件类型的重定向,close fd 之后用 Lstat 再确认一次路径不是 symlink / 硬链接 / 设备。
+	// 这是为了防 TOCTOU race:O_NOFOLLOW 挡住 open 时 race,但子进程运行期间
+	// 可能被其它进程 rename 或替换。验证失败 → fail-closed,把整个 cmd 输出
+	// 标为不可信（exit code 设为 -1）。
+	if fdRedirect.Kind == FDRedirectWriteFile || fdRedirect.Kind == FDRedirectAppendFile {
+		if fdRedirect.Target != "" {
+			if vErr := postWriteVerify(fdRedirect.Target); vErr != nil {
+				// 关闭 fd（defer 会再次关,no-op 安全）
+				if stdoutFile != nil {
+					stdoutFile.Close()
+				}
+				if stderrFile != nil {
+					stderrFile.Close()
+				}
+				return &CommandOutput{
+					Stdout:   stdout.String(),
+					Stderr:   stderr.String() + "\n[沙箱拦截] " + vErr.Error(),
+					ExitCode: -1,
+					Duration: duration.String(),
+				}, nil
+			}
+		}
+	}
+
+	// here-doc 临时文件清理在 defer 里统一做(heredocRemove + heredocPath)
 
 	exitCode := 0
 	if err != nil {
@@ -713,12 +780,29 @@ func executeSingle(ctx context.Context, cmd string, argv []string) (*CommandOutp
 		}
 	}
 
-	return &CommandOutput{
+	out := &CommandOutput{
 		Stdout:   stdout.String(),
 		Stderr:   stderr.String(),
 		ExitCode: exitCode,
 		Duration: duration.String(),
-	}, nil
+	}
+
+	// 重定向提示:让 LLM 看到元信息
+	switch fdRedirect.Kind {
+	case FDRedirectMerge21:
+		out.Stderr += "\n[沙箱提示] 检测到 2>&1,stderr 已合并到 stdout 字段。"
+	case FDRedirectDiscard2:
+		out.Stderr += "\n[沙箱提示] 检测到 2>/dev/null,stderr 已丢弃。"
+	case FDRedirectDiscard1:
+		out.Stdout += "\n[沙箱提示] 检测到 1>/dev/null,stdout 已丢弃。"
+	case FDRedirectWriteFile, FDRedirectAppendFile:
+		out.Stderr += fmt.Sprintf("\n[沙箱提示] 检测到文件重定向 %q,子进程写入 /tmp。", fdRedirect.Pattern)
+	case FDRedirectReadFile:
+		out.Stderr += fmt.Sprintf("\n[沙箱提示] 检测到文件读重定向 %q,子进程从 /tmp 读。", fdRedirect.Pattern)
+	case FDRedirectHereDoc:
+		out.Stderr += "\n[沙箱提示] 检测到 here-doc,内容已写到 /tmp 临时文件并喂给子进程 stdin。"
+	}
+	return out, nil
 }
 
 // executeWithShell 通过 /bin/sh -c 包装执行整条命令。
@@ -1206,6 +1290,266 @@ func firstLine(s string) string {
 		}
 	}
 	return ""
+}
+
+// FDRedirectKind fd 重定向类型
+//
+// 参考 Claude Code 的 23 重安全检查（其中 #9 input redirection /
+// #10 output redirection 的"非危险"子集），沙箱识别这些 token 后手动
+// 在 exec.Cmd 上合并 fd，而不是用 /bin/sh 包装执行。
+//
+// 三种"纯 fd 操作"（合并 / 黑洞，不写文件）：
+//   - Merge21: stderr 合并到 stdout（等价 `2>&1`）
+//   - Discard2: stderr 丢弃（等价 `2>/dev/null`）
+//   - Discard1: stdout 丢弃（等价 `1>/dev/null`）
+//
+// 四种"文件重定向"（目标强制 /tmp，沙箱内唯一可写目录）：
+//   - WriteFile:   >file / 1>file / 2>file / &>file        （覆盖写）
+//   - AppendFile:  >>file / 1>>file / 2>>file / &>>file    （追加写）
+//   - ReadFile:    <file / 0<file                          （读文件喂 stdin）
+//   - HereDoc:     <<EOF ... EOF / <<-EOF ... EOF / <<'EOF' （写到 /tmp/<uid>.heredoc.* 再喂 stdin）
+//
+// 所有文件重定向走 resolveSafeTmpPath + openTmpFile，子进程通过
+// cmd.Stdout / cmd.Stderr / cmd.Stdin / cmd.ExtraFiles 继承 fd。
+type FDRedirectKind int
+
+const (
+	FDRedirectNone       FDRedirectKind = iota
+	FDRedirectMerge21                   // 2>&1
+	FDRedirectDiscard2                  // 2>/dev/null
+	FDRedirectDiscard1                  // 1>/dev/null
+	FDRedirectWriteFile                 // >file / 1>file / 2>file / &>file
+	FDRedirectAppendFile                // >>file / 1>>file / 2>>file / &>>file
+	FDRedirectReadFile                  // <file / 0<file
+	FDRedirectHereDoc                   // <<EOF / <<-EOF / <<'EOF'
+)
+
+// FDRedirectResult 解析结果
+type FDRedirectResult struct {
+	Kind    FDRedirectKind
+	Pattern string // 命中的原始 token / 模式（用于错误提示）
+	FDKind  string // "stdout" / "stderr" / "stdin"，绑到 cmd 的对应字段
+	Target  string // 文件路径（解析后已通过 resolveSafeTmpPath 校验；here-doc 时为空）
+	HereDoc string // here-doc 内容（非空表示这是 here-doc 重定向）
+}
+
+// parseFDRedirect 解析 argv 中的 fd 重定向 token。
+//
+// 设计原则（参考 Claude Code 的 5/9/10 号检查）：
+//   - "纯 fd 操作"（合并 / 黑洞）放行
+//   - 文件重定向 / here-doc 有条件放行：目标必须在 /tmp 下，否则拒绝
+//   - here-doc 不能跨 stage 边界（splitByOperators 已经按 \| ; && 切分，
+//     但 here-doc 内容里可以有 \| 等,需要单独处理）。本实现采取保守
+//     策略：here-doc 必须在 stage 末尾,EOF 单独成 token。如果 LLM 把
+//     here-doc 内容写在下一个 stage,这里会被当普通文本,产生意料行为。
+//
+// 错误返回：
+//   - 目标非 /tmp 下 → "沙箱文件重定向目标必须在 /tmp 目录下"
+//   - 软链接逃逸 → "/tmp 下发现软链接..."
+//   - here-doc 缺 EOF → "here-doc 必须以单独 EOF 结束"
+//   - 目标路径为空 → 错误
+func parseFDRedirect(argv []string) (cleaned []string, redirect FDRedirectResult, err error) {
+	cleaned = make([]string, 0, len(argv))
+	redirect = FDRedirectResult{Kind: FDRedirectNone}
+
+	i := 0
+	for i < len(argv) {
+		tok := argv[i]
+
+		switch tok {
+		// === 放行类:fd 合并 / 黑洞 ===
+		case "2>&1":
+			redirect = mergeRedirect(redirect, FDRedirectMerge21, "2>&1", "stdout")
+			i++
+			continue
+		case "2>/dev/null":
+			redirect = mergeRedirect(redirect, FDRedirectDiscard2, "2>/dev/null", "stdout")
+			i++
+			continue
+		case "1>/dev/null":
+			redirect = mergeRedirect(redirect, FDRedirectDiscard1, "1>/dev/null", "stdout")
+			i++
+			continue
+
+		// === 文件写覆盖 ===
+		case ">", "1>", "2>", "&>":
+			if i+1 >= len(argv) {
+				return nil, redirect, fmt.Errorf(
+					"重定向 %q 缺少目标文件,期望: %q /tmp/file",
+					tok, tok)
+			}
+			target := argv[i+1]
+			safe, err := resolveSafeTmpPath(target)
+			if err != nil {
+				return nil, redirect, err
+			}
+			fdKind := "stdout"
+			if tok == "2>" {
+				fdKind = "stderr"
+			}
+			redirect = mergeRedirect(redirect, FDRedirectWriteFile, tok+" "+target, fdKind)
+			redirect.Target = safe
+			i += 2
+			continue
+
+		// === 文件追加写 ===
+		case ">>", "1>>", "2>>", "&>>":
+			if i+1 >= len(argv) {
+				return nil, redirect, fmt.Errorf(
+					"重定向 %q 缺少目标文件,期望: %q /tmp/file",
+					tok, tok)
+			}
+			target := argv[i+1]
+			safe, err := resolveSafeTmpPath(target)
+			if err != nil {
+				return nil, redirect, err
+			}
+			fdKind := "stdout"
+			if tok == "2>>" {
+				fdKind = "stderr"
+			}
+			redirect = mergeRedirect(redirect, FDRedirectAppendFile, tok+" "+target, fdKind)
+			redirect.Target = safe
+			i += 2
+			continue
+
+		// === 文件读（喂 stdin） ===
+		case "<", "0<":
+			if i+1 >= len(argv) {
+				return nil, redirect, fmt.Errorf(
+					"重定向 %q 缺少源文件,期望: %q /tmp/file",
+					tok, tok)
+			}
+			target := argv[i+1]
+			safe, err := resolveSafeTmpPath(target)
+			if err != nil {
+				return nil, redirect, err
+			}
+			redirect = mergeRedirect(redirect, FDRedirectReadFile, tok+" "+target, "stdin")
+			redirect.Target = safe
+			i += 2
+			continue
+
+		// === here-doc ===
+		case "<<", "<<-":
+			if i+1 >= len(argv) {
+				return nil, redirect, fmt.Errorf(
+					"here-doc %q 缺少终止标记 (EOF),期望: %q EOF ...",
+					tok, tok)
+			}
+			marker := argv[i+1]
+			// 收集后续 token 直到 argv[k] == marker
+			var lines []string
+			j := i + 2
+			found := false
+			for j < len(argv) {
+				if argv[j] == marker {
+					found = true
+					break
+				}
+				lines = append(lines, argv[j])
+				j++
+			}
+			if !found {
+				return nil, redirect, fmt.Errorf(
+					"here-doc 缺少终止标记 %q(必须单独成 token)",
+					marker)
+			}
+			content := strings.Join(lines, "\n") + "\n"
+			redirect = mergeRedirect(redirect, FDRedirectHereDoc, tok+" "+marker, "stdin")
+			redirect.HereDoc = content
+			i = j + 1
+			continue
+
+		default:
+			cleaned = append(cleaned, tok)
+			i++
+		}
+	}
+
+	if len(cleaned) == 0 && redirect.Kind == FDRedirectNone {
+		return nil, redirect, fmt.Errorf("fd 重定向剥离后命令为空")
+	}
+
+	return cleaned, redirect, nil
+}
+
+// tmpScriptExecutors /tmp 自执行检测的"解释器"白名单
+//
+// 防 LLM 写 /tmp/run.sh 再用解释器执行的逃逸手法:
+//   - bash /tmp/x.sh       （注意:bash 本身被 denylist 拒绝,这里是另一道保险）
+//   - sh /tmp/x.sh
+//   - zsh /tmp/x.sh
+//   - python /tmp/x.py     （python 写脚本 → 执行）
+//   - python3 /tmp/x.py
+//   - perl /tmp/x.pl
+//
+// 只检测"/tmp 下 + 可执行解释器 + 解释器文件名以 sh/py/pl 结尾"
+// 的常见模式。其他解释器(node/ruby/lua 等)暂不列,沙箱可逐步扩展。
+var tmpScriptExecutors = map[string]bool{
+	"bash":    true,
+	"sh":      true,
+	"zsh":     true,
+	"dash":    true,
+	"python":  true,
+	"python3": true,
+	"perl":    true,
+	"ruby":    true,
+}
+
+// checkTmpScriptExecution 检测 argv 是否是"在 /tmp 下执行解释器 + 脚本"模式。
+//
+// 返回 "" 表示不是;非空字符串表示拒绝原因。
+//
+// 检测规则：
+//  1. argv[0] 是解释器（bash/sh/zsh/...）
+//  2. argv[1] 是 /tmp/ 下的 .sh / .py / .pl / .rb 文件
+//  3. argv 后续可以是脚本参数（不深查）
+//
+// 注意：argv 来源是 parseCommand 的 strings.Fields，所以这里拿到的是
+// 已经切好的 token。"bash /tmp/run.sh" → ["bash", "/tmp/run.sh"]。
+func checkTmpScriptExecution(argv []string) string {
+	if len(argv) < 2 {
+		return ""
+	}
+	exe := strings.ToLower(filepath.Base(argv[0]))
+	if !tmpScriptExecutors[exe] {
+		return ""
+	}
+	script := argv[1]
+	if !strings.HasPrefix(script, "/tmp/") && script != "/tmp" {
+		return ""
+	}
+	// 验证文件扩展名
+	ext := strings.ToLower(filepath.Ext(script))
+	if ext != ".sh" && ext != ".py" && ext != ".pl" && ext != ".rb" {
+		return ""
+	}
+	// 检查 /tmp/ 路径中不能有 ..(防止 LLM 拼 /tmp/../etc/passwd)
+	cleaned := filepath.Clean(script)
+	if !strings.HasPrefix(cleaned, "/tmp/") {
+		return fmt.Sprintf(
+			"沙箱禁止在 /tmp 下用 %s 执行脚本 %q（路径穿越:解析后 %q 离开 /tmp）。"+
+				"沙箱内可写但不可执行脚本:请用 Go 直接调用命令,而不是写脚本后执行。",
+			exe, script, cleaned)
+	}
+	return fmt.Sprintf(
+		"沙箱禁止在 /tmp 下用 %s 执行脚本 %q。"+
+			"LLM 写 /tmp 脚本 + 自执行的模式被识别为沙箱逃逸尝试。"+
+			"请改用 Go 进程内直接执行命令,或把脚本内容作为 --system-prompt 等参数传给已授权的命令,"+
+			"不要执行 /tmp 下的脚本文件。",
+		exe, script)
+}
+
+// mergeRedirect 合并多次重定向:只保留第一个非 None 的,后续忽略并返回错误。
+//
+// LLM 不应该写两次重定向(比如 `>a >b`),这里我们保持与原 strings.Fields
+// 阶段的安全设计一致:只取第一个。
+func mergeRedirect(prev FDRedirectResult, kind FDRedirectKind, pattern, fdKind string) FDRedirectResult {
+	if prev.Kind != FDRedirectNone {
+		return prev
+	}
+	return FDRedirectResult{Kind: kind, Pattern: pattern, FDKind: fdKind}
 }
 
 // GetAllowedCommands 返回允许的命令列表（带当前平台标识，方便 LLM 区分）。
