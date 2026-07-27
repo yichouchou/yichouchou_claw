@@ -163,8 +163,8 @@ func main() {
 	}
 	log.Printf("[main] exec-approvals.json applied to %d agent(s): %v", loaded, config.ListAgentNames())
 
-	weatherAgent := subagents.NewWeatherAgent(memory.NewMemoryMiddleware("WeatherAgent"))
-	chatAgent := subagents.NewChatAgent(context.Background(), skillsRoot, memory.NewMemoryMiddleware("ChatAgent"))
+	weatherAgent := subagents.NewWeatherAgent(store, memory.NewMemoryMiddleware("WeatherAgent"))
+	chatAgent := subagents.NewChatAgent(context.Background(), skillsRoot, store, memory.NewMemoryMiddleware("ChatAgent"))
 	// 包装 ChatAgent / WeatherAgent / LocalCommandAgent：禁止它们转回 RouterAgent。
 	// 原因：这三个 sub-agent 都没有子 agent，但 eino 框架会自动给所有 sub-agent
 	// 添加 transfer_to_agent 工具，且默认目标包含父 agent（RouterAgent）。
@@ -175,7 +175,7 @@ func main() {
 	// transfer_to_agent 工具，让 LLM 看不到就不会调。
 	localCmdAgent := adk.AgentWithOptions(
 		context.Background(),
-		subagents.NewLocalCommandAgent(context.Background(), skillsRoot, memory.NewMemoryMiddleware("LocalCommandAgent")),
+		subagents.NewLocalCommandAgent(context.Background(), skillsRoot, store, memory.NewMemoryMiddleware("LocalCommandAgent")),
 		adk.WithDisallowTransferToParent(),
 	)
 	chatAgent = adk.AgentWithOptions(
@@ -294,48 +294,54 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 		Content: sessionID,
 	})
 
-	// === Memory: 把 SSE event 流转发给客户端,同时收集 assistant 消息内容 ===
-	// 从事件流中收集 assistant 消息,而不是事后读 store,避免时机问题。
-	var responseBuilder strings.Builder
-	assistantCount := 0
+	// === Memory: 把 SSE event 流转发给客户端 ===
 	for {
 		event, ok := iter.Next()
 		if !ok {
 			break
 		}
-		// 这里做 SSE 转发，同时从 event 中提取 assistant 消息内容
 		if err := message.ProcessAgentEvent(ctx, s, event); err != nil {
 			log.Printf("[main] ProcessAgentEvent error session=%s err=%v", sessionID, err)
 			break
-		}
-		// 从 event 中提取 assistant 消息内容
-		if event != nil && event.Output != nil && event.Output.MessageOutput != nil &&
-			event.Output.MessageOutput.Message != nil {
-			msg := event.Output.MessageOutput.Message
-			if msg.Role == schema.Assistant && msg.Content != "" {
-				// 剥离 think 块,只保留用户可见内容
-				cleaned := stripThinkTags(msg.Content)
-				if cleaned != "" {
-					if responseBuilder.Len() > 0 {
-						responseBuilder.WriteString("\n\n")
-					}
-					responseBuilder.WriteString(cleaned)
-					assistantCount++
-				}
-			}
 		}
 	}
 
 	_ = message.SendSSEEvent(s, message.SSEEvent{Type: "end"})
 
 	// === Memory: 落盘 user_response ===
+	// 在 SSE 循环结束后，从 store 读取完整 messages（AfterAgent 已写入）
+	// 先拼接所有 assistant 的完整 Content，再统一 stripThinkTags
+	final := store.Get(sessionID)
+	log.Printf("[main] store.Get session=%s msgs=%d", sessionID, len(final))
+	for i, m := range final {
+		log.Printf("[main]   msg[%d] role=%s content_len=%d tool_calls=%d",
+			i, m.Role, len(m.Content), len(m.ToolCalls))
+	}
+
+	var responseBuilder strings.Builder
+	assistantCount := 0
+	for _, m := range final {
+		if m.Role == schema.Assistant && m.Content != "" {
+			if responseBuilder.Len() > 0 {
+				responseBuilder.WriteString("\n\n")
+			}
+			responseBuilder.WriteString(m.Content)
+			assistantCount++
+		}
+	}
+
 	if assistantCount > 0 {
-		fullResponse := responseBuilder.String()
-		memory.SafeRecordUserResponse(ctx, requestGID, sessionID, "RouterAgent", []byte(fullResponse))
-		log.Printf("[main] recorded user_response session=%s group=%s merged_from=%d_events content_len=%d",
-			sessionID, requestGID, assistantCount, len(fullResponse))
+		// 对拼接后的完整内容统一 stripThinkTags
+		fullResponse := stripThinkTags(responseBuilder.String())
+		if fullResponse != "" {
+			memory.SafeRecordUserResponse(ctx, requestGID, sessionID, "RouterAgent", []byte(fullResponse))
+			log.Printf("[main] recorded user_response session=%s group=%s from=%d_messages content_len=%d",
+				sessionID, requestGID, assistantCount, len(fullResponse))
+		} else {
+			log.Printf("[main] WARNING: all assistant content stripped as think blocks session=%s", sessionID)
+		}
 	} else {
-		log.Printf("[main] WARNING: no assistant message with content found in events session=%s", sessionID)
+		log.Printf("[main] WARNING: no assistant message with content found session=%s", sessionID)
 	}
 
 	// AfterAgent middleware 已把本次完整 messages 写回 store；这里只做日志回顾。

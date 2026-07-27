@@ -37,6 +37,9 @@ func NewPersistMiddleware(store *Store) *PersistMiddleware {
 // AfterAgent 是 SDK 暴露的官方钩子：每次 ChatModelAgent 达到成功终态时被调用。
 // state.Messages 是该次 run 的完整 messages，**已经满足 OpenAI/Ark 风格模型对
 // assistant(tool_calls) → tool(result) 顺序与 id 对齐的要求**。
+//
+// 修改：所有 agent 都会触发 AfterAgent，使用 Append 而非 Replace，
+// 这样每个 agent 的响应都会被追加到 store。
 func (m *PersistMiddleware) AfterAgent(ctx context.Context, state *adk.ChatModelAgentState) (context.Context, error) {
 	// 通过 SDK 官方 API 从 sessionValues 读取 session_id。
 	raw, _ := adk.GetSessionValue(ctx, KeySessionID)
@@ -51,12 +54,27 @@ func (m *PersistMiddleware) AfterAgent(ctx context.Context, state *adk.ChatModel
 		return ctx, nil
 	}
 
-	// 注意：子 agent 上注册的同名 middleware 也会触发，这里靠调用方把 PersistMiddleware
-	// 只挂在最外层 ChatModelAgent 上来确保只持久化一次。
-	msgs := append([]*schema.Message(nil), state.Messages...)
-	m.store.Replace(sessionID, msgs)
+	// 找到本次 agent 新增的消息（最后一条 assistant）
+	// state.Messages 包含完整的对话历史，我们只追加新的 assistant 消息
+	var newMsgs []*schema.Message
+	for i := len(state.Messages) - 1; i >= 0; i-- {
+		msg := state.Messages[i]
+		if msg.Role == schema.Assistant {
+			// 找到最后的 assistant 消息，追加它和它之前的 tool messages
+			newMsgs = state.Messages[i:]
+			break
+		}
+	}
 
-	log.Printf("%s AfterAgent persisted session=%s messages=%d",
-		middlewareLogPrefix, sessionID, len(msgs))
+	if len(newMsgs) == 0 {
+		log.Printf("%s AfterAgent skip: no assistant message, session=%s", middlewareLogPrefix, sessionID)
+		return ctx, nil
+	}
+
+	// 使用 Append 而非 Replace，这样每个 agent 的响应都会被累积
+	m.store.Append(sessionID, newMsgs...)
+
+	log.Printf("%s AfterAgent appended session=%s messages=%d",
+		middlewareLogPrefix, sessionID, len(newMsgs))
 	return ctx, nil
 }
