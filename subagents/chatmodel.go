@@ -99,6 +99,15 @@ type GetWeatherInput struct {
 	City string `json:"city"`
 }
 
+// WebSearchInput 是 web_search 服务的占位输入结构体。
+//
+// web_search 是 Anthropic/Minimaxi 的服务端工具，实际搜索由 API 服务端完成，
+// 客户端不会真正解析这里的参数。这里定义结构体只是为了满足 utils.InferTool
+// 的签名要求，让 eino 能识别这个工具的定义。
+type WebSearchInput struct {
+	Query string `json:"query"`
+}
+
 func NewWeatherAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMiddleware) adk.Agent {
 	weatherTool, err := utils.InferTool(
 		"get_weather",
@@ -600,6 +609,26 @@ func NewChatAgent(ctx context.Context, skillsDir string, store *session.Store, e
 	if err != nil {
 		log.Fatalf("ChatAgent skill middleware: %v", err)
 	}
+
+	// web_search 占位工具：实际执行由 Anthropic API 的服务端 web_search 完成。
+	//
+	// eino 的 ToolNode 会按 tool 名称查找执行入口；如果不注册一个同名占位工具，
+	// 模型返回 web_search tool_call 时会报 "tool web_search not found in toolsNode indexes"。
+	// 但 web_search 是服务端工具（Anthropic 在服务端完成搜索，结果已包含在 message content 中），
+	// 因此这里注册一个"无害"的占位工具，工具调用结果只是占位说明，不会被执行。
+	webSearchTool, err := utils.InferTool(
+		"web_search",
+		"联网搜索工具。由 Anthropic/Minimaxi 服务端直接执行，无需客户端处理。",
+		func(ctx context.Context, input *WebSearchInput) (string, error) {
+			// 这个函数在正常情况下不会被调用——服务端工具由 Anthropic API 直接处理。
+			// 但为了防止 eino ToolNode 报 "tool not found"，这里返回一个占位说明。
+			return "[web_search 由服务端处理，结果已包含在模型响应中]", nil
+		},
+	)
+	if err != nil {
+		log.Fatalf("ChatAgent web_search placeholder tool: %v", err)
+	}
+
 	a, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:        "ChatAgent",
 		Description: "通用对话 agent：日常闲聊、通用知识问答、技术方案讨论、概念解释、代码 review、文档整理、翻译。**不**执行任何主机命令——命令执行类请求由 LocalCommandAgent 处理。",
@@ -636,8 +665,16 @@ func NewChatAgent(ctx context.Context, skillsDir string, store *session.Store, e
 - 你没有可以转出的 sub-agent，**严禁**调用 transfer_to_agent 或任何形式的转出工具
 - 不要尝试委派任务给其他 agent（RouterAgent 会负责路由，你不需要再转移）
 - 不要伪造"已执行"的输出
-- 不要在 ChatAgent 里假装做了命令执行；如需执行，明确告诉用户会路由到 LocalCommandAgent`,
-		Model: model.NewChatModel(),
+- 不要在 ChatAgent 里假装做了命令执行；如需执行，明确告诉用户会路由到 LocalCommandAgent
+- 当用户询问实时信息（新闻、天气、股价、最新事件）时，可以使用 web_search 工具联网搜索`,
+		Model: model.NewChatModelForChatAgent(),
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				// 注册 web_search 占位工具，让 eino ToolNode 能找到对应的执行入口。
+				// 实际执行由 Anthropic/Minimaxi 服务端完成。
+				Tools: []tool.BaseTool{webSearchTool},
+			},
+		},
 		Handlers: append(append(append([]adk.ChatModelAgentMiddleware{
 			messagehandler.NewLanguageConstraintMiddleware(),
 		}, func() adk.ChatModelAgentMiddleware {
