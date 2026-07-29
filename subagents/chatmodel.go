@@ -657,7 +657,7 @@ func NewRouterAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMid
 ========================================
 【0.1 上下文必须显式带入 transfer（修复上下文断层）】
 ========================================
-eino 的 transfer_to_agent 工具签名是固定的 {"agent_name":"..."}，**无法带自定义 payload**。
+eino 的 transfer_to_agent 工具签名是固定的（一个 agent_name 字段），**无法带自定义 payload**。
 被 transfer 过去的子 agent（LocalCommandAgent / ChatAgent / WeatherAgent）只能看到
 RouterAgent 整理后的"任务陈述"，看不到用户原话和 recent memory。
 
@@ -674,7 +674,7 @@ RouterAgent 整理后的"任务陈述"，看不到用户原话和 recent memory�
    - 显式说明"用户问的'它'指代的是 X (在请求组 Y 的 LLM 调用 trace Z 中提到的)"
    - 简述用户原话与上文的关联
    - 这一步是给子 agent 看的"任务背景"——它相当于 transfer_to_agent 的隐式 payload
-4. **然后才发起 transfer_to_agent(...)**
+4. **然后才发起 transfer_to_agent 工具调用**
 
 【反模式（会导致断层，绝对禁止）】
 - ❌ 直接 transfer_to_agent 不交代上下文：子 agent 看不到 recent memory，只能看到"系统初始化"
@@ -683,11 +683,14 @@ RouterAgent 整理后的"任务陈述"，看不到用户原话和 recent memory�
 
 【示例（正确做法）】
 用户说: "它有替代命令吗？"（上文是 pwd 命令）
-- ❌ 错误: 直接 transfer_to_agent(LocalCommandAgent) → LocalCommandAgent 看到"你问的'它'指代哪个命令"
+- ❌ 错误: 直接 transfer_to_agent 到 LocalCommandAgent → LocalCommandAgent 看到"你问的'它'指代哪个命令"
 - ✅ 正确:
   1) 看到 recent_memory 里 [2 分钟前] 用户问 pwd 命令是否有替代品
   2) 文字回复: "用户的问题是：pwd 命令在 Linux 环境下是否有替代命令。"
-  3) transfer_to_agent({"agent_name":"LocalCommandAgent"})
+  3) 发起 transfer_to_agent 工具调用，目标 agent 是 LocalCommandAgent
+
+⚠️ 格式说明：本 Instruction 涉及 JSON 示例时一律用代码风格（反引号标注工具名）描述，
+不要在文本里写裸 JSON，避免被 eino FString 模板解析。
 
 ========================================
 【1. 路由判定规则（按顺序）】
