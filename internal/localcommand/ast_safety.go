@@ -60,54 +60,93 @@ func astSafetyCheck(ctx context.Context, agentName, cmd string) (bool, string) {
 	}
 	syntax.Walk(file, walker.Visit)
 
-	if walker.dangerous {
-		return true, walker.reason
-	}
-	return false, ""
+	return walker.finalize()
 }
 
 // astSafetyWalker AST 遍历过程中的安全检查状态。
+//
+// 设计: 收集所有 CallExpr 的失败原因, **不**在第一个失败就停。
+// 原因: 当命令形如 `safe && dangerous`, 第一个 CallExpr 检查失败
+// (例如"不在白名单: echo")不该让我们停, 因为后续阶段可能有更
+// 严重的威胁(敏感路径/硬禁止), 用户/LLM 看到的拦截原因应该是
+// 最严重的那个, 而不是第一个失败的。
 type astSafetyWalker struct {
 	ctx       context.Context
 	agentName string
 
-	// pathACL 路径 ACL（来自 application.yml sandbox.path_acl 配置）
+	// pathACL 路径 ACL(来自 application.yml sandbox.path_acl 配置)
 	pathACL *PathACL
 
-	dangerous bool
-	reason    string
+	// 收集所有失败 CallExpr 的拦截原因, 后面会按优先级筛选
+	reasons []string
 }
 
 // Visit 是 syntax.Walk 的回调函数。
-// 返回 true 继续遍历子节点；返回 false 停止遍历（已触发拒绝）。
+// 始终返回 true 继续遍历(收集所有节点); 我们不在第一个失败就 stop。
 func (w *astSafetyWalker) Visit(node syntax.Node) bool {
-	if w.dangerous {
-		return false
-	}
 	if node == nil {
 		return true
 	}
 
 	switch n := node.(type) {
 	case *syntax.CallExpr:
-		return w.checkCallExpr(n)
+		w.checkCallExpr(n)
 	case *syntax.Redirect:
-		return w.checkRedirect(n)
+		w.checkRedirect(n)
 	case *syntax.BinaryCmd:
 		// `&&` `||` `|` `;` 等连接的命令
 		// 继续遍历子节点即可（每个 CallExpr 都会被独立检查）
-		return true
 	default:
-		// 其它节点类型（IfClause / ForClause / FuncDecl / Subshell / CmdSubst / 等）
-		// 继续遍历，让 Visit 命中里面的 CallExpr
-		return true
+		// 其它节点类型(IfClause / ForClause / FuncDecl / Subshell / CmdSubst / 等)
+	}
+	return true
+}
+
+// priorityOf 根据 reason 内容返回严重程度(数字越小越严重)。
+// 用于从多个失败原因中选最严重的返回给 LLM/用户。
+func priorityOf(reason string) int {
+	switch {
+	case strings.Contains(reason, "[AST] 禁止 builtin"):
+		return 0 // eval / source / . 绝对禁止, 永远最严重
+	case strings.Contains(reason, "硬禁止"):
+		return 1 // rm -rf / / reboot 等
+	case strings.Contains(reason, "敏感路径"), strings.Contains(reason, "[AST Redirect"):
+		return 2
+	case strings.Contains(reason, "敏感信息"), strings.Contains(reason, "Authorization"),
+		strings.Contains(reason, "Token"), strings.Contains(reason, "Cookie"),
+		strings.Contains(reason, "API Key"):
+		return 3 // curl 敏感信息夹带
+	case strings.Contains(reason, "内网"):
+		return 4 // curl 内网探测
+	case strings.Contains(reason, "软禁止"):
+		return 5
+	case strings.Contains(reason, "白名单"):
+		return 6 // "不在白名单中" 优先级最低
+	default:
+		return 10
 	}
 }
 
-// checkCallExpr 检查单个 CallExpr 节点。
-func (w *astSafetyWalker) checkCallExpr(c *syntax.CallExpr) bool {
+// finalize 从所有收集到的 reasons 中挑最严重的返回。
+func (w *astSafetyWalker) finalize() (bool, string) {
+	if len(w.reasons) == 0 {
+		return false, ""
+	}
+	best := w.reasons[0]
+	bestP := priorityOf(best)
+	for _, r := range w.reasons[1:] {
+		if p := priorityOf(r); p < bestP {
+			best = r
+			bestP = p
+		}
+	}
+	return true, best
+}
+
+// checkCallExpr 检查单个 CallExpr 节点(只收集不返回)。
+func (w *astSafetyWalker) checkCallExpr(c *syntax.CallExpr) {
 	if len(c.Args) == 0 {
-		return true
+		return
 	}
 
 	// 提取命令名
@@ -116,9 +155,9 @@ func (w *astSafetyWalker) checkCallExpr(c *syntax.CallExpr) bool {
 	// 1. 禁止危险 builtin
 	switch name {
 	case "eval", "source", ".":
-		w.dangerous = true
-		w.reason = fmt.Sprintf("[AST] 禁止 builtin %q: 能执行任意字符串,无法静态验证安全性", name)
-		return false
+		w.reasons = append(w.reasons,
+			fmt.Sprintf("[AST] 禁止 builtin %q: 能执行任意字符串,无法静态验证安全性", name))
+		return
 	case "exec":
 		// exec 会替换当前进程, 但命令本身仍然需要走 IsDangerous
 		// 不直接拒绝,让后续检查决定
@@ -127,44 +166,38 @@ func (w *astSafetyWalker) checkCallExpr(c *syntax.CallExpr) bool {
 	// 2. 重建命令字符串, 走 IsDangerousWithAgent
 	reconstructed := formatCallExpr(c)
 	if dangerous, reason := IsDangerousWithAgent(w.ctx, w.agentName, reconstructed); dangerous {
-		w.dangerous = true
-		w.reason = fmt.Sprintf("[AST CallExpr %q] %s", reconstructed, reason)
-		return false
+		w.reasons = append(w.reasons,
+			fmt.Sprintf("[AST CallExpr %q] %s", reconstructed, reason))
+		return
 	}
-
-	// 3. 继续遍历子节点 (处理嵌套的 $() 等)
-	return true
 }
 
-// checkRedirect 检查 Redirect 节点（重定向目标是否在敏感路径）。
-func (w *astSafetyWalker) checkRedirect(r *syntax.Redirect) bool {
+// checkRedirect 检查 Redirect 节点(重定向目标是否在敏感路径)。
+func (w *astSafetyWalker) checkRedirect(r *syntax.Redirect) {
 	if w.pathACL == nil {
-		return true
+		return
 	}
 
 	op := r.Op.String()
 	target := wordToString(r.Word)
 
 	// 检查写入操作是否命中 write_denied
-	// 包含 > >> &> &>> <> 及其变种
 	if isWriteOp(op) {
 		if reason := w.pathACL.checkWriteDenied(target); reason != "" {
-			w.dangerous = true
-			w.reason = fmt.Sprintf("[AST Redirect %s %q] %s", op, target, reason)
-			return false
+			w.reasons = append(w.reasons,
+				fmt.Sprintf("[AST Redirect %s %q] %s", op, target, reason))
+			return
 		}
 	}
 
 	// 检查读取操作是否命中 read_denied
 	if isReadOp(op) {
 		if reason := w.pathACL.checkReadDenied(target); reason != "" {
-			w.dangerous = true
-			w.reason = fmt.Sprintf("[AST Redirect %s %q] %s", op, target, reason)
-			return false
+			w.reasons = append(w.reasons,
+				fmt.Sprintf("[AST Redirect %s %q] %s", op, target, reason))
+			return
 		}
 	}
-
-	return true
 }
 
 // isWriteOp 判断 RedirOperator 是否为写入类操作。
