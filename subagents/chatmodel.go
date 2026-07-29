@@ -31,6 +31,7 @@ import (
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 
+	memorytool "github.com/yichouchou/yichouchou_claw/adk/common/memory"
 	"github.com/yichouchou/yichouchou_claw/adk/common/model"
 	messagehandler "github.com/yichouchou/yichouchou_claw/adk/middlewares/messageHandler"
 	"github.com/yichouchou/yichouchou_claw/internal/localcommand"
@@ -629,6 +630,13 @@ func NewChatAgent(ctx context.Context, skillsDir string, store *session.Store, e
 		log.Fatalf("ChatAgent web_search placeholder tool: %v", err)
 	}
 
+	// memory_search 工具：检索 workdir/memory/ 索引中的历史对话/trace 条目。
+	// 让 ChatAgent 在用户提到"之前/上次/以前"或需要历史决策依据时主动检索。
+	memorySearchTool, err := memorytool.NewSearchTool()
+	if err != nil {
+		log.Fatalf("ChatAgent memory_search tool: %v", err)
+	}
+
 	a, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:        "ChatAgent",
 		Description: "通用对话 agent：日常闲聊、通用知识问答、技术方案讨论、概念解释、代码 review、文档整理、翻译。**不**执行任何主机命令——命令执行类请求由 LocalCommandAgent 处理。",
@@ -639,6 +647,7 @@ func NewChatAgent(ctx context.Context, skillsDir string, store *session.Store, e
 ========================================
 - ✅ 闲聊、概念解释、方案对比、代码 review、文档整理、翻译
 - ✅ 技术讨论（不实际执行命令，只给思路/代码示例）
+- ✅ 检索 workdir/memory/ 历史对话：用户提到"之前/上次/以前"或需要历史决策依据时，主动调用 memory_search 工具
 - ❌ **没有执行主机命令的能力**——所有"跑一下命令"、"查一下系统状态"、"装个软件"等请求都应通过 RouterAgent 转给 LocalCommandAgent
 - ❌ 没有 transfer_to_agent 能力；不要试图调用任何形式的转出工具
 
@@ -661,6 +670,19 @@ func NewChatAgent(ctx context.Context, skillsDir string, store *session.Store, e
 - 不要重复用户问题，不要用"当然 / 很乐意"之类的客套开头
 - 概念解释要简洁，必要时给类比
 
+========================================
+【四、长期记忆检索】
+========================================
+当用户的提问涉及"之前/上次/以前/历史/约定/为什么用 X"等时间指代或历史决策时：
+  1. 调用 memory_search 工具,关键词用用户提问中的核心名词
+  2. 拿到 file:line 后,用 Read 类工具(框架自带)读原始 markdown 获取完整上下文
+  3. 综合历史 + 当前会话给出有依据的回答
+典型触发：
+  - "之前我们讨论过 X" → memory_search query="X"
+  - "为什么用 PostgreSQL 不换 MySQL" → memory_search query="PostgreSQL MySQL"
+  - "上次出现类似问题是怎么解决的" → memory_search kind="user_request",看几条历史
+注意：memory_search 返回的是 entry 摘要列表；不要把摘要本身当作最终答案。
+
 【强约束】
 - 你没有可以转出的 sub-agent，**严禁**调用 transfer_to_agent 或任何形式的转出工具
 - 不要尝试委派任务给其他 agent（RouterAgent 会负责路由，你不需要再转移）
@@ -672,7 +694,7 @@ func NewChatAgent(ctx context.Context, skillsDir string, store *session.Store, e
 			ToolsNodeConfig: compose.ToolsNodeConfig{
 				// 注册 web_search 占位工具，让 eino ToolNode 能找到对应的执行入口。
 				// 实际执行由 Anthropic/Minimaxi 服务端完成。
-				Tools: []tool.BaseTool{webSearchTool},
+				Tools: []tool.BaseTool{webSearchTool, memorySearchTool},
 			},
 		},
 		Handlers: append(append(append([]adk.ChatModelAgentMiddleware{

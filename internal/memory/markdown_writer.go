@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yichouchou/yichouchou_claw/internal/config"
 )
 
 const markdownLogPrefix = "[memory.md]"
@@ -59,6 +62,10 @@ type AsyncMarkdownRecorder struct {
 	// nil = 关闭 refine(规则版摘要即是最终结果)。
 	// 每个 entry 落盘成功后投递 RefineTask。
 	refiner *RefineQueue
+
+	// index 是可选的长期记忆索引。nil = 不维护索引。
+	// 每次 writeOne 成功后 append 一条索引；refine 更新 summary 时同步更新索引。
+	index *Index
 }
 
 // entry 内部待写入条目。
@@ -80,18 +87,17 @@ type entry struct {
 // NewAsyncMarkdownRecorder 构造异步 recorder。
 //
 // 三个开关:
-//   - YICHOUCHOU_MEMORY=off/false/0/no/disable/disabled → disabled=true,所有 Record* no-op
+//   - memory.enabled=false（application.yml） 或 YICHOUCHOU_MEMORY=off/false/0/no/disable/disabled
+//     → disabled=true,所有 Record* no-op
 //   - workdir 空 → disabled=true
 //   - queueSize 由调用方决定;默认 1024,够 LLM trace 突发不丢
 //
+// 配置优先级：application.yml > 环境变量（环境变量作为兜底）。
 // 构造后立即启动 worker goroutine。Close() 前 worker 会一直跑。
 func NewAsyncMarkdownRecorder(workdir string) (*AsyncMarkdownRecorder, error) {
-	if v := strings.ToLower(strings.TrimSpace(os.Getenv("YICHOUCHOU_MEMORY"))); v != "" {
-		switch v {
-		case "off", "false", "0", "no", "disable", "disabled":
-			log.Printf("%s disabled via YICHOUCHOU_MEMORY=%q", markdownLogPrefix, v)
-			return &AsyncMarkdownRecorder{disabled: true}, nil
-		}
+	if isMemoryDisabled() {
+		log.Printf("%s disabled via application.yml or YICHOUCHOU_MEMORY env", markdownLogPrefix)
+		return &AsyncMarkdownRecorder{disabled: true}, nil
 	}
 	if strings.TrimSpace(workdir) == "" {
 		log.Printf("%s workdir is empty, recorder disabled", markdownLogPrefix)
@@ -114,6 +120,25 @@ func NewAsyncMarkdownRecorder(workdir string) (*AsyncMarkdownRecorder, error) {
 	return r, nil
 }
 
+// isMemoryDisabled 综合 application.yml 和环境变量判断是否禁用 memory。
+//
+// 优先级：application.yml.memory.enabled = false → 禁用；
+// 否则看环境变量 YICHOUCHOU_MEMORY（兼容旧行为）。
+func isMemoryDisabled() bool {
+	// application.yml 检查：仅在 LoadApplication 已注入配置时生效。
+	if cfg := config.GetApplication(); cfg != nil && !cfg.Memory.Enabled {
+		return true
+	}
+	// 环境变量兜底
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("YICHOUCHOU_MEMORY"))); v != "" {
+		switch v {
+		case "off", "false", "0", "no", "disable", "disabled":
+			return true
+		}
+	}
+	return false
+}
+
 // Root 返回 recorder 根目录。
 func (r *AsyncMarkdownRecorder) Root() string {
 	if r == nil || r.disabled {
@@ -129,6 +154,26 @@ func (r *AsyncMarkdownRecorder) SetRefiner(q *RefineQueue) {
 		return
 	}
 	r.refiner = q
+}
+
+// SetIndex 绑定一个长期记忆索引,使每个 entry 落盘后自动 append 一条索引。
+// 传 nil 关闭索引维护。
+//
+// 主流程调用 SetIndex 后,writeOne 会同时写盘 + 更新索引;refine 后会
+// 异步更新索引中的 summary 字段。
+func (r *AsyncMarkdownRecorder) SetIndex(idx *Index) {
+	if r == nil {
+		return
+	}
+	r.index = idx
+}
+
+// GetIndex 返回绑定的索引（nil 表示未设置）。
+func (r *AsyncMarkdownRecorder) GetIndex() *Index {
+	if r == nil {
+		return nil
+	}
+	return r.index
 }
 
 // === Recorder 接口实现 ===
@@ -238,6 +283,13 @@ func (r *AsyncMarkdownRecorder) Close() error {
 
 	close(r.stopCh)
 	<-r.doneCh
+
+	// 同时关闭索引(落盘 dirty 数据 + 关闭文件)
+	if r.index != nil {
+		if err := r.index.Close(); err != nil {
+			log.Printf("%s index Close failed: %v", markdownLogPrefix, err)
+		}
+	}
 	return nil
 }
 
@@ -376,6 +428,11 @@ func (r *AsyncMarkdownRecorder) writeOne(e *entry) {
 		log.Printf("%s mkdir %s err=%v", markdownLogPrefix, dir, err)
 		return
 	}
+
+	// 在写之前先数当前文件行数,以便索引记录 entry 起始行。
+	// 注意:此函数只被 worker goroutine 串行调用,无需锁。
+	startLine := countLines(e.fullPath) + 1 // 下一行就是本次写入的起始行
+
 	f, err := os.OpenFile(e.fullPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		log.Printf("%s open %s err=%v", markdownLogPrefix, e.fullPath, err)
@@ -421,6 +478,52 @@ func (r *AsyncMarkdownRecorder) writeOne(e *entry) {
 			Side:            side,
 		})
 	}
+
+	// 落盘成功 → 同步 append 到索引(若已绑定)。
+	if r.index != nil {
+		// 计算相对 workdir/memory 的路径
+		relFile, relErr := filepath.Rel(r.workdir, e.fullPath)
+		if relErr != nil {
+			relFile = e.fullPath
+		}
+		relFile = filepath.ToSlash(relFile)
+
+		idxEntry := &IndexEntry{
+			SubDir:         e.subdir,
+			File:           relFile,
+			Line:           startLine,
+			SessionID:      e.sessionID,
+			LLMTraceID:     string(e.llmTraceID),
+			RequestGroupID: string(e.requestGroupID),
+			Agent:          e.agentName,
+			Kind:           e.kind,
+			Time:           time.Now().Format(time.RFC3339),
+			Summary:        e.summary,
+			Refined:        false,
+		}
+		if err := r.index.Append(idxEntry); err != nil {
+			log.Printf("%s index append failed: %v", markdownLogPrefix, err)
+		}
+	}
+}
+
+// countLines 返回 path 文件的总行数；不存在返回 0。
+// 用 bufio.Scanner 按 '\n' 切片,效率足够,文件大时不会成为瓶颈
+// (markdown 单文件通常 < 1MB,worker 串行执行)。
+func countLines(path string) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	count := 0
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		count++
+	}
+	return count
 }
 
 // renderFrontMatter 生成 YAML front-matter。

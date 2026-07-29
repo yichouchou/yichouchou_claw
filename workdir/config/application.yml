@@ -1,0 +1,80 @@
+# yichouchou_claw 统一配置文件
+#
+# 加载顺序：
+#   1. 应用启动时加载本文件到 internal/config.ApplicationConfig
+#   2. 各模块从全局配置对象读取
+#   3. 环境变量仍可覆盖敏感字段（API Key / Token）
+#
+# 注：API Key 等敏感字段建议用环境变量注入，不要直接写入此文件。
+
+server:
+  # HTTP 服务监听端口
+  host: ":28080"
+
+# LLM 配置
+# MODEL_TYPE 决定走哪个 ChatModel 实现：
+#   - "ark"          → 火山方舟（Ark SDK）
+#   - "anthropic"    → Anthropic SDK（默认；支持 Minimaxi 兼容端点 + 服务端工具）
+#   - 其他/空         → OpenAI 兼容协议
+llm:
+  type: "anthropic"
+
+  # === OpenAI 兼容配置 ===
+  openai:
+    api_key: ""           # 也可从 env OPENAI_API_KEY 读取
+    model: ""             # 也可从 env OPENAI_MODEL 读取
+    base_url: ""          # 也可从 env OPENAI_BASE_URL 读取
+    by_azure: false       # 是否走 Azure OpenAI（OPENAI_BY_AZURE=true）
+
+  # === Ark（火山方舟）配置 ===
+  ark:
+    api_key: ""           # 也可从 env ARK_API_KEY 读取
+    model: ""             # 也可从 env ARK_MODEL 读取
+    base_url: ""          # 也可从 env ARK_BASE_URL 读取
+
+  # === Anthropic 配置（用于 ChatAgent + Minimaxi web_search 服务端工具）===
+  anthropic:
+    api_key: ""           # 也可从 env ANTHROPIC_API_KEY 或 OPENAI_API_KEY 读取
+    model: "MiniMax-M3"   # 默认模型名
+    base_url: "https://api.minimaxi.com/anthropic"  # Minimaxi Anthropic 兼容端点
+    max_tokens: 4096
+    # 是否启用服务端工具 web_search（Minimaxi web_search_20250305）
+    enable_web_search: true
+
+# CozeLoop（可选 trace）
+tracing:
+  coze_loop:
+    enabled: false        # 是否启用 CozeLoop trace
+    workspace_id: ""      # COZELOOP_WORKSPACE_ID
+    api_token: ""         # COZELOOP_API_TOKEN
+
+# 工作目录与资源路径（相对于 workdir 根目录或绝对路径）
+paths:
+  workdir: "workdir"                     # workdir 根目录（默认 ./workdir）
+  skills: "workdir/skills"               # skills 目录
+  memory: "workdir"                      # memory 输出根（其下生成 memory/{sessions,inputs,outputs,errors}）
+  approvals: "workdir/config/exec-approvals.json"  # 命令执行审批配置
+
+# Memory（会话 trace 落盘）
+memory:
+  enabled: true                              # 也可从 env YICHOUCHOU_MEMORY=off 关闭
+  llm_refine_enabled: true                    # 也可从 env YICHOUCHOU_LLM_REFINE=off 关闭
+  refiner:
+    workers: 2                               # LLM 摘要精炼 worker 数
+    queue_size: 256                          # 精炼任务 channel 缓冲
+    per_call_timeout_seconds: 30             # 单次 LLM refine 超时
+    content_snippet_bytes: 1500              # 喂给 LLM 的内容长度上限
+    model_temperature: 0.2                   # refine 用低温度
+    max_summary_length: 100                  # 摘要硬上限（字符数）
+
+# Session（对话历史）
+session:
+  max_rounds: 12                             # 每个 session 保留最近多少轮（一问一答算 1 轮）
+
+# LocalCommand（沙箱命令执行）
+localcommand:
+  single_command_timeout_seconds: 30         # 单条命令超时
+  pipeline_command_timeout_seconds: 60        # 管道命令链超时
+
+# Memory 中间件 trace 容量
+# 注：anthropic adapter 的 max_tokens 已在上方 llm.anthropic.max_tokens 配置

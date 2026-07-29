@@ -31,15 +31,70 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	cbutils "github.com/cloudwego/eino/utils/callbacks"
 	arkModel "github.com/volcengine/volcengine-go-sdk/service/arkruntime/model"
+
+	"github.com/yichouchou/yichouchou_claw/internal/config"
 )
 
+// NewChatModel 根据 application.yml 中的 llm 配置创建 ChatModel。
+//
+// 优先级：yaml 配置 > 环境变量（环境变量作为兜底）。
+// MODEL_TYPE 环境变量会覆盖 yaml 的 llm.type（兼容旧行为）。
 func NewChatModel() model.ToolCallingChatModel {
-	modelType := strings.ToLower(os.Getenv("MODEL_TYPE"))
+	appCfg := config.GetApplication()
+	if appCfg == nil {
+		// 配置未加载（极端情况），退回纯环境变量模式。
+		return newChatModelFromEnv()
+	}
 
-	// Create Ark ChatModel when MODEL_TYPE is "ark"
+	modelType := strings.ToLower(firstNonEmpty(os.Getenv("MODEL_TYPE"), appCfg.LLM.Type))
+
+	switch modelType {
+	case "ark":
+		apiKey := firstNonEmpty(os.Getenv("ARK_API_KEY"), appCfg.LLM.Ark.APIKey)
+		modelName := firstNonEmpty(os.Getenv("ARK_MODEL"), appCfg.LLM.Ark.Model)
+		baseURL := firstNonEmpty(os.Getenv("ARK_BASE_URL"), appCfg.LLM.Ark.BaseURL)
+
+		cm, err := ark.NewChatModel(context.Background(), &ark.ChatModelConfig{
+			APIKey:  apiKey,
+			Model:   modelName,
+			BaseURL: baseURL,
+			Thinking: &arkModel.Thinking{
+				Type: arkModel.ThinkingTypeDisabled,
+			},
+		})
+		if err != nil {
+			log.Fatalf("ark.NewChatModel failed: %v", err)
+		}
+		return cm
+	default:
+		// OpenAI 兼容协议（包括 anthropic 兼容端点，但这里走的是 OpenAI SDK 路径，
+		// 用 Anthropic SDK 的路径见 NewChatModelForChatAgent）
+		apiKey := firstNonEmpty(os.Getenv("OPENAI_API_KEY"), appCfg.LLM.OpenAI.APIKey)
+		modelName := firstNonEmpty(os.Getenv("OPENAI_MODEL"), appCfg.LLM.OpenAI.Model)
+		baseURL := firstNonEmpty(os.Getenv("OPENAI_BASE_URL"), appCfg.LLM.OpenAI.BaseURL)
+		byAzure := os.Getenv("OPENAI_BY_AZURE") == "true"
+		if !byAzure {
+			byAzure = appCfg.LLM.OpenAI.ByAzure
+		}
+
+		cm, err := openai.NewChatModel(context.Background(), &openai.ChatModelConfig{
+			APIKey:  apiKey,
+			Model:   modelName,
+			BaseURL: baseURL,
+			ByAzure: byAzure,
+		})
+		if err != nil {
+			log.Fatalf("openai.NewChatModel failed: %v", err)
+		}
+		return cm
+	}
+}
+
+// newChatModelFromEnv 是 NewChatModel 的纯环境变量版本（兜底）。
+func newChatModelFromEnv() model.ToolCallingChatModel {
+	modelType := strings.ToLower(os.Getenv("MODEL_TYPE"))
 	if modelType == "ark" {
 		cm, err := ark.NewChatModel(context.Background(), &ark.ChatModelConfig{
-			// Add Ark-specific configuration from environment variables
 			APIKey:  os.Getenv("ARK_API_KEY"),
 			Model:   os.Getenv("ARK_MODEL"),
 			BaseURL: os.Getenv("ARK_BASE_URL"),
@@ -52,15 +107,11 @@ func NewChatModel() model.ToolCallingChatModel {
 		}
 		return cm
 	}
-
-	// Create OpenAI ChatModel (default)
 	cm, err := openai.NewChatModel(context.Background(), &openai.ChatModelConfig{
 		APIKey:  os.Getenv("OPENAI_API_KEY"),
 		Model:   os.Getenv("OPENAI_MODEL"),
 		BaseURL: os.Getenv("OPENAI_BASE_URL"),
-		ByAzure: func() bool {
-			return os.Getenv("OPENAI_BY_AZURE") == "true"
-		}(),
+		ByAzure: os.Getenv("OPENAI_BY_AZURE") == "true",
 	})
 	if err != nil {
 		log.Fatalf("openai.NewChatModel failed: %v", err)
@@ -71,63 +122,106 @@ func NewChatModel() model.ToolCallingChatModel {
 // NewChatModelForChatAgent 创建专用于 ChatAgent 的 ChatModel，
 // 使用 Anthropic SDK 并配置 Minimaxi 的 web_search 服务端工具。
 //
+// 配置来源：application.yml 的 llm.anthropic；环境变量作为兜底。
+//
 // 根据文档：https://platform.minimaxi.com/docs/guides/server-tools
 // web_search 是服务端工具，通过 Anthropic SDK 的 tools 参数添加。
 func NewChatModelForChatAgent() model.ToolCallingChatModel {
-	modelType := strings.ToLower(os.Getenv("MODEL_TYPE"))
+	appCfg := config.GetApplication()
+	if appCfg == nil {
+		// 配置未加载，退回纯环境变量版本
+		return newChatModelForChatAgentFromEnv()
+	}
+
+	modelType := strings.ToLower(firstNonEmpty(os.Getenv("MODEL_TYPE"), appCfg.LLM.Type))
 
 	// Ark 不支持 Minimaxi 的服务端工具，返回普通 ChatModel
 	if modelType == "ark" {
 		return NewChatModel()
 	}
 
-	// 从环境变量读取配置
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+	// 读取 Anthropic 配置
+	apiKey := firstNonEmpty(os.Getenv("OPENAI_API_KEY"), os.Getenv("ANTHROPIC_API_KEY"), appCfg.LLM.Anthropic.APIKey)
+	modelName := firstNonEmpty(os.Getenv("OPENAI_MODEL"), appCfg.LLM.Anthropic.Model)
+	baseURL := firstNonEmpty(os.Getenv("ANTHROPIC_BASE_URL"), appCfg.LLM.Anthropic.BaseURL)
+	maxTokens := appCfg.LLM.Anthropic.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 4096
 	}
+	enableWebSearch := appCfg.LLM.Anthropic.EnableWebSearch
 
-	modelName := os.Getenv("OPENAI_MODEL")
-	if modelName == "" {
-		modelName = "MiniMax-M3"
-	}
-
-	baseURL := os.Getenv("ANTHROPIC_BASE_URL")
-	if baseURL == "" {
-		baseURL = "https://api.minimaxi.com/anthropic"
-	}
-
-	maxTokens := int64(4096)
-
-	// 创建 Anthropic Adapter，配置 web_search 服务端工具
-	//
-	// Minimaxi 官方调用示例（curl）：
-	//   "tools": [{
-	//       "type": "web_search_20250305",
-	//       "name": "web_search"
-	//   }]
-	//
-	// Anthropic SDK 的 WebSearchTool20250305Param.Name 和 Type 字段是
-	// constant.WebSearch / constant.WebSearch20250305 类型（底层 string），
-	// 有 default tag 序列化为 "web_search" / "web_search_20250305"。
-	// 部分代理/兼容实现对空值处理不一致，这里显式赋值以确保生成的 JSON
-	// 与官方示例完全一致。
-	adapter := NewAnthropicAdapter(
+	// 创建 Anthropic Adapter
+	var adapterOpts []AnthropicAdapterOption
+	adapterOpts = append(adapterOpts,
 		WithAPIKey(apiKey),
 		WithBaseURL(baseURL),
 		WithModel(modelName),
 		WithMaxTokens(maxTokens),
-		WithServerTools([]anthropic.ToolUnionParam{
+	)
+
+	if enableWebSearch {
+		// Minimaxi 官方调用示例（curl）：
+		//   "tools": [{
+		//       "type": "web_search_20250305",
+		//       "name": "web_search"
+		//   }]
+		adapterOpts = append(adapterOpts, WithServerTools([]anthropic.ToolUnionParam{
 			{
 				OfWebSearchTool20250305: &anthropic.WebSearchTool20250305Param{
 					Name: "web_search",          // constant.WebSearch = "web_search"
 					Type: "web_search_20250305", // constant.WebSearch20250305 = "web_search_20250305"
 				},
 			},
+		}))
+	}
+
+	return NewAnthropicAdapter(adapterOpts...)
+}
+
+// newChatModelForChatAgentFromEnv 是 NewChatModelForChatAgent 的纯环境变量版本（兜底）。
+func newChatModelForChatAgentFromEnv() model.ToolCallingChatModel {
+	modelType := strings.ToLower(os.Getenv("MODEL_TYPE"))
+	if modelType == "ark" {
+		return NewChatModel()
+	}
+
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+	}
+	modelName := os.Getenv("OPENAI_MODEL")
+	if modelName == "" {
+		modelName = "MiniMax-M3"
+	}
+	baseURL := os.Getenv("ANTHROPIC_BASE_URL")
+	if baseURL == "" {
+		baseURL = "https://api.minimaxi.com/anthropic"
+	}
+
+	return NewAnthropicAdapter(
+		WithAPIKey(apiKey),
+		WithBaseURL(baseURL),
+		WithModel(modelName),
+		WithMaxTokens(4096),
+		WithServerTools([]anthropic.ToolUnionParam{
+			{
+				OfWebSearchTool20250305: &anthropic.WebSearchTool20250305Param{
+					Name: "web_search",
+					Type: "web_search_20250305",
+				},
+			},
 		}),
 	)
+}
 
-	return adapter
+// firstNonFallback 返回第一个非空字符串；全空时返回 fallback。
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func GetInputLoggerCallback() callbacks.Handler {

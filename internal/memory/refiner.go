@@ -731,12 +731,20 @@ func (q *RefineQueue) process(task RefineTask, workerID int) {
 				refinerLogPrefix, workerID, task.SessionID, task.RequestGroupID, task.Side, err)
 			return
 		}
+		// 同步更新索引（若绑定）
+		if q.index != nil {
+			_ = q.index.UpdateSummary(task.FilePath, "", task.RequestGroupID, task.Side, newSummary)
+		}
 	} else {
 		if err := q.updater.FindAndReplaceSummary(
 			task.FilePath, task.LLMTraceID, newSummary); err != nil {
 			log.Printf("%s worker=%d write back failed session=%s trace=%s err=%v",
 				refinerLogPrefix, workerID, task.SessionID, task.LLMTraceID, err)
 			return
+		}
+		// 同步更新索引（若绑定）
+		if q.index != nil {
+			_ = q.index.UpdateSummary(task.FilePath, task.LLMTraceID, "", "", newSummary)
 		}
 	}
 
@@ -759,6 +767,18 @@ type RefineQueue struct {
 	doneCh   chan struct{}
 	closedMu sync.RWMutex
 	closed   bool
+
+	// index 是可选的长期记忆索引。refine summary 写回文件后,同步更新索引中
+	// 对应 entry 的 summary 字段。nil = 不维护索引（保持向后兼容）。
+	index *Index
+}
+
+// SetIndex 绑定一个长期记忆索引，使每次 refine 写回文件后同步更新索引。
+func (q *RefineQueue) SetIndex(idx *Index) {
+	if q == nil {
+		return
+	}
+	q.index = idx
 }
 
 // NewRefineQueue 构造异步 refine 队列并启动 worker。
