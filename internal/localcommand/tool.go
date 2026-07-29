@@ -582,6 +582,181 @@ func hasShellLogic(cmd string) bool {
 	return false
 }
 
+// splitByShellLogic 把命令按 shell 短路/顺序控制符（|| && ;）拆分为 stage。
+//
+// 用途：当用户输入包含 && / || / ; 时，沙箱无法"按 stage 独立执行"（失去
+// 短路语义），所以必须用 /bin/sh -c 整条执行；但**在执行 shell 之前**，必须
+// 对**每个独立 stage**都做安全检查，否则恶意用户可以用 `safe && dangerous`
+// 形式绕过整个沙箱。
+//
+// 与 splitByOperators 的差异：
+//   - splitByOperators 还拆 | (管道),且为执行流程设计；
+//   - splitByShellLogic 只拆 ||/&&/; ，保留 | 在 stage 内（让 IsDangerous
+//     看到完整管道字符串,防止漏报）。stage 字符串保留原样不做 trim,
+//     与 IsDangerous 期望"含 path 的整字符串"语义一致。
+//
+// 引号处理：与 hasShellLogic 保持一致（单/双引号内的 ||/&&/; 视为字面量）。
+// 这意味着 `echo "a||b"` 不会被拆。
+func splitByShellLogic(cmd string) []string {
+	var result []string
+	var current bytes.Buffer
+	var i int
+	for i < len(cmd) {
+		// 单引号: 跳过整段
+		if cmd[i] == '\'' {
+			current.WriteByte(cmd[i])
+			i++
+			for i < len(cmd) && cmd[i] != '\'' {
+				current.WriteByte(cmd[i])
+				i++
+			}
+			if i < len(cmd) {
+				current.WriteByte(cmd[i])
+				i++
+			}
+			continue
+		}
+		// 双引号: 跳过整段
+		if cmd[i] == '"' {
+			current.WriteByte(cmd[i])
+			i++
+			for i < len(cmd) && cmd[i] != '"' {
+				current.WriteByte(cmd[i])
+				i++
+			}
+			if i < len(cmd) {
+				current.WriteByte(cmd[i])
+				i++
+			}
+			continue
+		}
+		// || 或 &&
+		if i+1 < len(cmd) && (cmd[i] == '|' || cmd[i] == '&') && cmd[i+1] == cmd[i] {
+			if current.Len() > 0 {
+				result = append(result, current.String())
+				current.Reset()
+			}
+			i += 2
+			continue
+		}
+		// ;
+		if cmd[i] == ';' {
+			if current.Len() > 0 {
+				result = append(result, current.String())
+				current.Reset()
+			}
+			i++
+			continue
+		}
+		current.WriteByte(cmd[i])
+		i++
+	}
+	if current.Len() > 0 {
+		result = append(result, current.String())
+	}
+	return result
+}
+
+// checkShellChainSafety 在 executeWithShell 之前对整条命令做安全检查。
+//
+// 检查策略（四层防御，2026-07 升级）：
+//  1. AST 解析（mvdan.cc/sh/v3）：解决字符串扫描无法覆盖的引号嵌套/subshell
+//     注入/shell 元字符/glob/history/ANSI-C quoting 等问题。
+//  2. 整条命令走 IsDangerousWithAgent：阻止整条命中的硬禁止 / 敏感路径 /
+//     软禁止 / allowlist 检查（覆盖大多数 bypass 尝试）。
+//  3. 按 ||/&&/; 拆出的每个 stage 各自再走一次 IsDangerousWithAgent：
+//     - 防止某些规则只匹配特定 stage 字符串；
+//     - 提供最直观的"哪个 stage 触发了拦截"诊断信息。
+//  4. 对每个 stage 做 subshell/命令替换启发式检查（防 $(...) / `...` 注入）：
+//     即使命令字符串看起来无害,如果 stage 内嵌了 subshell，
+//     subshell 内的命令也会被 shell 执行,所以也要扫一遍。
+//
+// 任一检查命中 → 立即拒绝。
+//
+// 返回值：(dangerous, reason)。
+//   - dangerous=true 表示命令不安全,Execute 主流程应直接拒绝并把 reason 返回给 LLM。
+//   - dangerous=false 表示命令通过安全检查,可以进入 executeWithShell 包装执行。
+func checkShellChainSafety(ctx context.Context, agentName, cmd string) (bool, string) {
+	// 第一层:AST 解析 (新增于阶段 1,2026-07-27)
+	// 解决字符串扫描无法覆盖的所有 bypass 场景:
+	//   - 引号嵌套 / subshell 注入
+	//   - shell 元字符（重定向 / 管道 / 后台）
+	//   - glob / brace expansion
+	//   - history expansion (!! / !$)
+	//   - ANSI-C quoting ($'\n')
+	//   - eval / source / . (禁止 builtin)
+	if dangerous, reason := astSafetyCheck(ctx, agentName, cmd); dangerous {
+		return true, reason
+	}
+
+	// 第二层:整条命令 (字符串兜底,与 AST 互补)
+	if dangerous, reason := IsDangerousWithAgent(ctx, agentName, cmd); dangerous {
+		return true, fmt.Sprintf("[shell-chain 全局] %s", reason)
+	}
+
+	// 第三层:按 shell 逻辑拆分,每个 stage 独立检查
+	stages := splitByShellLogic(cmd)
+	for idx, stage := range stages {
+		stageTrim := strings.TrimSpace(stage)
+		if stageTrim == "" {
+			continue
+		}
+		if dangerous, reason := IsDangerousWithAgent(ctx, agentName, stageTrim); dangerous {
+			return true, fmt.Sprintf("[shell-chain stage %d: %q] %s", idx+1, stageTrim, reason)
+		}
+	}
+
+	// 第四层:subshell / 命令替换启发式（防 $(...) / `...` / <(...) 注入）
+	// 注意:AST 层已经处理了大部分 subshell 注入,这里是字符串兜底,
+	// 用于 AST 未覆盖的极端 corner case。
+	for idx, stage := range stages {
+		stageTrim := strings.TrimSpace(stage)
+		if reason := scanSubshellInjection(stageTrim); reason != "" {
+			return true, fmt.Sprintf("[shell-chain stage %d subshell: %q] %s", idx+1, stageTrim, reason)
+		}
+	}
+
+	return false, ""
+}
+
+// scanSubshellInjection 启发式检测 stage 内是否含 subshell / 命令替换。
+//
+// 当前检测范围（保守策略：发现就拦截,让用户改用单 stage 命令）：
+//   - $(...)  - 现代 subshell
+//   - `...`   - legacy command substitution（不含在单引号内）
+//   - <(...)  - process substitution
+//   - >(...)  - process substitution
+//
+// 注意：双引号内的 $(...) / `...` 仍会展开,这里也按"危险"处理。
+// 单引号内的内容已经被 splitByShellLogic 视为字面量,这里不再重复判断。
+//
+// 对单引号字符串内的 ` ` 会跳过;对双引号字符串内的 ` $ 保留扫描。
+func scanSubshellInjection(stage string) string {
+	for i := 0; i < len(stage); i++ {
+		// 单引号:跳过整段
+		if stage[i] == '\'' {
+			i++
+			for i < len(stage) && stage[i] != '\'' {
+				i++
+			}
+			continue
+		}
+		// $(...)
+		if stage[i] == '$' && i+1 < len(stage) && stage[i+1] == '(' {
+			return "禁止命令替换 $(...)：嵌套命令会绕过 stage 边界检查"
+		}
+		// 反引号 legacy command substitution
+		if stage[i] == '`' {
+			return "禁止命令替换反引号：嵌套命令会绕过 stage 边界检查"
+		}
+		// <(...) 或 >(...)
+		if (stage[i] == '<' || stage[i] == '>') && i+1 < len(stage) && stage[i+1] == '(' {
+			return "禁止 process substitution：嵌套命令会绕过 stage 边界检查"
+		}
+	}
+	return ""
+}
+
 // CommandStage 命令阶段
 type CommandStage struct {
 	Cmd  string
@@ -1038,7 +1213,26 @@ func Execute(ctx context.Context, input *CommandInput) (*CommandOutput, error) {
 	// 包含短路/顺序控制符（|| && ;）时，整条命令必须用 /bin/sh -c 包装执行，
 	// 否则 splitByOperators 会把 || 当成单 | 拆分，导致后续 stage 找不到 builtin
 	// （典型场景：which gh || command -v gh || echo NOT_FOUND）
+	//
+	// ⚠️ 安全前提：在用 /bin/sh -c 包装执行之前，必须先对**整条命令**和**按
+	// shell 逻辑拆分出的每个 stage** 都做一次 IsDangerousWithAgent 检查，
+	// 否则恶意用户可以用 `safe && dangerous` 形式绕过整个沙箱（硬禁止 /
+	// 敏感路径 / denylist / 软禁止 / allowlist / 授权都会被绕过）。
+	// 见 checkShellChainSafety。
 	if hasShellLogic(cmd) {
+		// 安全检查必须先做（这是修复的核心点）：
+		//  - 第一层：整条命令命中任何规则 → 拒绝
+		//  - 第二层：按 ||/&&/; 拆出的每个 stage 命中任何规则 → 拒绝
+		//  - 第三层：subshell $(...) / `...` / <(...) 注入 → 拒绝
+		if dangerous, reason := checkShellChainSafety(ctx, agentName, cmd); dangerous {
+			hint := authorizationHint(reason, AuthorizationFromContext(ctx), cmd)
+			return &CommandOutput{
+				Stdout:   "",
+				Stderr:   fmt.Sprintf("安全拦截: %s\n%s", reason, hint),
+				ExitCode: -1,
+				Duration: "0s",
+			}, nil
+		}
 		return executeWithShell(ctx, cmd)
 	}
 

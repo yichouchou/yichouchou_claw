@@ -189,6 +189,54 @@ type LocalCommandConfig struct {
 	PipelineCommandTimeoutSeconds int `yaml:"pipeline_command_timeout_seconds"`
 }
 
+// SandboxConfig 沙箱安全配置（2026-07-27 新增，集成四个安全阶段）。
+//
+// 四个安全阶段的配置入口：
+//   - PathACL：read/write/exec 三类 denied 路径
+//   - Denybin：是否启用 OS 层 denybin PATH 注入（默认 true）
+//   - AST：是否启用 mvdan.cc/sh AST 解析（默认 true）
+type SandboxConfig struct {
+	// Enabled 是否启用沙箱安全（false = 不做任何安全检查,极不推荐）
+	Enabled bool `yaml:"enabled"`
+
+	// AST 阶段 1: mvdan.cc/sh AST 解析安全检查
+	AST *ASTConfig `yaml:"ast,omitempty"`
+
+	// Denybin 阶段 2: OS 层 denybin PATH 注入
+	Denybin *DenybinConfig `yaml:"denybin,omitempty"`
+
+	// PathACL 阶段 3+4: read/write/exec denied 路径
+	PathACL *PathACLConfig `yaml:"path_acl,omitempty"`
+}
+
+// ASTConfig AST 解析安全检查配置。
+type ASTConfig struct {
+	// Enabled 是否启用 AST 解析。默认 true。
+	// 设为 false 时,checkShellChainSafety 会跳过 AST 检查（不推荐）。
+	Enabled bool `yaml:"enabled"`
+	// FailClosedOnParseError 解析失败时是否拒绝执行。默认 true。
+	// (false 时退化为仅字符串扫描,降级到阶段 2-4)
+	FailClosedOnParseError bool `yaml:"fail_closed_on_parse_error"`
+}
+
+// DenybinConfig denybin PATH 注入配置。
+type DenybinConfig struct {
+	// Enabled 是否启用 denybin。默认 true。
+	Enabled bool `yaml:"enabled"`
+	// DeniedCommands 自定义拒绝的命令列表（默认使用 path_acl.exec_denied）
+	DeniedCommands []string `yaml:"denied_commands"`
+}
+
+// PathACLConfig 路径 ACL 配置（read/write/exec 三类）。
+type PathACLConfig struct {
+	// ReadDenied 禁止读取的路径前缀
+	ReadDenied []string `yaml:"read_denied"`
+	// WriteDenied 禁止写入的路径前缀
+	WriteDenied []string `yaml:"write_denied"`
+	// ExecDenied 禁止执行的命令名（同时被 denybin 使用）
+	ExecDenied []string `yaml:"exec_denied"`
+}
+
 // ApplicationConfig application.yml 根结构。
 type ApplicationConfig struct {
 	Server       ServerConfig       `yaml:"server"`
@@ -198,6 +246,7 @@ type ApplicationConfig struct {
 	Memory       MemoryConfig       `yaml:"memory"`
 	Session      SessionConfig      `yaml:"session"`
 	LocalCommand LocalCommandConfig `yaml:"localcommand"`
+	Sandbox      SandboxConfig      `yaml:"sandbox"`
 }
 
 // =====================================================================
