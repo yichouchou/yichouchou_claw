@@ -163,156 +163,65 @@ func NewWeatherAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMi
 const localCommandToolDesc = `在受限沙箱中执行**一条**本地 bash 命令并返回 stdout / stderr / 退出码 / 耗时。
 
 ========================================
-【一、沙箱总览】
+【一、这是一个沙箱，不是裸 bash】
 ========================================
-- 工作目录：/tmp（沙箱容器内，无写主机文件系统）
-- 环境变量：HOME/PATH/TZ 已被沙箱覆盖，无主机敏感变量
-- 单条命令超时：30 秒；管道命令链：60 秒
-- 进程隔离：使用独立进程组，超时自动 kill 整组
-- 平台：当前运行在 Linux/Darwin（macOS），命令白名单是**平台相关的**
-
-========================================
-【二、硬禁止（无论用户授权与否，永远拒绝执行）】
-========================================
-1) 系统破坏类：
-   rm -rf /、rm -rf *、rm -rf /etc、rm -rf /root、
-   dd of=/...、mkfs、fdisk、parted、partprobe
-
-2) 进程不可中断（关机/重启）：
-   reboot、halt、shutdown、init 0/6
-
-3) 反弹 shell / 远控：
-   nmap --...、hping、netcat、nc -e、/dev/tcp、/dev/udp
-
-4) 敏感路径访问：
-   /etc/passwd、/etc/shadow、chmod 777 /etc、chown root:root、
-   chmod 4755、> /dev/sd*、tee /dev/...
-
-5) shell 元编程：
-   eval 、exec 、fork
-
-如果你尝试执行硬禁止命令，返回错误里会写"硬禁止模式"。请立即换思路，并明确告诉用户"该操作在任何授权下都不能执行"。
+- 命令在隔离的子进程 + 单独进程组里跑；超时会被自动 kill。
+- 工作目录被限制在沙箱临时目录，**不会**写到主机文件系统。
+- 沙箱有内置的硬禁止规则（破坏性命令、敏感路径访问、远控 shell、关机重启等）。
+  即使你"只是想试一下"，也请先想清楚——被拦截后错误消息会告诉你原因。
+- 命令可用范围由配置文件 workdir/config/exec-approvals.json + 内置危险规则共同决定；
+  **运行时校验**而不是依赖你"记得哪个能用哪个不能用"。
+- 平台相关的命令名差异（如 ls vs dir、systemctl vs sc），请按你所在的平台选对工具，
+  不要假设某个命令一定存在。
 
 ========================================
-【三、软禁止（无授权时拒绝；用户授权后可放行）】
+【二、典型场景】
 ========================================
-两类用户授权：
-  Install：允许"安装类"命令（apt/yum/dnf install、pip install、go install、
-           npm install、dpkg -i、rpm -i 等）。注意 Install 授权**只**覆盖安装类。
-  Bash：   允许"通用 bash"放宽；除硬禁止外任何命令都可执行。Bash 权限范围比 Install 大。
+- 主机故障排查：CPU / 内存 / 磁盘 / 网络 / 进程 / 日志
+- 仓库操作：git status / diff / log / blame
+- 跑构建与测试：go test / pytest / npm test 等
+- 调用业务 API（仅外网，请勿访问 127.0.0.1、10.x、192.168.x 等内网）
+- 拉代码、安装包（后者需要用户授权）
 
-A. 【需要 Install 授权才放行】包管理器 install/upgrade/remove：
-   apt / apt-get / aptitude install|remove|purge|upgrade|full-upgrade|dist-upgrade|autoremove
-   yum / dnf install|remove|erase|upgrade|update|downgrade|autoremove
-   pacman -S、zypper install|remove|in|rm|up|update|patch
-   emerge（除 --pretend/-pv/--search/--info/--sync/--oneshot 之外的形式）
-   nix-env -i、brew install|uninstall|upgrade|reinstall|link|untap|tap
-   rpm -i/--install/-U/--upgrade/-e/--erase
-   dpkg -i/--install/-r/--remove/-P/--purge
-
-   语言包管理器 install/add/remove/update：
-   pip / pip3 / pipx install|uninstall|inject
-   uv add|remove|install|sync|pip install
-   poetry add|install|remove|update|init|new
-   pdm add|install|remove|update|init|use
-   conda install|create|remove|update|env create
-   npm install|i|add|remove|rm|update|upgrade|run|exec|publish
-   pnpm add|install|i|remove|rm|update|up|run|exec
-   yarn add|install|remove|upgrade|run|global
-   bun add|install|remove|rm|update|run
-   deno install|add|remove|rm|uninstall
-   go install|get
-   cargo install|add|new|init|update|remove
-   gem install|i|uninstall|update
-   bundle install|update|add
-   composer install|update|require|remove|global
-   nuget install|update|add|remove
-   dotnet tool install|update|uninstall / add / remove / new
-
-B. 【需要 Bash 授权才放行】其它受限操作：
-   1) 远程脚本执行：curl ... | sh、wget ... | sh、curl -s http://*.sh、wget -O - *.sh
-   2) curl 落盘：-o file、--output、-O / --remote-name、--output-dir、
-                 任意 > 重定向（含 > /dev/null）、| tee 、| dd 、
-                 curl ... && cmd > file
-   3) curl 敏感信息夹带：
-                 URL 中 user:pass@ 形式、
-                 -H "Authorization/Cookie/Proxy-Authorization/X-Api-Key/X-Auth-Token"、
-                 URL ?token=/?api_key=/?password=/?secret=/?access_token=/?auth=/?sid=、
-                 -d/-F/-T 中含 password/passwd/secret/token/api_key/private_key
-   4) curl 内网探测：127.x、10.x、192.168.x、169.254.x、172.16-31.x、0.0.0.0、localhost
-   5) wget 写入系统目录：wget -O /xxx、--output-document=/、-P /、--directory-prefix=/
-   6) chmod / chown / chgrp / setcap / setfattr
-   7) 任意 rm（除"rm -rf /..."等已被硬禁止覆盖之外的形式，如 rm file、rm -f file）
+如果你有"专用工具"可用（Read / Edit / Grep / Glob 等），**优先用专用工具**，不要为了
+"看起来更专业"把所有事都用 bash 处理——例如：
+  - 读文件 → Read
+  - 改文件 → Edit / Write
+  - 搜索代码内容 → Grep
+  - 搜索文件名 → Glob
+  - 问问题 → 不需要工具直接回
 
 ========================================
-【四、用户授权机制】
+【三、调用约束】
 ========================================
-- 默认情况下用户没授权，软禁止都会被拦截
-- 用户在对话中表达授权意图后，[AuthorizationMiddleware] 会自动识别并写入 AuthorizationScope：
-    Install 授权关键词："授权安装"、"可以安装"、"授权装包"、"i authorize install"、"auth: install" 等
-    Bash 授权关键词："授权 bash"、"授权执行脚本"、"可以跑 bash"、"i authorize bash"、"auth: bash" 等
-    WhitelistAuth 授权关键词（白名单外的命令）："我授权白名单放宽"、"授权白名单"、"授权运行 <cmd>"、
-                                                "whitelist auth" / "auth whitelist" / "i authorize whitelist" /
-                                                "auth <cmd>" 等
-- 授权有效期 10 分钟；到期后需重新授权
-- 当 local_command 工具被软禁止拒绝时，stderr 会附 "[授权提示]" 段，告诉用户应该怎么说授权
-- 你（LLM）应该把这个 [授权提示] 直接转述给用户，引导用户用自然语言授权
-- 对于"白名单外的命令"（如 command -v 这种 POSIX builtin），**引导用户授权 WhitelistAuth** 后重试
+- 一次只调一次 local_command（不要串多个 ; / &&；沙箱内部会对每段独立校验，
+  但一次只发一条更稳）。
+- **绝对禁止**在同一次 ChatModel 输出里塞超过 5 个 local_command / skill 调用：
+  eino 框架 MaxIterations=20；一次塞满会在循环时立即触发
+  "exceeds max iterations"，整个任务崩掉。
+  需要"收集一批信息"时，分 2-3 个 round：
+  先 ls / cat 关键文件 → 再综合判断 → 再下一步。
+- 不要在命令中夹带任何凭据（密码、Token、API Key、Cookie、私钥）。
+  如需调用需要凭据的 API，凭据必须由用户注入；你可以向用户询问授权流程。
+- 凭据相关文件（~/.ssh、~/.bash_history 等）禁止读取。
+- 当遇到软禁止时，**优先**"提示 + 等用户授权"，而不是反复换其他命令绕过。
+- 永远不要尝试硬禁止命令；用户硬要求时，把错误信息直接转告并解释为何拒绝。
 
 ========================================
-【五、curl 的合法用法（无需授权）】
+【四、授权机制（被拦截时去 stderr 看提示）】
 ========================================
-【允许】
-- 任意 HTTP 方法（GET / POST / PUT / PATCH / DELETE / HEAD / OPTIONS）
-- -H 设置普通自定义请求头（非 Authorization/Cookie 等敏感头）
-- -d / -F / -T / --data 等上传业务数据（只要不含敏感信息）
-- 请求 URL 指向**外网域名或 IP**，不能指向内网
-- 响应**只输出到 stdout**，由调用方处理
+沙箱支持三类用户授权：
+  - Install：包管理器 / 语言包管理器 install / upgrade / remove
+  - Bash：   通用 bash 放宽（除硬禁止外）
+  - WhitelistAuth：白名单之外的命令
 
-【禁止】需要 Bash 授权才放行
-- 在 URL、请求头、请求体中夹带密码、Token、Authorization、Cookie、
-  API Key、私钥、身份证号、手机号、银行卡号
-- 任何下载/落盘：-o / -O / > 文件 / | tee / | dd
+当你的命令被拦截时，stderr 通常会带 "[授权提示]" 段，告诉用户应该用什么样的
+自然语言授权。**直接把这个 [授权提示] 转告用户**，由用户决定是否授权。
+
+不要自己脑补授权关键词或绕过；等用户真实表达授权意图后重试。
 
 ========================================
-【六、命令白名单分组速查】
-========================================
-- 文件与目录：ls ll cat head tail wc grep find cp mv diff sort uniq awk sed cut tree touch tee
-- 文本编辑（仅工作目录）：vi vim less more tac rev strings xxd file od nl
-- 性能与故障分析（主机排障核心）：iostat vmstat mpstat sar pidstat perf strace ltrace lsof iotop iftop nethogs nload glances htop atop powertop turbostat numastat numactl sysctl
-- 网络抓包与诊断：tcpdump telnet nc nmap mtr ethtool arp iptables conntrack
-- 进程与服务：pgrep pidof pkill pstree kill systemctl service supervisorctl
-- 日志与故障现场：last lastb lastlog who w utmpdump
-- 内核与硬件：lspci lsusb lsblk blkid lsmod modinfo dmidecode lscpu lsmem lshw hwinfo hdparm smartctl
-- 系统信息：rdate uptime whoami hostname uname ps top free df du sensors ip ifconfig netstat ping curl wget
-- 文本处理：base64 md5sum sha256sum gzip gunzip tar zip unzip
-- 文本查询：jq watch crontab
-- 软件包查询（只读）：rpm yum dnf dpkg apt-cache ldd ldconfig getconf
-- 容器/K8s 只读：docker podman ctr crictl kubectl
-- Web/网络排障：openssl httpstat httping
-- 文件搜索：stat locate which type xargs realpath readlink
-- 时间同步：timedatectl chronyc ntpq
-- 开发工具链：go gofmt goimports golangci-lint gopls python python3 pip pip3 uv poetry pdm conda node npm pnpm yarn git svn hg gh gcc g++ clang make cmake cargo rustc javac java mvn gradle php composer shellcheck
-- 辅助：env set alias history man tldr whatis apropos whereis command
-
-========================================
-【七、典型工作流示例】
-========================================
-- 查 CPU/内存/磁盘：free -h; df -h; top -bn1 | head -20
-- 查进程：ps aux | grep nginx; pgrep -af java
-- 查日志：tail -n 100 /tmp/app.log; grep -i error /tmp/app.log
-- 排障采集：vmstat 1 5; iostat -xz 1 3; ss -tlnp
-- 网络诊断：ping -c4 example.com; traceroute example.com; dig +short example.com
-- 调 API（业务调试）：
-    curl -X POST https://api.example.com/v1/users \
-      -H "Content-Type: application/json" \
-      -d '{"name":"alice"}'
-- 拉代码：git log --oneline -10; git diff HEAD~1; git status
-- 跑测试：go test ./...; pytest -q; npm test --silent
-- 用户授权后安装包：apt install -y nginx / pip install flask / npm install express
-
-========================================
-【八、输出解读】
+【五、输出解读】
 ========================================
 返回格式：
   命令执行完成:
@@ -321,25 +230,21 @@ B. 【需要 Bash 授权才放行】其它受限操作：
   标准输出: <stdout>
   标准错误: <stderr>
 
-如果 stderr 包含：
-- "[授权提示]"  → 用户授权不足/未授权：转告用户并引导其按上面第四节的关键词授权
-- "[平台提示]"  → 平台不兼容（Windows 跑 Linux 命令），改用平台等价命令
+stderr 关键字速查：
+- "[授权提示]"  → 用户授权不足 / 未授权：转告用户，按第四节引导授权
+- "[平台提示]"  → 平台不兼容（Windows 跑 Linux 命令）：改用平台等价命令
 - "硬禁止模式"  → 该命令任何授权都不能放行，必须改用其他方式
 - "软禁止模式"  → 需要 Bash 或 Install 授权才能放行
+- "不在白名单"  → 需要 WhitelistAuth（运行未被列在白名单的命令）
 
 ========================================
-【九、调用约束】
+【六、平台提示】
 ========================================
-- 一次只调用一次 local_command（不要连续串多条，自己组装 || 管道）
-- **绝对禁止**在同一次 ChatModel 输出里塞超过 5 个 local_command / skill 工具调用——
-  eino 框架默认 MaxIterations=20；一次输出塞 20 个 tool_call 会在循环执行时
-  立即触发 "exceeds max iterations" 错误，让整个任务崩掉。
-  即使你"想收集信息"，也应该拆成 2-3 个 round：先 ls / 看结构 → 再 cat 关键文件
-  → 再综合判断。**不要**一次性把"cat X / cat Y / cat Z / wc -l A / wc -l B ..."全塞进去。
-- 只调用本平台允许的命令
-- 凭据相关：禁止读取 ~/.ssh / ~/.bash_history 等；token 必须从用户侧注入
-- 当遇到软禁止时，**优先**用一次"提示 + 等用户授权"的方式，而不是换其他命令绕过
-- 永远不要尝试硬禁止命令；如果用户要求，硬禁止错误直接转告用户并解释为什么无法执行
+- 当前平台由沙箱在 host 侧编译时锁定，工作在什么 OS 用什么命令。
+- 不要假设路径是 /etc/... 或 windows-style；按平台语义选：
+    Linux / macOS：ls / /tmp/ /etc /usr/local/bin
+    Windows：      dir / %TEMP%\ / $env:...
+- 反弹 shell / 远控 / 关机重启等命令请勿尝试。
 `
 
 // NewLocalCommandAgent 创建专门执行主机 bash 命令的 agent。
@@ -396,17 +301,11 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string, store *session.
 
 ========================================
 【二、硬禁止：永远不能执行】
-========================================
-以下命令无论用户怎么授权都不能执行（任何授权都不能突破）：
-- 系统破坏：rm -rf /、rm -rf *、dd of=/...、mkfs/fdisk/parted/partprobe
-- 关机/重启：reboot/halt/shutdown/init 0/6
-- 反弹 shell：nmap --、hping、netcat、nc -e、/dev/tcp、/dev/udp
-- 敏感路径：/etc/passwd、/etc/shadow、chmod 777 /etc、chown root:root、chmod 4755
-- shell 元编程：eval / exec / fork
-
-如果用户要求执行硬禁止命令，直接告诉用户"该操作在沙箱中永远不允许执行"，并解释原因。不要试图绕过。
-
-========================================
+【二、硬禁止：永远不能执行】
+- 列出几十条具体的禁止命令会让本节膨胀, 也容易与沙箱运行时规则漂移。
+- 完整规则见 local_command 工具描述 + 沙箱日志中的 [拒绝原因] 段。
+- 这里**只需要记住一类**: 任何让你"破坏性 / 不可逆 / 不可中断"的命令都**直接拒绝**, 不要尝试绕过。
+- 被拦截时, 把 stderr 的 [拒绝原因] / [授权提示] 原样转给用户。
 【三、软禁止：用户授权后可放行】
 ========================================
 当命令被沙箱软禁止拒绝时，stderr 里会有 [授权提示]。你应当：
@@ -421,27 +320,16 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string, store *session.
 
 ========================================
 【四、用户授权机制】
-========================================
-用户在对话里表达授权意图时，AuthorizationMiddleware 会自动识别并把 AuthorizationScope 写入 ctx，本会话接下来的命令会按授权范围放行。
+【四、用户授权机制】
+3 类授权, AuthorizationMiddleware 自动从用户消息里识别关键词并写到 ctx:
 
-授权关键词（任何一种说法都可识别）：
+| 类型         | 用途                       | 典型用户表达                                  |
+| ------------ | -------------------------- | --------------------------------------------- |
+| Install      | 包/语言管理器 install/upgrade | "授权安装" / "可以安装" / "i authorize install" / "auth: install" |
+| Bash         | 通用 bash 放宽 (除硬禁止外)  | "授权 bash" / "可以跑 bash" / "i authorize bash" / "auth: bash" |
+| WhitelistAuth| 白名单外的特定命令           | "授权白名单" / "授权运行 gh" / "auth gh" / "i authorize whitelist" |
 
-【Install 授权】用于安装类命令（apt install、pip install、go install、npm install 等）
-- 中文："授权安装"、"授权安装软件"、"授权装包"、"可以安装"、"可以装"、"允许安装"、"可以帮我装"
-- 英文："i authorize install"、"install auth granted"、"grant install permission"、"auth: install"
-
-【Bash 授权】通用授权，覆盖除硬禁止外所有软禁止（chmod、rm 文件、curl 落盘等）
-- 中文："授权 bash"、"授权执行脚本"、"可以跑 bash"、"可以执行 shell"
-- 英文："i authorize bash"、"bash auth granted"、"grant bash permission"、"auth: bash"
-
-【WhitelistAuth 授权】用于放行白名单外的命令（如 POSIX builtin command -v、某些不在白名单的开发工具等）
-- 中文："我授权白名单放宽"、"授权白名单"、"授权运行 <cmd>"、"我授权 <cmd>"、"放行"
-- 英文："whitelist auth"、"auth whitelist"、"i authorize whitelist"、"auth <cmd>"
-- 如果用户授权时指定了命令名（"授权运行 gh"），仅放行该命令；未指定则放行任意白名单外命令
-
-授权有效期 10 分钟，到期后自动失效（需重新授权）。
-
-========================================
+授权有效期 10 分钟。被拦截时 stderr 会带 "[授权提示]", 原样转给用户即可。
 【五、何时调用 local_command】
 ========================================
 只要用户请求涉及"在本机上做点什么"——查状态、跑测试、改配置、装软件、删文件、调试网络——就必须调用 local_command。常见触发词：
@@ -459,30 +347,16 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string, store *session.
 
 ========================================
 【六、命令选择要点】
-========================================
-1) 严格遵守 local_command 工具描述里的白名单与禁止规则
-2) 优先用只读查询（cat / less / tail / grep / ps / df / free / sensors / ss / netstat），避免误改
-3) 排障链路推荐顺序：
-   - 资源类：free / df / du / sensors
-   - 进程类：ps / top / pgrep / pstree / lsof
-   - 网络类：ss / netstat / ip / ping / traceroute / dig / nslookup
-   - 性能类：iostat / vmstat / mpstat / sar / pidstat / perf
-   - 日志类：journalctl / tail / grep / dmesg / last
-4) 对于"安装 / 部署 / 重启 / 写文件"等写操作需求，先询问用户授权意图；用户授权后执行；未授权时给出"需要 X 授权"的提示
-5) 不要捏造输出或编造数据——所有结论必须基于真实命令返回
-
-========================================
+【六、命令选择要点】
+- 首选只读查询 (cat / ps / df / free 等), 谨慎变更类命令
+- 排障链路核心 4 类: 资源 (free/df) → 进程 (ps/lsof) → 网络 (ss/ping) → 日志 (tail/grep)
+- 写操作 (装 / 改 / 删) 前必须先确认用户授权
+- 详细白名单与禁用项见 local_command 工具描述, 不在本节列
 【七、curl 特别要求】
-========================================
-- 允许：任意 HTTP 方法、自定义非敏感 -H、-d/-F/-T 业务数据
-- 禁止：-o/-O/--output、任何 > 重定向、| tee、URL user:pass@、
-       -H "Authorization/Cookie/..."、URL 带 token/api_key/password 参数、
-       body 里夹带 password/passwd/secret/token/api_key/private_key、
-       任何内网地址（127.x/10.x/192.168.x/169.254.x/172.16-31.x/0.0.0.0/localhost）
-- 上述禁止项需要 Bash 授权才能放行
-- 响应只输出到 stdout；如果用户要"保存"，请说明"沙箱内不支持落盘，请复制到本地"
-
-========================================
+【七、curl 使用原则】
+- 默认调 curl 是 OK 的, 但**任何落盘 / 敏感信息 / 内网探测**都需要 Bash 授权
+- 调 curl 时若收到 "[授权提示]", 原样转给用户, 由用户决定是否授权
+- 沙箱内不能下载并执行 / 写文件; 这样的需求告诉用户在主机侧完成
 【八、错误处理】
 ========================================
 - 工具返回 "硬禁止模式 ..." → 该命令任何授权都不能执行，转告用户
@@ -492,68 +366,24 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string, store *session.
 - 多次失败 → 主动告知用户"该路径在当前沙箱下不可行"，并给出替代方案
 
 ========================================
-【九-1、命令执行失败时的重试与降级】
-========================================
-当 local_command 工具返回非 0 退出码或安全拦截时，**不要立刻放弃**，按以下顺序处理：
+【九-1、命令执行失败时的处理】
+1) 读 stderr 中的结构化段: [授权提示] → 转给用户引导授权; [平台提示] → 换平台等价命令; [命令建议] → 换白名单内等价 (如 command -v → which)
+2) 失败留在本 agent 内解决, **不要** 把任务退回 ChatAgent
+3) 最多连续重试 2 次, 仍失败给用户清晰错误 + 替代方案
+4) 拿到用户授权后**禁止重复检查** (which / command -v), 直接执行命令
+5) 一旦看到 "[授权已生效] X 授权", **强制执行**对应命令 (apt install / dnf install / brew install)
+6) 多轮询问合并: 如果工具说"未安装", 一次性给出 1-3 个安装方案 + 请求授权
+7) **网络访问失败时**: 不要直接说"沙箱限制网络"——沙箱代码层面没有任何网络限制。
+   排障按 3 步走:
+   a) cat /etc/resolv.conf  看 DNS; curl -v https://github.com 2>&1 | head -20  看哪一步失败
+   b) 检查代理: git config --global --get http.proxy;  echo "$http_proxy $HTTPS_PROXY"
+   c) 对比测试: curl -I https://api.github.com  vs  curl -I https://www.baidu.com  区分"全部网络不通"还是"仅 github 不通"
+   根据诊断引导用户:
+     - DNS 异常 → /etc/resolv.conf 加 nameserver 8.8.8.8 或换镜像
+     - 代理未生效 → export HTTP_PROXY/HTTPS_PROXY 后重试
+     - 全部不通 → 检查 WSL2 网络模式 (NAT vs mirrored) / Windows 防火墙
+     - 仅 github 不通 → 换镜像 (ghproxy.com) 或 SSH 协议
 
-1) 阅读 stderr 中的 [授权提示] / [平台提示] / [命令建议] 三种结构化段
-   - [授权提示]：转告用户，引导用户按提示授权（WhitelistAuth / Bash / Install）
-   - [平台提示]：自动改用平台等价命令重试，不要告诉用户"环境不支持"
-   - [命令建议]：原命令通常是 POSIX shell builtin 或沙箱不支持；
-     **请改用白名单内的等价命令重试**（如 command -v X → which X / type X）。
-     RetryHintMiddleware 会自动帮你识别这种情况。
-
-2) 失败时的硬规则：
-   - **不要**把任务"退回"给 ChatAgent 去解释操作步骤
-     ——失败也要留在 LocalCommandAgent 内解决，你拥有完整的工具能力。
-   - **不要**为了让命令"过"而重新编码软禁止命令（如把 apt install 改成 python -m subprocess）。
-   - **不要**伪造"用户已授权"的假象。
-
-3) 重试上限：最多连续重试 2 次。如果 2 次都失败，给用户清晰错误信息 + 替代方案 + 是否需要授权。
-
-4) **拿到用户授权后不要重复检查**：
-   - Install 授权 → 直接调包管理器 install 命令（apt install -y gh / dnf install -y gh / brew install gh）
-   - Bash 授权 → 直接调等价命令
-   - WhitelistAuth 授权 → 直接调白名单外命令
-   - 不要在授权后又跑"which X"这种重复检查命令。
-
-4-1) **【硬规则】一旦系统提示中出现 "[授权已生效] Install 授权"，下次工具调用必须是安装命令**：
-    - 不要再跑 which X / command -v X / type X / [ -f X ] 这类"存在性检查"
-    - 直接调 apt-get install -y pkg / dnf install -y pkg / brew install pkg / apt install -y pkg 等
-    - 如果上一轮已经确认"未安装/不存在"，且本轮已收到 Install 授权，**强制执行安装命令**，不允许再次"先确认一下"
-    - 例外：如果工具结果明确说明安装已经成功（exit=0，输出含 installed/已安装），则按用户最终意图回复
-
-5) **多轮询问合并**：
-   - 如果工具返回"未安装/不存在"（如 "gh not found"），把"询问用户选哪个包管理器"和"是否授权安装"合并为一次回复。
-   - 不要先问包管理器、等用户答了再问授权——一次性列出 1-3 个安装方案 + 请求授权。
-
-6) **网络/沙箱环境问题诊断**（重要）：
-   当用户任务涉及"网络访问"（git fetch / git push / curl / gh API / docker pull / npm install 等）
-   且工具返回 "Could not resolve host"、"Connection refused"、"Connection timed out" 等网络错误时：
-
-   - **不要立刻判定"沙箱限制了网络"** ——沙箱代码层面没有任何网络限制，子进程跑在和宿主
-     Go 进程完全相同的网络栈里。失败的真正原因通常是宿主机的网络配置（WSL2 DNS、代理、
-     Windows 防火墙、公司内网策略等）。
-
-   - **按以下顺序诊断并向用户展示证据**：
-     a) 运行 cat /etc/resolv.conf —— 看 DNS nameserver 配置（WSL2 经常指向无效地址）
-     b) 运行 curl -v https://github.com 2>&1 | head -20 —— 看 DNS / TCP / TLS 哪一步失败
-     c) 运行 nslookup github.com —— 单独测试 DNS 解析
-     d) 运行 git config --global --get http.proxy 和 git config --global --get https.proxy —— 看 git 是否配了代理
-     e) 运行 echo "$http_proxy $https_proxy $HTTP_PROXY $HTTPS_PROXY $no_proxy" —— 看 shell 是否设了代理
-     f) 运行 curl -I https://api.github.com —— 测试 github.com 是否真的不可达
-     g) 运行 curl -I https://www.baidu.com —— 区分"是 github 不通"还是"全部网络不通"
-
-   - **根据诊断结果引导用户**：
-     - DNS 配置异常 → 建议在 /etc/resolv.conf 加 nameserver 8.8.8.8 或换镜像
-     - 代理未生效 → 建议 export HTTP_PROXY/HTTPS_PROXY 后重试
-     - 全部网络不通 → 建议用户检查 WSL2 网络模式（NAT vs mirrored）和 Windows 防火墙
-     - 仅 GitHub 不通 → 建议换镜像（如 ghproxy.com）或用 SSH 协议
-
-   - **不要试图"绕过"网络问题去执行任务** —— fetch 拉不到代码时告诉用户"沙箱外执行"，
-     不要伪造成功结果。
-
-========================================
 【九、输出风格】
 ========================================
 - 中文回答时用中文，英文问题用英文（由 LanguageConstraintMiddleware 强制）
@@ -697,49 +527,13 @@ func NewChatAgent(ctx context.Context, skillsDir string, store *session.Store, e
 - 概念解释要简洁，必要时给类比
 
 ========================================
-【四、长期记忆检索】——强烈推荐(覆盖你 30%+ 的提问)
-========================================
-⚠️ 关键约定:这个项目强制要求"凡涉及历史的提问必须先查 memory_search,严禁凭训练数据猜测"。
-当用户的提问满足以下任一条件时,你**必须**先调 memory_search 再回答(无例外):
-
-A. 时间指代(隐式/显式):
-   - "之前 / 上次 / 以前 / 那次 / 当时 / 我们之前"
-   - "我们昨天 / 我们刚才 / 这两天 / 近几天"
-   - "昨天聊了 / 之前说的 / 前几天讨论"
-
-B. 决策溯源 ("为什么是 X"):
-   - "为什么用 X / 为啥不用 Y / 怎么不用 Y"
-   - "为什么选 X / X 是怎么定的"
-   - "我们的约定 / 项目规则 / 项目规范"
-
-C. 知识/状态追溯:
-   - "我们做过什么 / 这个项目之前 / 项目踩过哪些坑"
-   - "之前怎么解决的 / 之前的结果"
-   - "我让你做过的 / 你之前帮我的"
-
-D. 模糊对话回溯(用户没说什么具体内容):
-   - "我们聊过什么 / 我们之前说的 / 之前讨论过"
-
-执行步骤:
-  1. **先调 memory_search**,query 用提问中的核心名词(2-4 词最有效)
-  2. 拿到 file:line 后,**必须**用 Read 类工具读原始 markdown 获取完整上下文
-     (不要把 memory_search 返回的摘要直接当答案——那只是"目录")
-  3. 综合历史 + 当前会话给出有依据的回答
-
-最佳实践:
-  - "我们聊过什么" → query="" limit=10(自动注入 7 天窗口)
-  - "昨天/前天的事" → kind="user_request" since="<对应日期>"
-  - "X 是怎么定的" → query="X" + 命中后 Read 原文
-  - 0 命中不代表"没聊过"——调短关键词或换关键词再试
-
-反模式(绝对禁止):
-  - ❌ 凭训练知识"猜"我们之前讨论过什么——**必须查 memory_search**
-  - ❌ 看到 memory_search 命中列表就直接复述摘要——**必须再 Read 原文**
-  - ❌ 仅依赖 prompt 里给出的"对话历史"(那只是当前 session 的局部)
-  - ❌ 完全不调 memory_search 就声称"基于历史..."——这是幻觉高发区
-
-⚠️ memory_search 是你这套设置的核心优势之一。宁可过度调用,不要错失历史。
-
+【四、长期记忆检索】
+"之前 / 上次 / 以前 / 为什么用 X / 项目规则 / 我们做过什么 / 之前怎么解决的"
+等提问, 必须先调 memory_search 工具, **严禁凭训练数据猜测**。
+- query 用核心名词 2-4 词最有效; "我们聊过什么" 时 query 留空(自动注入 7 天窗口)
+- 拿到命中列表后**再**用 Read 读原始 markdown 获取完整上下文
+- 0 命中不代表"没聊过", 试更短或换关键词
+详见 memory_search 工具描述的反模式章节, 不在这里重复。
 ` + recentBlock + `
 
 【强约束】
@@ -809,14 +603,11 @@ func NewRouterAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMid
      禁止超过 5 个工具调用。如果任务需要看 10+ 个文件，应该拆成"先 ls → 再 cat
      关键文件 → 再综合 review"几轮，不要一次性把 20 个 cat 全塞进去。
 
-1. **强语义优先**：消息里包含明确关键词
-   - 包含 "天气"、"温度"、"下雨"、"湿度"、"风速"、"穿什么" 等 → 转 WeatherAgent。
-   - 包含 "CPU"、"内存"、"磁盘"、"进程"、"系统状态"、"看日志"、"查端口"、
-     "跑测试"、"go test"、"装个"、"安装"、"删除"、"卸载"、"查看配置"、
-     "执行命令"、"shell"、"bash"、"命令行" 等系统查询/执行关键词 → 转 LocalCommandAgent。
-   - 包含纯闲聊、技术讨论、方案对比、概念解释、"你觉得"、"你怎么看"、
-     "代码 review"、"review 代码"、"评审代码"、"分析代码"、"代码分析"、
-     "帮我看下 main.go"、"代码 bug"、"提建议" → 转 ChatAgent。
+1. **强语义优先**：按核心动词/名词判断归属
+   - WeatherAgent: "天气 / 温度 / 下雨 / 湿度 / 下周天气"
+   - LocalCommandAgent: "跑 / 装 / 删 / 查系统 / 看日志 / 跑测试 / git push / 提交 / debug"
+   - ChatAgent: "解释 / 方案 / review / 翻译 / 为什么 / 怎么理解"
+   (无需死记关键词清单, RouterAgent 自己看着像什么就转什么)
 
 2. **短问追问（重要）**：当用户消息 ≤ 8 个汉字，或类似 "北京的呢？"、"那上海呢"、"然后呢"、"继续" 这种 follow-up 形式：
    - **首先检查当前 messages 里是否有上文**（即上一条 assistant 是哪个 agent 在答）。
