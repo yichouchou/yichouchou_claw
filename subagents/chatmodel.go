@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"strings"
 
 	"github.com/cloudwego/eino-ext/adk/backend/local"
 	"github.com/cloudwego/eino/adk"
@@ -124,6 +125,7 @@ func NewWeatherAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMi
 
 	handlers := append([]adk.ChatModelAgentMiddleware{
 		messagehandler.NewLanguageConstraintMiddleware(),
+		newDynamicRecentMemoryMiddleware(config.GetRecentMemoryConfig()),
 	}, extraHandlers...)
 	if store != nil {
 		handlers = append([]adk.ChatModelAgentMiddleware{session.NewPersistMiddleware(store)}, handlers...)
@@ -263,6 +265,10 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string, store *session.
 	if err != nil {
 		log.Fatalf("LocalCommandAgent skill middleware: %v", err)
 	}
+	// 动态 recent memory 中间件：transfer 过来的子 agent 也能看到最近记忆,
+	// 防止"上下文断层"——RouterAgent 复述得再清楚,LocalCommandAgent 也得有
+	// 原始 recent memory 作为兜底。
+	localCmdDynamicRecentMw := newDynamicRecentMemoryMiddleware(config.GetRecentMemoryConfig())
 	localCmdTool, err := utils.InferTool(
 		"local_command",
 		localCommandToolDesc,
@@ -412,6 +418,7 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string, store *session.
 			messagehandler.NewLanguageConstraintMiddleware(),
 			messagehandler.NewAuthorizationMiddleware(),
 			messagehandler.NewRetryHintMiddleware(),
+			localCmdDynamicRecentMw,
 		}, func() adk.ChatModelAgentMiddleware {
 			if store != nil {
 				return session.NewPersistMiddleware(store)
@@ -492,6 +499,9 @@ func NewChatAgent(ctx context.Context, skillsDir string, store *session.Store, e
 			recentBlock = "<recent_memory>\n（长期记忆索引未启用或暂无最近对话；如需历史上下文,请调用 memory_search 工具）\n</recent_memory>"
 		}
 	}
+	// 动态 recent block 中间件：每次 ChatModel 调用前重新生成,保证 transfer 后
+	// 子 agent 也能看到最新 recent memory(修复上下文断层)。
+	chatDynamicRecentMw := newDynamicRecentMemoryMiddleware(recentCfg)
 
 	a, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:        "ChatAgent",
@@ -552,6 +562,7 @@ func NewChatAgent(ctx context.Context, skillsDir string, store *session.Store, e
 		},
 		Handlers: append(append(append([]adk.ChatModelAgentMiddleware{
 			messagehandler.NewLanguageConstraintMiddleware(),
+			chatDynamicRecentMw,
 		}, func() adk.ChatModelAgentMiddleware {
 			if store != nil {
 				return session.NewPersistMiddleware(store)
@@ -585,9 +596,15 @@ func NewRouterAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMid
 	}
 
 	// ==== 自动注入最近记忆到 RouterAgent 的 system prompt ====
-	// 让 RouterAgent 一开始就"看到"最近 N 条对话,正常情况下不需要主动调
-	// memory_search 就能理解"刚才 / 上次 / 之前" 这类上下文指代。
-	// 路由判定规则第 0 条已强制：先看 recent_memory → 不够再调 memory_search。
+	// 关键修复(2026-07-29)：之前的版本在 NewRouterAgent() 构造时把 recentBlock
+	// 写死到 Instruction 里,导致:
+	//   1. 服务重启后,新会话第一条 user_message 之前的 recent memory 还是
+	//      "启动那一刻"的内容(若重启前最后一条对话还没被 refine/落盘就漏掉)
+	//   2. 同一会话连问多轮,recentBlock 不会更新
+	// 改进:让 recentBlock 仍作为 Instruction 的静态部分(提供基础上下文),
+	// 再**额外**注册一个 BeforeModelRewriteState middleware,在每次
+	// ChatModel 调用前把"最新"recent memory 拼到当前 user message 前面,
+	// 保证 RouterAgent 看到的"最近记忆"始终是最新视角。
 	recentCfg := config.GetRecentMemoryConfig()
 	var recentBlock string
 	if !recentCfg.Enabled {
@@ -604,6 +621,8 @@ func NewRouterAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMid
 			recentBlock = "<recent_memory>\n（长期记忆索引未启用或暂无最近对话；如需历史上下文,请调用 memory_search 工具）\n</recent_memory>"
 		}
 	}
+	// 动态 recent block 中间件:每次调用前重新生成。
+	dynamicRecentMw := newDynamicRecentMemoryMiddleware(recentCfg)
 
 	a, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:        "RouterAgent",
@@ -634,6 +653,41 @@ func NewRouterAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMid
 - ❌ 在不查 memory 的情况下，对模糊短问反问用户"请提供具体命令"——用户问的"这个命令"很可能指刚才聊过的内容。
 - ❌ 主观臆断"历史里没有"——没看到不等于没聊过，先调 memory_search 再说。
 - ❌ 仅凭当前这一条 query 路由，忽略上文。
+
+========================================
+【0.1 上下文必须显式带入 transfer（修复上下文断层）】
+========================================
+eino 的 transfer_to_agent 工具签名是固定的 {"agent_name":"..."}，**无法带自定义 payload**。
+被 transfer 过去的子 agent（LocalCommandAgent / ChatAgent / WeatherAgent）只能看到
+RouterAgent 整理后的"任务陈述"，看不到用户原话和 recent memory。
+
+因此**你在 transfer 之前必须把上下文显式复述出来**，否则子 agent 收到"系统初始化，没有用户问题"，
+会反问澄清——这就是"上下文断层"bug 的根因。
+
+【标准工作流（按顺序执行）】
+1. **先读 recent memory**（见下方 <recent_memory> 块）：能推出上下文就够用。
+2. **不够就调 memory_search 工具**：
+   - "刚才 / 上次 / 之前 / 它 / 这个命令" → query 用能定位到具体命令/操作的核心名词
+   - 例: "它有替代命令吗" → query="pwd 替代命令" 或 "pwd 替代"
+   - 拿到命中后用 Read 读原始 markdown 拿到完整上下文
+3. **在你的工具调用之前的文字回复里，把上下文复述清楚**：
+   - 显式说明"用户问的'它'指代的是 X (在请求组 Y 的 LLM 调用 trace Z 中提到的)"
+   - 简述用户原话与上文的关联
+   - 这一步是给子 agent 看的"任务背景"——它相当于 transfer_to_agent 的隐式 payload
+4. **然后才发起 transfer_to_agent(...)**
+
+【反模式（会导致断层，绝对禁止）】
+- ❌ 直接 transfer_to_agent 不交代上下文：子 agent 看不到 recent memory，只能看到"系统初始化"
+- ❌ 调 memory_search 但不把命中结果整合到回复里就 transfer：等于没查
+- ❌ 反问用户"你指的是哪个命令" —— 永远先自己查 memory，查不到再问
+
+【示例（正确做法）】
+用户说: "它有替代命令吗？"（上文是 pwd 命令）
+- ❌ 错误: 直接 transfer_to_agent(LocalCommandAgent) → LocalCommandAgent 看到"你问的'它'指代哪个命令"
+- ✅ 正确:
+  1) 看到 recent_memory 里 [2 分钟前] 用户问 pwd 命令是否有替代品
+  2) 文字回复: "用户的问题是：pwd 命令在 Linux 环境下是否有替代命令。"
+  3) transfer_to_agent({"agent_name":"LocalCommandAgent"})
 
 ========================================
 【1. 路由判定规则（按顺序）】
@@ -701,10 +755,62 @@ func NewRouterAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMid
 			session.NewPersistMiddleware(store),
 			messagehandler.NewLanguageConstraintMiddleware(),
 			messagehandler.NewAuthorizationMiddleware(),
+			dynamicRecentMw,
 		}, extraHandlers...),
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	return a
+}
+
+// dynamicRecentMemoryMiddleware 在每次 ChatModel 调用前重新生成 recent memory
+// 块,并拼到当前 messages 末尾(user role)的开头。
+//
+// 为什么需要：NewRouterAgent 构造时算的 recentBlock 是 agent 启动时刻的快照,
+// 对于长会话或服务刚重启的场景,会错过最新的 user_request。动态中间件保证
+// RouterAgent 每次看到的"最近记忆"都是 Run 触发那一刻的实时视图。
+type dynamicRecentMemoryMiddleware struct {
+	*adk.BaseChatModelAgentMiddleware
+	cfg config.RecentMemoryConfig
+}
+
+func newDynamicRecentMemoryMiddleware(cfg config.RecentMemoryConfig) *dynamicRecentMemoryMiddleware {
+	return &dynamicRecentMemoryMiddleware{cfg: cfg}
+}
+
+func (m *dynamicRecentMemoryMiddleware) BeforeModelRewriteState(
+	ctx context.Context, state *adk.ChatModelAgentState, _ *adk.ModelContext,
+) (context.Context, *adk.ChatModelAgentState, error) {
+	if !m.cfg.Enabled {
+		return ctx, state, nil
+	}
+	if len(state.Messages) == 0 {
+		return ctx, state, nil
+	}
+	// 取最后一条 user message,把 recent memory 块前置。
+	// 原因：recent memory 是给"当前这一次"看的,不应该污染历史消息。
+	for i := len(state.Messages) - 1; i >= 0; i-- {
+		msg := state.Messages[i]
+		if msg.Role != schema.User {
+			continue
+		}
+		// 跳过已经注入过的(避免 iteration 重复加)
+		if strings.HasPrefix(msg.Content, "<recent_memory_dynamic>") {
+			return ctx, state, nil
+		}
+		block := memorytool.RecentMemoryBlock(memorytool.RecentMemoryConfig{
+			Enabled:     true,
+			Limit:       m.cfg.Limit,
+			MaxTokens:   m.cfg.MaxTokens,
+			KindsFilter: m.cfg.KindsFilter,
+			MaxAgeDays:  m.cfg.MaxAgeDays,
+		})
+		if block == "<recent_memory>\n\n</recent_memory>" {
+			block = "<recent_memory>\n（暂无最近对话）\n</recent_memory>"
+		}
+		state.Messages[i].Content = "<recent_memory_dynamic>\n" + block + "\n</recent_memory_dynamic>\n\n" + msg.Content
+		break
+	}
+	return ctx, state, nil
 }
