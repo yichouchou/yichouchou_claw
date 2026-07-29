@@ -573,7 +573,38 @@ func NewChatAgent(ctx context.Context, skillsDir string, store *session.Store, e
 //   - ChatAgent：闲聊、通用问答、技术讨论
 //   - WeatherAgent：查天气
 //   - LocalCommandAgent：执行主机 bash 命令（含沙箱授权）
+//
+// 注意：RouterAgent 同时持有 memory_search 工具，并自动注入"最近记忆"到
+// system prompt。原因：路由前需要先理解上下文（用户经常问"刚才那个 XX 是什么"、
+// "上一次装的包是啥"），必须先调 memory 检索历史再判断委派。
 func NewRouterAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMiddleware) adk.Agent {
+	// memory_search 工具：路由前先读历史,避免在没有上下文时反问用户。
+	memorySearchTool, err := memorytool.NewSearchTool()
+	if err != nil {
+		log.Fatalf("RouterAgent memory_search tool: %v", err)
+	}
+
+	// ==== 自动注入最近记忆到 RouterAgent 的 system prompt ====
+	// 让 RouterAgent 一开始就"看到"最近 N 条对话,正常情况下不需要主动调
+	// memory_search 就能理解"刚才 / 上次 / 之前" 这类上下文指代。
+	// 路由判定规则第 0 条已强制：先看 recent_memory → 不够再调 memory_search。
+	recentCfg := config.GetRecentMemoryConfig()
+	var recentBlock string
+	if !recentCfg.Enabled {
+		recentBlock = ""
+	} else {
+		recentBlock = memorytool.RecentMemoryBlock(memorytool.RecentMemoryConfig{
+			Enabled:     true,
+			Limit:       recentCfg.Limit,
+			MaxTokens:   recentCfg.MaxTokens,
+			KindsFilter: recentCfg.KindsFilter,
+			MaxAgeDays:  recentCfg.MaxAgeDays,
+		})
+		if recentBlock == "<recent_memory>\n\n</recent_memory>" {
+			recentBlock = "<recent_memory>\n（长期记忆索引未启用或暂无最近对话；如需历史上下文,请调用 memory_search 工具）\n</recent_memory>"
+		}
+	}
+
 	a, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:        "RouterAgent",
 		Description: "一个智能任务路由器，负责将任务分配给其他专家 agent。",
@@ -584,7 +615,29 @@ func NewRouterAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMid
 - LocalCommandAgent：在受限沙箱内执行主机 bash 命令（系统查询、日志查看、网络诊断、安装/写操作等）；需要用户授权的安装/写操作由它负责交互。
 等等
 
-【路由判定规则（按顺序）】
+========================================
+【0. 路由前必须先理解上下文（最优先）】
+========================================
+在判断"这条消息转给谁"之前，**先理解用户到底在问什么**。两种手段由你按需选用：
+
+(a) **system prompt 已自动注入的"最近记忆"**（见下方的 <recent_memory> 块）：
+  - 优先用这里的内容来理解"刚才 / 上次 / 之前"这类指代。
+  - 这部分内容是事实来源，**不要凭训练数据猜测**用户之前聊过什么。
+
+(b) **memory_search 工具**：当下面情况时主动调：
+  - 用户的问题在"最近记忆"里找不到（窗口太短 / 太旧）
+  - 用户明确要求"翻/查 memory / 翻记录 / 之前怎么做的 / 为什么用 X"
+  - 反模式需要查的："我们之前 X 怎么解决的" → query="X 解决"
+  - query 留空时自动注入最近 7 天窗口
+
+**严禁**：
+- ❌ 在不查 memory 的情况下，对模糊短问反问用户"请提供具体命令"——用户问的"这个命令"很可能指刚才聊过的内容。
+- ❌ 主观臆断"历史里没有"——没看到不等于没聊过，先调 memory_search 再说。
+- ❌ 仅凭当前这一条 query 路由，忽略上文。
+
+========================================
+【1. 路由判定规则（按顺序）】
+========================================
 0. **复合任务拆分（最优先）**：如果一条消息同时包含"分析 / 评审 / 解释 / review 文本"
    和"提交 / 跑命令 / 创建 / 执行" 等多个动词，**视为复合任务**：
    - "进入 X 目录 review 代码 + 提交 issue"、"分析代码然后写文件"、"看完帮我跑 Y"
@@ -610,10 +663,10 @@ func NewRouterAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMid
    (无需死记关键词清单, RouterAgent 自己看着像什么就转什么)
 
 2. **短问追问（重要）**：当用户消息 ≤ 8 个汉字，或类似 "北京的呢？"、"那上海呢"、"然后呢"、"继续" 这种 follow-up 形式：
-   - **首先检查当前 messages 里是否有上文**（即上一条 assistant 是哪个 agent 在答）。
-     - 若上文是 WeatherAgent → 可以推断是天气连续追问 → 转 WeatherAgent。
-     - 若上文是 LocalCommandAgent → 转 LocalCommandAgent（继续命令执行任务）。
-     - 若上文是 ChatAgent 或没有上文 → **不要猜测意图**，用 ChatAgent 反问一句澄清，例如"你说的 XX 是什么意思？是天气，还是想执行命令？"，然后停止本次 run。
+   - **绝对不要直接反问**。先看下方 <recent_memory> 块能否推出上下文。
+   - 若 recent_memory 已显示上文在聊某命令 → 转 LocalCommandAgent 继续。
+   - 若 recent_memory 仍无法推出（用户首次对话 / 太旧）→ 调 memory_search 工具查更早历史。
+   - 仅当"recent_memory + memory_search 都查不到"才允许走 ChatAgent 反问。
    - 严格禁止对无上文且措辞模糊的短问直接转 WeatherAgent 或 LocalCommandAgent。
 
 3. **地理孤词例外**：用户只写一个地名（"西藏"、"新疆"、"上海"）且上文无法推出天气话题时：
@@ -633,8 +686,15 @@ func NewRouterAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMid
   如果再次调 transfer_to_agent，框架会因工具不可见而报 "[NodeRunError] tool transfer_to_agent not found"，
   这条错误会导致整个 run 失败，必须避免。
 - 你自己不要回答业务问题；永远先把任务委派给最合适的 agent。
-- LocalCommandAgent 处理完后用户可以继续追问命令执行相关内容；后续追问应优先转回 LocalCommandAgent，而不是 ChatAgent。`,
+- LocalCommandAgent 处理完后用户可以继续追问命令执行相关内容；后续追问应优先转回 LocalCommandAgent，而不是 ChatAgent。` + recentBlock,
 		Model: model.NewChatModel(),
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				// 注册 memory_search 工具,让 RouterAgent 在路由前能主动检索历史。
+				// 最近记忆通常已通过 recentBlock 自动注入,只在窗口不够时调。
+				Tools: []tool.BaseTool{memorySearchTool},
+			},
+		},
 		// 只在 RouterAgent 上注册 PersistMiddleware，让最外层 agent 在每次成功结束后
 		// 把完整 messages 写入 store；子 agent（ChatAgent / WeatherAgent / LocalCommandAgent）不会触发。
 		Handlers: append([]adk.ChatModelAgentMiddleware{
