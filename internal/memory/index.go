@@ -684,6 +684,52 @@ func (i *Index) GetBySession(sessionID string, limit int) []SearchResult {
 	return out
 }
 
+// Recent 返回最近 N 条 entry（按时间倒序）。
+//
+// 用途：
+//   - system prompt 自动注入最近记忆（D 方案）
+//   - 启动时 dump 最近若干条历史供人浏览
+//
+// 参数：
+//   - limit: 返回条数上限（<=0 时默认 20）
+//   - kindFilter: 只保留这些 kind（如 ["user_request"] 排除 trace 类）；nil 不过滤
+//
+// 返回：按时间倒序的 []SearchResult（最新在前）
+func (i *Index) Recent(limit int, kindFilter []string) []SearchResult {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	if limit <= 0 {
+		limit = 20
+	}
+
+	// kind 白名单构建
+	kindSet := make(map[string]bool)
+	for _, k := range kindFilter {
+		kindSet[k] = true
+	}
+
+	out := make([]SearchResult, 0)
+	for _, id := range i.order {
+		e := i.entries[id]
+		if e == nil {
+			continue
+		}
+		// 应用 kind 过滤
+		if len(kindSet) > 0 && !kindSet[e.Kind] {
+			continue
+		}
+		out = append(out, SearchResult{IndexEntry: *e})
+	}
+	// 时间倒序
+	sort.SliceStable(out, func(a, b int) bool {
+		return out[a].Time > out[b].Time
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
 // Stats 返回索引统计信息。
 func (i *Index) Stats() IndexStats {
 	i.mu.RLock()

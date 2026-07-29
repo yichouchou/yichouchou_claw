@@ -176,6 +176,11 @@ type MemoryConfig struct {
 	Enabled          bool          `yaml:"enabled"`
 	LLMRefineEnabled bool          `yaml:"llm_refine_enabled"`
 	Refiner          RefinerConfig `yaml:"refiner"`
+
+	// RecentMemory 是 D 方案的配置入口：把最近 N 条记忆自动注入到 ChatAgent
+	// system prompt。
+	// yml 路径: application.yml → memory.recent_memory.*
+	RecentMemory RecentMemoryConfig `yaml:"recent_memory"`
 }
 
 // SessionConfig session 配置。
@@ -235,6 +240,57 @@ type PathACLConfig struct {
 	WriteDenied []string `yaml:"write_denied"`
 	// ExecDenied 禁止执行的命令名（同时被 denybin 使用）
 	ExecDenied []string `yaml:"exec_denied"`
+}
+
+// RecentMemoryConfig 最近记忆自动注入配置（D 方案的配置入口）。
+//
+// 来源：参考 Claude Code 的 CLAUDE.md 机制——把最近 N 条记忆直接灌到
+// ChatAgent 的 system prompt,让模型无需主动调 memory_search 也能"感知"到
+// 近期上下文。
+//
+// 注意：这个配置是 yml 解析后的运行时只读副本。运行时由 main.go 解析 yml 后
+// 注入,其他模块从 globalRecentMemoryConfigGetter 读取。
+type RecentMemoryConfig struct {
+	// Enabled 是否启用自动注入。
+	// 设为 false 时, RecentMemoryContext 返回空（不注入），保持与原 NewChatAgent 行为一致。
+	// 默认 false（保守起步,在 application.yml 显式打开更清晰）。
+	Enabled bool `yaml:"enabled"`
+
+	// Limit 注入多少条最近记忆。
+	// 推荐 5-20: 太大 → 占 token; 太小 → 模型看不到完整历史。
+	// 默认 10。
+	Limit int `yaml:"limit"`
+
+	// MaxTokens 注入文本字符上限（粗略估算）。
+	// 超过此上限会被裁剪,只保留前缀部分 + "如需更早的记忆请调 memory_search"提示。
+	// 默认 2000 字符。
+	MaxTokens int `yaml:"max_tokens"`
+
+	// KindsFilter 只注入这些 kind。
+	// 默认 ["user_request"]: 只显示"用户问过什么",最贴近自然语言。
+	// 可扩展: ["user_request", "user_response"] 包含问答对。
+	KindsFilter []string `yaml:"kinds_filter"`
+
+	// MaxAgeDays 最远多少天内的记忆会被注入。
+	// 超过此时间的记忆不注入,留给"主动查询"路径（memory_search 工具）兜底。
+	// 默认 30 天。
+	MaxAgeDays int `yaml:"max_age_days"`
+}
+
+// fillDefaults 填充零值字段为默认值（在 LoadApplication 时调用）。
+func (r *RecentMemoryConfig) fillDefaults() {
+	if r.Limit <= 0 {
+		r.Limit = 10
+	}
+	if r.MaxTokens <= 0 {
+		r.MaxTokens = 2000
+	}
+	if r.MaxAgeDays <= 0 {
+		r.MaxAgeDays = 30
+	}
+	if len(r.KindsFilter) == 0 {
+		r.KindsFilter = []string{"user_request"}
+	}
 }
 
 // ApplicationConfig application.yml 根结构。
@@ -335,6 +391,9 @@ func LoadApplication(path string) error {
 		return fmt.Errorf("config: parse %s: %w", path, err)
 	}
 
+	// 填充 RecentMemory 的零值字段为默认值
+	cfg.Memory.RecentMemory.fillDefaults()
+
 	appMu.Lock()
 	app = cfg
 	appAt = path
@@ -403,6 +462,38 @@ func GetApplication() *ApplicationConfig {
 	appMu.RLock()
 	defer appMu.RUnlock()
 	return app
+}
+
+// GetRecentMemoryConfig 是 memory.recent_memory 的便捷 getter。
+//
+// 用法（在 ChatAgent 中）：
+//
+//	cfg := config.GetRecentMemoryConfig()
+//	if !cfg.Enabled { return ... }   // 不注入
+//	memorytool.RecentMemoryBlock(memorytool.RecentMemoryConfig{...})
+//
+// 注意：返回的值是 yml 解析后的"实际生效"配置（含 fillDefaults）。
+// 如果未加载 application.yml，返回 ZeroRecentMemoryConfig (Enabled=false)。
+func GetRecentMemoryConfig() RecentMemoryConfig {
+	appMu.RLock()
+	defer appMu.RUnlock()
+	if app == nil {
+		return ZeroRecentMemoryConfig()
+	}
+	return app.Memory.RecentMemory
+}
+
+// ZeroRecentMemoryConfig 返回"未启用"的 RecentMemoryConfig。
+//
+// 这是未调用 LoadApplication 时的安全默认值。
+func ZeroRecentMemoryConfig() RecentMemoryConfig {
+	return RecentMemoryConfig{
+		Enabled:     false,
+		Limit:       10,
+		MaxTokens:   2000,
+		MaxAgeDays:  30,
+		KindsFilter: []string{"user_request"},
+	}
 }
 
 // ApplicationLoadedPath 返回最后一次成功加载的 application.yml 路径（用于日志 / 调试）。
