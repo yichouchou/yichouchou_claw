@@ -32,7 +32,6 @@ package memory
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -845,6 +844,3 @@ func SearchGlobalIndex(q SearchQuery) []SearchResult {
 	}
 	return idx.Search(q)
 }
-
-// _ 占用：避免 context import 被 unused 检查误删
-var _ = context.Background

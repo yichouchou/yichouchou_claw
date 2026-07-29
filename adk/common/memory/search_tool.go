@@ -27,12 +27,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
-	"time"
-
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
 	"github.com/yichouchou/yichouchou_claw/internal/memory"
+	"strings"
 )
 
 // SearchInput 是 memory_search 工具的入参。
@@ -169,9 +167,3 @@ func doSearch(input *SearchInput) (string, error) {
 	}
 	return string(b), nil
 }
-
-// _ 占用 context/time 引用,避免 unused 警告
-var (
-	_ = context.Background
-	_ = time.Now
-)
