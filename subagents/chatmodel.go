@@ -34,6 +34,7 @@ import (
 	memorytool "github.com/yichouchou/yichouchou_claw/adk/common/memory"
 	"github.com/yichouchou/yichouchou_claw/adk/common/model"
 	messagehandler "github.com/yichouchou/yichouchou_claw/adk/middlewares/messageHandler"
+	"github.com/yichouchou/yichouchou_claw/internal/config"
 	"github.com/yichouchou/yichouchou_claw/internal/localcommand"
 	"github.com/yichouchou/yichouchou_claw/internal/session"
 )
@@ -637,6 +638,31 @@ func NewChatAgent(ctx context.Context, skillsDir string, store *session.Store, e
 		log.Fatalf("ChatAgent memory_search tool: %v", err)
 	}
 
+	// ==== D 方案: 自动注入最近记忆到 system prompt ====
+	// 参考 Claude Code 的 CLAUDE.md 机制: 模型无需主动调 memory_search，
+	// 直接在 system prompt 里看到最近 N 条历史。提升触发率的最大杠杆点。
+	//
+	// 配置从 config.GetRecentMemoryConfig() 读取(可由 application.yml 配置)。
+	// 不再 hardcoded 默认值,完全由配置文件控制。
+	recentCfg := config.GetRecentMemoryConfig()
+	var recentBlock string
+	if !recentCfg.Enabled {
+		// 配置关闭 → 不注入任何 recent_memory 块,保持极简 system prompt
+		recentBlock = ""
+	} else {
+		recentBlock = memorytool.RecentMemoryBlock(memorytool.RecentMemoryConfig{
+			Enabled:     true,
+			Limit:       recentCfg.Limit,
+			MaxTokens:   recentCfg.MaxTokens,
+			KindsFilter: recentCfg.KindsFilter,
+			MaxAgeDays:  recentCfg.MaxAgeDays,
+		})
+		if recentBlock == "<recent_memory>\n\n</recent_memory>" {
+			// 索引未启用 或 无最近记忆 → 给一个轻量占位说明
+			recentBlock = "<recent_memory>\n（长期记忆索引未启用或暂无最近对话；如需历史上下文,请调用 memory_search 工具）\n</recent_memory>"
+		}
+	}
+
 	a, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:        "ChatAgent",
 		Description: "通用对话 agent：日常闲聊、通用知识问答、技术方案讨论、概念解释、代码 review、文档整理、翻译。**不**执行任何主机命令——命令执行类请求由 LocalCommandAgent 处理。",
@@ -671,17 +697,50 @@ func NewChatAgent(ctx context.Context, skillsDir string, store *session.Store, e
 - 概念解释要简洁，必要时给类比
 
 ========================================
-【四、长期记忆检索】
+【四、长期记忆检索】——强烈推荐(覆盖你 30%+ 的提问)
 ========================================
-当用户的提问涉及"之前/上次/以前/历史/约定/为什么用 X"等时间指代或历史决策时：
-  1. 调用 memory_search 工具,关键词用用户提问中的核心名词
-  2. 拿到 file:line 后,用 Read 类工具(框架自带)读原始 markdown 获取完整上下文
+⚠️ 关键约定:这个项目强制要求"凡涉及历史的提问必须先查 memory_search,严禁凭训练数据猜测"。
+当用户的提问满足以下任一条件时,你**必须**先调 memory_search 再回答(无例外):
+
+A. 时间指代(隐式/显式):
+   - "之前 / 上次 / 以前 / 那次 / 当时 / 我们之前"
+   - "我们昨天 / 我们刚才 / 这两天 / 近几天"
+   - "昨天聊了 / 之前说的 / 前几天讨论"
+
+B. 决策溯源 ("为什么是 X"):
+   - "为什么用 X / 为啥不用 Y / 怎么不用 Y"
+   - "为什么选 X / X 是怎么定的"
+   - "我们的约定 / 项目规则 / 项目规范"
+
+C. 知识/状态追溯:
+   - "我们做过什么 / 这个项目之前 / 项目踩过哪些坑"
+   - "之前怎么解决的 / 之前的结果"
+   - "我让你做过的 / 你之前帮我的"
+
+D. 模糊对话回溯(用户没说什么具体内容):
+   - "我们聊过什么 / 我们之前说的 / 之前讨论过"
+
+执行步骤:
+  1. **先调 memory_search**,query 用提问中的核心名词(2-4 词最有效)
+  2. 拿到 file:line 后,**必须**用 Read 类工具读原始 markdown 获取完整上下文
+     (不要把 memory_search 返回的摘要直接当答案——那只是"目录")
   3. 综合历史 + 当前会话给出有依据的回答
-典型触发：
-  - "之前我们讨论过 X" → memory_search query="X"
-  - "为什么用 PostgreSQL 不换 MySQL" → memory_search query="PostgreSQL MySQL"
-  - "上次出现类似问题是怎么解决的" → memory_search kind="user_request",看几条历史
-注意：memory_search 返回的是 entry 摘要列表；不要把摘要本身当作最终答案。
+
+最佳实践:
+  - "我们聊过什么" → query="" limit=10(自动注入 7 天窗口)
+  - "昨天/前天的事" → kind="user_request" since="<对应日期>"
+  - "X 是怎么定的" → query="X" + 命中后 Read 原文
+  - 0 命中不代表"没聊过"——调短关键词或换关键词再试
+
+反模式(绝对禁止):
+  - ❌ 凭训练知识"猜"我们之前讨论过什么——**必须查 memory_search**
+  - ❌ 看到 memory_search 命中列表就直接复述摘要——**必须再 Read 原文**
+  - ❌ 仅依赖 prompt 里给出的"对话历史"(那只是当前 session 的局部)
+  - ❌ 完全不调 memory_search 就声称"基于历史..."——这是幻觉高发区
+
+⚠️ memory_search 是你这套设置的核心优势之一。宁可过度调用,不要错失历史。
+
+` + recentBlock + `
 
 【强约束】
 - 你没有可以转出的 sub-agent，**严禁**调用 transfer_to_agent 或任何形式的转出工具

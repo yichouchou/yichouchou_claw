@@ -67,6 +67,19 @@ memory:
     model_temperature: 0.2                   # refine 用低温度
     max_summary_length: 100                  # 摘要硬上限（字符数）
 
+  # 最近记忆自动注入（D 方案，2026-07-27 新增）
+  # 设计参考 Claude Code CLAUDE.md 机制：把最近 N 条记忆直接灌到 ChatAgent
+  # 的 system prompt，让模型无需主动调 memory_search 就能"感知"到近期讨论。
+  # 触发率提升的最大杠杆点。
+  recent_memory:
+    enabled: true                            # 总开关；设为 false 则不注入（保持极简 prompt）
+    limit: 10                                # 注入多少条最近记忆（推荐 5-20）
+    max_tokens: 2000                         # 注入文本字符上限（粗略估算，到达上限自动裁剪）
+    max_age_days: 30                         # 最远多少天内的记忆会被注入
+    kinds_filter:                            # 注入这些 kind 的记忆
+      - user_request                          # 默认：只显示"用户问过什么"
+      # - user_response                       # 可选追加：包含模型回答
+
 # Session（对话历史）
 session:
   max_rounds: 12                             # 每个 session 保留最近多少轮（一问一答算 1 轮）
