@@ -14,32 +14,16 @@
  * limitations under the License.
  */
 
-// Package config 提供执行审批配置的加载与内存缓存。
+// Package config 提供应用配置的加载与内存缓存。
+//
+// 两类配置：
+//  1. 执行审批配置（白名单/黑名单）：从 exec-approvals.json 加载，喂给沙箱。
+//  2. 应用配置（端口、LLM、路径、超时等）：从 application.yml 加载，供各模块读取。
 //
 // 设计目标：
-//   - 把 localcommand 包内的"白名单 / 黑名单"从代码字面量迁出到 JSON 文件
-//     （workdir/config/exec-approvals.json），由配置驱动而非代码硬编码。
-//   - 启动时一次性 Load 到内存；运行期不允许 reload，避免并发修改带来的
-//     不一致语义。
+//   - 把配置从代码字面量 / 环境变量硬编码迁出到 YAML 文件，由配置驱动。
+//   - 启动时一次性 Load 到内存；运行期不允许 reload，避免并发修改带来的不一致语义。
 //   - 加载失败 / 文件缺失时降级到内置兜底（不阻塞进程启动）。
-//
-// 配置 schema 见 exec-approvals.json；顶层结构：
-//
-//	{
-//	  "agents": {
-//	    "<agent_name>": {
-//	      "security":    "allowlist" | "denylist",
-//	      "description": "策略说明",
-//	      "allowlist":   [{"bash": "ls", "description": "..."}, ...],
-//	      "denylist":    [{"bash": "rm", "description": "..."}, ...]
-//	    }
-//	  }
-//	}
-//
-// security 字段语义：
-//   - "allowlist"：只允许 allowlist 列出的命令；denylist 在此基础上"再次
-//     显式拒绝"某些命令（双重保险，例如 rm 既不在 allowlist 也在 denylist）。
-//   - "denylist"：默认允许所有命令，仅拒绝 denylist 列出的命令。
 package config
 
 import (
@@ -50,7 +34,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"gopkg.in/yaml.v3"
 )
+
+// =====================================================================
+// 第一部分：执行审批配置（exec-approvals.json）
+// =====================================================================
 
 // CommandRule 一条命令规则（用于 allowlist；denylist 用 DenylistRule）。
 type CommandRule struct {
@@ -105,21 +95,142 @@ type ExecApprovals struct {
 }
 
 // =====================================================================
+// 第二部分：应用配置（application.yml）
+// =====================================================================
+
+// ServerConfig HTTP 服务配置。
+type ServerConfig struct {
+	// Host 监听地址，如 ":28080"
+	Host string `yaml:"host"`
+}
+
+// OpenAIConfig OpenAI 兼容协议配置。
+type OpenAIConfig struct {
+	APIKey  string `yaml:"api_key"`
+	Model   string `yaml:"model"`
+	BaseURL string `yaml:"base_url"`
+	ByAzure bool   `yaml:"by_azure"`
+}
+
+// ArkConfig 火山方舟配置。
+type ArkConfig struct {
+	APIKey  string `yaml:"api_key"`
+	Model   string `yaml:"model"`
+	BaseURL string `yaml:"base_url"`
+}
+
+// AnthropicConfig Anthropic 配置（用于 ChatAgent + Minimaxi 兼容端点）。
+type AnthropicConfig struct {
+	APIKey          string `yaml:"api_key"`
+	Model           string `yaml:"model"`
+	BaseURL         string `yaml:"base_url"`
+	MaxTokens       int64  `yaml:"max_tokens"`
+	EnableWebSearch bool   `yaml:"enable_web_search"`
+}
+
+// LLMConfig LLM 总配置：选择哪个 ChatModel 实现 + 三家 provider 的配置。
+type LLMConfig struct {
+	// Type 决定走哪个 ChatModel：
+	//   "ark"       → 火山方舟（Ark SDK）
+	//   "anthropic" → Anthropic SDK（默认；支持 Minimaxi 服务端工具）
+	//   其他/空     → OpenAI 兼容协议
+	Type string `yaml:"type"`
+
+	OpenAI    OpenAIConfig    `yaml:"openai"`
+	Ark       ArkConfig       `yaml:"ark"`
+	Anthropic AnthropicConfig `yaml:"anthropic"`
+}
+
+// CozeLoopConfig CozeLoop trace 配置。
+type CozeLoopConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	WorkspaceID string `yaml:"workspace_id"`
+	APIToken    string `yaml:"api_token"`
+}
+
+// TracingConfig tracing 配置。
+type TracingConfig struct {
+	CozeLoop CozeLoopConfig `yaml:"coze_loop"`
+}
+
+// PathsConfig 路径配置（相对于 cwd 或绝对路径）。
+type PathsConfig struct {
+	Workdir   string `yaml:"workdir"`
+	Skills    string `yaml:"skills"`
+	Memory    string `yaml:"memory"`
+	Approvals string `yaml:"approvals"`
+}
+
+// RefinerConfig LLM 摘要精炼 worker 配置。
+type RefinerConfig struct {
+	Workers               int     `yaml:"workers"`
+	QueueSize             int     `yaml:"queue_size"`
+	PerCallTimeoutSeconds int     `yaml:"per_call_timeout_seconds"`
+	ContentSnippetBytes   int     `yaml:"content_snippet_bytes"`
+	ModelTemperature      float32 `yaml:"model_temperature"`
+	MaxSummaryLength      int     `yaml:"max_summary_length"`
+}
+
+// MemoryConfig memory 配置。
+type MemoryConfig struct {
+	Enabled          bool          `yaml:"enabled"`
+	LLMRefineEnabled bool          `yaml:"llm_refine_enabled"`
+	Refiner          RefinerConfig `yaml:"refiner"`
+}
+
+// SessionConfig session 配置。
+type SessionConfig struct {
+	MaxRounds int `yaml:"max_rounds"`
+}
+
+// LocalCommandConfig 沙箱命令执行配置。
+type LocalCommandConfig struct {
+	SingleCommandTimeoutSeconds   int `yaml:"single_command_timeout_seconds"`
+	PipelineCommandTimeoutSeconds int `yaml:"pipeline_command_timeout_seconds"`
+}
+
+// ApplicationConfig application.yml 根结构。
+type ApplicationConfig struct {
+	Server       ServerConfig       `yaml:"server"`
+	LLM          LLMConfig          `yaml:"llm"`
+	Tracing      TracingConfig      `yaml:"tracing"`
+	Paths        PathsConfig        `yaml:"paths"`
+	Memory       MemoryConfig       `yaml:"memory"`
+	Session      SessionConfig      `yaml:"session"`
+	LocalCommand LocalCommandConfig `yaml:"localcommand"`
+}
+
+// =====================================================================
 // 内存存储：包级单例，启动时一次性 Load，运行期只读。
 // =====================================================================
 
 var (
-	storeMu  sync.RWMutex
-	store    *ExecApprovals
-	loadedAt string // 用于日志：记录配置文件路径，便于排查"到底加载了哪份配置"
+	approvalsMu sync.RWMutex
+	approvals   *ExecApprovals
+	approvalsAt string
+
+	appMu sync.RWMutex
+	app   *ApplicationConfig
+	appAt string
 )
 
-// Load 从 path 加载配置文件并写入内存。多次调用以最后一次为准（仅用于测试）。
+// LoadApprovals 从 path 加载 exec-approvals.json 并写入内存。多次调用以最后一次为准（仅用于测试）。
 //
 // 错误策略：
 //   - path 不存在：log 警告，返回 nil（调用方应继续用内置兜底）。
 //   - JSON 解析失败：log 错误，返回 error（让调用方决定是否 fatal）。
+func LoadApprovals(path string) error {
+	return loadApprovals(path)
+}
+
+// Load 是 LoadApprovals 的兼容别名（保留旧 API）。
+//
+// Deprecated: 新代码请用 LoadApprovals。
 func Load(path string) error {
+	return loadApprovals(path)
+}
+
+func loadApprovals(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		log.Printf("[config] exec-approvals.json not loaded from %s: %v (using built-in fallback)", path, err)
@@ -148,41 +259,136 @@ func Load(path string) error {
 		}
 	}
 
-	storeMu.Lock()
-	store = &cfg
-	loadedAt = path
-	storeMu.Unlock()
+	approvalsMu.Lock()
+	approvals = &cfg
+	approvalsAt = path
+	approvalsMu.Unlock()
 
 	log.Printf("[config] exec-approvals.json loaded from %s (agents=%d)", path, len(cfg.Agents))
 	return nil
 }
 
-// GetPolicy 返回 agentName 对应的策略；若不存在或未加载，返回 nil。
-func GetPolicy(agentName string) *AgentPolicy {
-	storeMu.RLock()
-	defer storeMu.RUnlock()
-	if store == nil {
+// LoadApplication 从 path 加载 application.yml 并写入内存。
+//
+// 错误策略：
+//   - path 不存在：log 警告，返回 nil error（调用方继续用零值兜底）。
+//   - YAML 解析失败：返回 error。
+//   - 字段缺失：用零值填充（避免整文件缺失一个字段就 fatal）。
+func LoadApplication(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("[config] application.yml not loaded from %s: %v (using zero-value fallback)", path, err)
 		return nil
 	}
-	p, ok := store.Agents[agentName]
+
+	cfg := defaultApplicationConfig()
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("config: parse %s: %w", path, err)
+	}
+
+	appMu.Lock()
+	app = cfg
+	appAt = path
+	appMu.Unlock()
+
+	log.Printf("[config] application.yml loaded from %s", path)
+	return nil
+}
+
+// defaultApplicationConfig 返回内置兜底配置（所有字段都给合理默认）。
+func defaultApplicationConfig() *ApplicationConfig {
+	return &ApplicationConfig{
+		Server: ServerConfig{
+			Host: ":28080",
+		},
+		LLM: LLMConfig{
+			Type: "anthropic",
+			OpenAI: OpenAIConfig{
+				ByAzure: false,
+			},
+			Anthropic: AnthropicConfig{
+				Model:           "MiniMax-M3",
+				BaseURL:         "https://api.minimaxi.com/anthropic",
+				MaxTokens:       4096,
+				EnableWebSearch: true,
+			},
+		},
+		Tracing: TracingConfig{
+			CozeLoop: CozeLoopConfig{
+				Enabled: false,
+			},
+		},
+		Paths: PathsConfig{
+			Workdir:   "workdir",
+			Skills:    "workdir/skills",
+			Memory:    "workdir",
+			Approvals: "workdir/config/exec-approvals.json",
+		},
+		Memory: MemoryConfig{
+			Enabled:          true,
+			LLMRefineEnabled: true,
+			Refiner: RefinerConfig{
+				Workers:               2,
+				QueueSize:             256,
+				PerCallTimeoutSeconds: 30,
+				ContentSnippetBytes:   1500,
+				ModelTemperature:      0.2,
+				MaxSummaryLength:      100,
+			},
+		},
+		Session: SessionConfig{
+			MaxRounds: 12,
+		},
+		LocalCommand: LocalCommandConfig{
+			SingleCommandTimeoutSeconds:   30,
+			PipelineCommandTimeoutSeconds: 60,
+		},
+	}
+}
+
+// GetApplication 返回当前 application.yml 配置。nil 表示未加载（极端情况）。
+//
+// 调用方读到的总是非 nil（LoadApplication 在文件缺失时会写入默认配置），
+// 但为了兼容未调用 LoadApplication 的场景，返回 nil 也合法。
+func GetApplication() *ApplicationConfig {
+	appMu.RLock()
+	defer appMu.RUnlock()
+	return app
+}
+
+// ApplicationLoadedPath 返回最后一次成功加载的 application.yml 路径（用于日志 / 调试）。
+func ApplicationLoadedPath() string {
+	appMu.RLock()
+	defer appMu.RUnlock()
+	return appAt
+}
+
+// GetPolicy 返回 agentName 对应的策略；若不存在或未加载，返回 nil。
+func GetPolicy(agentName string) *AgentPolicy {
+	approvalsMu.RLock()
+	defer approvalsMu.RUnlock()
+	if approvals == nil {
+		return nil
+	}
+	p, ok := approvals.Agents[agentName]
 	if !ok {
 		return nil
 	}
 	return &p
 }
 
-// IsConfigured 报告是否已加载过配置（用于在 main.go 启动时判断是否走内置兜底）。
-func IsConfigured() bool {
-	storeMu.RLock()
-	defer storeMu.RUnlock()
-	return store != nil
+// IsApprovalsConfigured 报告是否已加载过 approvals 配置。
+func IsApprovalsConfigured() bool {
+	approvalsMu.RLock()
+	defer approvalsMu.RUnlock()
+	return approvals != nil
 }
 
-// LoadedPath 返回最后一次成功加载的配置文件路径（用于日志 / 调试）。
-func LoadedPath() string {
-	storeMu.RLock()
-	defer storeMu.RUnlock()
-	return loadedAt
+// LoadedApprovalsPath 返回最后一次成功加载的 approvals 配置文件路径（用于日志 / 调试）。
+func LoadedApprovalsPath() string {
+	approvalsMu.RLock()
+	defer approvalsMu.RUnlock()
+	return approvalsAt
 }
 
 // ListAgentNames 返回当前配置里所有 agent 名称（按字典序排序）。
@@ -193,13 +399,13 @@ func LoadedPath() string {
 // 不会被遍历到，沙箱里"无黑白名单"——具体语义由 localcommand
 // 决定（默认会落到"全部走 WhitelistAuth 授权"分支）。
 func ListAgentNames() []string {
-	storeMu.RLock()
-	defer storeMu.RUnlock()
-	if store == nil {
+	approvalsMu.RLock()
+	defer approvalsMu.RUnlock()
+	if approvals == nil {
 		return nil
 	}
-	names := make([]string, 0, len(store.Agents))
-	for name := range store.Agents {
+	names := make([]string, 0, len(approvals.Agents))
+	for name := range approvals.Agents {
 		names = append(names, name)
 	}
 	sort.Strings(names)

@@ -48,11 +48,10 @@ func NewAnthropicAdapter(opts ...AnthropicAdapterOption) *AnthropicAdapter {
 		opt(cfg)
 	}
 
-	// 如果没有设置 apiKey，从环境变量读取
+	// 如果没有设置 apiKey，从环境变量读取（兜底）
 	apiKey := cfg.apiKey
 	if apiKey == "" {
-		// 尝试 ANTHROPIC_API_KEY，如果没有则用 OPENAI_API_KEY
-		apiKey = getEnvWithFallback("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+		apiKey = osGetenv("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
 	}
 
 	// 构建客户端选项
@@ -384,10 +383,14 @@ func (a *AnthropicAdapter) WithTools(tools []*schema.ToolInfo) (model.ToolCallin
 	}, nil
 }
 
-// getEnvWithFallback 获取环境变量，如果第一个不存在则用第二个
-func getEnvWithFallback(primary, fallback string) string {
-	if v := os.Getenv(primary); v != "" {
-		return v
+// osGetenv 按顺序读取多个环境变量名，返回第一个非空值。
+//
+// AnthropicAdapter 内部兜底用：调用方没显式 WithAPIKey 时按顺序尝试环境变量。
+func osGetenv(names ...string) string {
+	for _, name := range names {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
 	}
-	return os.Getenv(fallback)
+	return ""
 }
