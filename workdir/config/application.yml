@@ -76,5 +76,68 @@ localcommand:
   single_command_timeout_seconds: 30         # 单条命令超时
   pipeline_command_timeout_seconds: 60        # 管道命令链超时
 
+# Sandbox 安全（2026-07-27 新增，整合四个安全阶段）
+#
+# 设计参考：
+#   - Claude Code:  deny → ask → allow 三段评估
+#   - OpenAI Codex: denybin PATH 注入（OS 层 defense-in-depth）
+#   - mvdan.cc/sh:  AST 解析作为 shell 命令的唯一可信源
+#   - safecmd:      AST 提取 + 逐 CallExpr 验证
+#
+# 四个安全阶段（按评估顺序）：
+#   1. AST 解析：mvdan.cc/sh 解析命令为 AST,递归检查每个 CallExpr/Redirect
+#   2. deny → ask → allow 三段：显式评估链路,清晰展示拒绝原因
+#   3. PathACL：read/write 分开的敏感路径 ACL（read 立即拒绝, write 配合 AST Redirect 检查）
+#   4. denybin PATH 注入：把 deny 命令的真实二进制隐藏到 PATH 末尾（OS 层兜底）
+sandbox:
+  enabled: true                                # 是否启用沙箱安全检查（false = 极不安全）
+
+  # 阶段 1: AST 解析
+  ast:
+    enabled: true                              # 是否启用 mvdan.cc/sh AST 解析
+    fail_closed_on_parse_error: true           # AST 解析失败时直接拒绝（fail-closed）
+
+  # 阶段 2: denybin PATH 注入
+  denybin:
+    enabled: true                              # 是否创建 denybin 目录并插入 PATH 最前端
+    # denied_commands: 为空时使用 path_acl.exec_denied；都为空时使用内置默认
+    denied_commands: []
+
+  # 阶段 3+4: 路径 ACL（read/write/exec 三类）
+  path_acl:
+    # 禁止读取的路径前缀（命中即拒绝,与命令白名单无关）
+    read_denied:
+      - /etc/shadow
+      - /etc/sudoers
+      - /etc/gshadow
+      - /root/.ssh
+      - /root/.bash_history
+      - ~/.ssh/id_rsa
+      - ~/.aws/credentials
+      - ~/.kube/config
+    # 禁止写入的路径前缀（被 AST Redirect 检查命中即拒绝）
+    write_denied:
+      - /etc
+      - /usr
+      - /boot
+      - /proc
+      - /sys
+      - /var/lib
+    # 禁止执行的命令名（被 denybin PATH 注入 + IsDangerousWithAgentV2 deny 阶段命中即拒绝）
+    exec_denied:
+      # 网络类
+      - nc
+      - nmap
+      # 权限修改类
+      - chmod
+      - chown
+      - setcap
+      - setfattr
+      # 磁盘与分区类
+      - dd
+      - mkfs
+      - fdisk
+      - parted
+
 # Memory 中间件 trace 容量
 # 注：anthropic adapter 的 max_tokens 已在上方 llm.anthropic.max_tokens 配置

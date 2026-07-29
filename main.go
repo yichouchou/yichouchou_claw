@@ -67,6 +67,37 @@ func main() {
 	}
 	appCfg := config.GetApplication()
 
+	// =====================================================================
+	// Sandbox 安全初始化（2026-07-27 新增,集成四个安全阶段）
+	// =====================================================================
+	if appCfg.Sandbox.Enabled {
+		// 阶段 3+4: 把 path_acl 注入 localcommand 全局 ACL
+		if appCfg.Sandbox.PathACL != nil {
+			acl := &localcommand.PathACL{
+				ReadDenied:  appCfg.Sandbox.PathACL.ReadDenied,
+				WriteDenied: appCfg.Sandbox.PathACL.WriteDenied,
+				ExecDenied:  appCfg.Sandbox.PathACL.ExecDenied,
+			}
+			localcommand.SetGlobalPathACL(acl)
+			log.Printf("[main] sandbox.path_acl enabled: read=%d write=%d exec=%d",
+				len(acl.ReadDenied), len(acl.WriteDenied), len(acl.ExecDenied))
+		}
+
+		// 阶段 2: denybin PATH 注入（OS 层 defense-in-depth）
+		if appCfg.Sandbox.Denybin != nil && appCfg.Sandbox.Denybin.Enabled {
+			binDir, newPATH, err := localcommand.SetupDenyBin()
+			if err != nil {
+				log.Printf("[main] denybin setup failed: %v (PATH injection disabled)", err)
+			} else {
+				log.Printf("[main] denybin enabled: %s (injected into PATH)", binDir)
+				// 把注入后的 PATH 存到 env,供子进程继承
+				_ = os.Setenv("PATH", newPATH)
+			}
+		}
+	} else {
+		log.Printf("[main] WARNING: sandbox security DISABLED (extremely unsafe)")
+	}
+
 	// 解析关键路径（相对路径转绝对路径）。
 	skillsRoot := resolvePath(wd, appCfg.Paths.Skills)
 	memoryRoot := resolvePath(wd, appCfg.Paths.Memory)
