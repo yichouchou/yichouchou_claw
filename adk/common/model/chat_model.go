@@ -18,18 +18,14 @@ package model
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/cloudwego/eino-ext/components/model/ark"
 	"github.com/cloudwego/eino-ext/components/model/openai"
-	"github.com/cloudwego/eino/callbacks"
 	"github.com/cloudwego/eino/components/model"
-	cbutils "github.com/cloudwego/eino/utils/callbacks"
 	arkModel "github.com/volcengine/volcengine-go-sdk/service/arkruntime/model"
 
 	"github.com/yichouchou/yichouchou_claw/internal/config"
@@ -224,24 +220,11 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func GetInputLoggerCallback() callbacks.Handler {
-	return cbutils.NewHandlerHelper().ChatModel(&cbutils.ModelCallbackHandler{
-		OnStart: func(ctx context.Context, info *callbacks.RunInfo, input *model.CallbackInput) context.Context {
-			time.Sleep(20 * time.Second)
-			fmt.Printf("\n========================================\n")
-			fmt.Printf("[ChatModel Input] Agent: %s\n", info.Name)
-			fmt.Printf("========================================\n")
-			for i, msg := range input.Messages {
-				fmt.Printf("  Message %d [%s]: %s\n", i+1, msg.Role, msg.Content)
-				if len(msg.ToolCalls) > 0 {
-					fmt.Printf("    Tool Calls: %d\n", len(msg.ToolCalls))
-					for j, tc := range msg.ToolCalls {
-						fmt.Printf("      %d. %s: %s\n", j+1, tc.Function.Name, tc.Function.Arguments)
-					}
-				}
-			}
-			fmt.Printf("========================================\n\n")
-			return ctx
-		},
-	}).Handler()
-}
+// === 旧版调试 callback 已废弃(2026-07-29) ===
+//
+// 原 GetInputLoggerCallback 有两个问题:
+//   1. time.Sleep(20 * time.Second) —— 启用会卡 ChatModel 20s
+//   2. 只打印 msg.Content,漏掉多模态 MultiContent(空字符串)
+//
+// 替代:internal/memory/hook.go formatMessagesAsInput 已完整覆盖多模态追踪。
+// 如需更细的 ChatModel 调试,推荐直接接 eino 的 callbacks handler(后续可加)。

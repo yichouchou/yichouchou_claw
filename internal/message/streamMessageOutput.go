@@ -14,14 +14,46 @@ import (
 )
 
 // SSEEvent 是推送给前端的单个事件载荷。
+//
+// 多模态字段（2026-07-29 新增）：
+//   - MultiContent: 消息的多模态 parts（图片/文件/音频/视频）。前端按 part.Type
+//     分别渲染：text → 文本；image_url → <img>；file_url → <a> 下载。
+//   - Files: 工具调用返回的附件（PDF/截图/日志）。前端展示为下载链接。
+//
+// 与 Content 字段的关系：Content 仍是所有 text parts 拼起来的扁平字符串，
+// 用于保持向后兼容；MultiContent 保留完整结构让前端可以还原图文混排。
 type SSEEvent struct {
-	Type       string            `json:"type"`
-	AgentName  string            `json:"agent_name,omitempty"`
-	RunPath    string            `json:"run_path,omitempty"`
-	Content    string            `json:"content,omitempty"`
-	ToolCalls  []schema.ToolCall `json:"tool_calls,omitempty"`
-	ActionType string            `json:"action_type,omitempty"`
-	Error      string            `json:"error,omitempty"`
+	Type         string              `json:"type"`
+	AgentName    string              `json:"agent_name,omitempty"`
+	RunPath      string              `json:"run_path,omitempty"`
+	Content      string              `json:"content,omitempty"`
+	ToolCalls    []schema.ToolCall   `json:"tool_calls,omitempty"`
+	ActionType   string              `json:"action_type,omitempty"`
+	Error        string              `json:"error,omitempty"`
+	MultiContent []MessageOutputPart `json:"multi_content,omitempty"`
+	Files        []MessageOutputFile `json:"files,omitempty"`
+}
+
+// MessageOutputPart 是 SSE 事件的多模态 part（精简版 schema.MessageOutputPart）。
+//
+// 仅在 SSE 层使用，传输更友好；前端可以解析成 <img>/<video>/<a> 等。
+// 完整字段在 schema.MessageOutputPart 内（避免循环依赖）。
+type MessageOutputPart struct {
+	Type    string `json:"type"`
+	Text    string `json:"text,omitempty"`
+	URL     string `json:"url,omitempty"`
+	MIME    string `json:"mime,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Summary string `json:"summary,omitempty"`
+}
+
+// MessageOutputFile 是工具调用返回的附件。
+type MessageOutputFile struct {
+	Name   string `json:"name"`
+	URL    string `json:"url,omitempty"`
+	Data   string `json:"data,omitempty"` // base64 内联（小文件）
+	MIME   string `json:"mime,omitempty"`
+	Source string `json:"source,omitempty"` // 来源 tool 名
 }
 
 // ProcessAgentEvent 把 AgentEvent 转换成若干 SSE 事件写到流上。
@@ -71,15 +103,51 @@ func handleRegularMessage(s *sse.Stream, event *adk.AgentEvent, msg *schema.Mess
 		eventType = "tool_result"
 	}
 	ev := SSEEvent{
-		Type:      eventType,
-		AgentName: event.AgentName,
-		RunPath:   formatRunPath(event.RunPath),
-		Content:   msg.Content,
+		Type:         eventType,
+		AgentName:    event.AgentName,
+		RunPath:      formatRunPath(event.RunPath),
+		Content:      msg.Content,
+		MultiContent: convertOutputPartsToSSE(msg.AssistantGenMultiContent),
 	}
 	if len(msg.ToolCalls) > 0 {
 		ev.ToolCalls = msg.ToolCalls
 	}
 	return SendSSEEvent(s, ev)
+}
+
+// convertOutputPartsToSSE 把 eino schema.MessageOutputPart 转成 SSE 层的精简结构。
+//
+// 只透传 URL/MIME/Text 等元数据;base64 内联数据如果超过 1KB 就只发摘要,
+// 避免 SSE 事件过大阻塞 stream 流。
+func convertOutputPartsToSSE(parts []schema.MessageOutputPart) []MessageOutputPart {
+	if len(parts) == 0 {
+		return nil
+	}
+	out := make([]MessageOutputPart, 0, len(parts))
+	for _, p := range parts {
+		sp := MessageOutputPart{
+			Type: string(p.Type),
+			Text: p.Text,
+		}
+		if p.Image != nil {
+			if p.Image.URL != nil {
+				sp.URL = *p.Image.URL
+			}
+			sp.MIME = p.Image.MIMEType
+		} else if p.Audio != nil {
+			if p.Audio.URL != nil {
+				sp.URL = *p.Audio.URL
+			}
+			sp.MIME = p.Audio.MIMEType
+		} else if p.Video != nil {
+			if p.Video.URL != nil {
+				sp.URL = *p.Video.URL
+			}
+			sp.MIME = p.Video.MIMEType
+		}
+		out = append(out, sp)
+	}
+	return out
 }
 
 // handleStreamingMessage 纯转发：每个 chunk 按角色原样推到 SSE。
@@ -102,16 +170,17 @@ func handleStreamingMessage(s *sse.Stream, event *adk.AgentEvent, stream *schema
 			})
 		}
 
-		if chunk.Content != "" {
+		if chunk.Content != "" || len(chunk.AssistantGenMultiContent) > 0 {
 			eventType := "stream_chunk"
 			if chunk.Role == schema.Tool {
 				eventType = "tool_result_chunk"
 			}
 			if err := SendSSEEvent(s, SSEEvent{
-				Type:      eventType,
-				AgentName: event.AgentName,
-				RunPath:   formatRunPath(event.RunPath),
-				Content:   chunk.Content,
+				Type:         eventType,
+				AgentName:    event.AgentName,
+				RunPath:      formatRunPath(event.RunPath),
+				Content:      chunk.Content,
+				MultiContent: convertOutputPartsToSSE(chunk.AssistantGenMultiContent),
 			}); err != nil {
 				return err
 			}

@@ -32,14 +32,18 @@ package memorytool
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
+	"github.com/cloudwego/eino/schema"
 	"github.com/yichouchou/yichouchou_claw/internal/memory"
 )
 
@@ -138,12 +142,18 @@ const toolDescriptionNew = `在 workdir/memory/ 索引里检索历史对话/trac
 // 索引未初始化时返回的 Output.Hint 会提示模型退化为文件全文搜。
 //
 // 返回类型是 eino 的 tool.BaseTool,可直接塞进 adk.ToolsConfig.Tools 列表。
+//
+// 多模态升级(2026-07-29):
+//  1. 改用 utils.InferEnhancedTool,让 ToolResult 既包含 JSON 文本 part,
+//     也包含命中的 markdown 文件作为附件(图片/截图随附)。
+//  2. 客户端 eino ToolNode 会优先调用 EnhancedInvokableTool,确保多模态不被丢。
+//  3. 同时也满足 tool.BaseTool 接口(向下兼容)。
 func NewSearchTool() (tool.BaseTool, error) {
-	return utils.InferTool(
+	return utils.InferEnhancedTool(
 		"memory_search",
 		toolDescriptionNew,
-		func(ctx context.Context, input *SearchInput) (string, error) {
-			return doSearch(input)
+		func(ctx context.Context, input *SearchInput) (*schema.ToolResult, error) {
+			return doSearchEnhanced(ctx, input)
 		},
 	)
 }
@@ -161,8 +171,139 @@ func doSearch(input *SearchInput) (string, error) {
 	return string(b), nil
 }
 
-// doSearchExposed 返回 SearchOutput 结构（供测试用，不暴露为 public API）。
+// doSearchEnhanced 是 EnhancedInvokableTool 的入口。
 //
+// 返回 schema.ToolResult:
+//   - 第一个 part: text 类型,内容是 SearchOutput 的 JSON 序列化
+//     (兼容旧版纯文本返回,模型仍可看到结构化结果)
+//   - 后续 part(可选): file 类型,挂上命中条目的 markdown 文件。
+//     模型可以直接看到附件内容,不再需要 Read 一次磁盘。
+//
+// 设计取舍:
+//   - 只挂前 N(默认 3)条最相关条目,避免一次性把全部 10 条 markdown 塞进 tool_result
+//     (可能单条几十 KB,累计太大影响上下文窗口)。
+//   - markdown 文件以"附件"形式挂入,模型可以用 Read 工具或直接引用。
+func doSearchEnhanced(ctx context.Context, input *SearchInput) (*schema.ToolResult, error) {
+	out, err := doSearchExposed(input)
+	if err != nil {
+		return nil, err
+	}
+	jsonBytes, err := json.Marshal(out)
+	if err != nil {
+		return nil, fmt.Errorf("marshal output: %w", err)
+	}
+
+	result := schema.ToolResult{
+		Parts: []schema.ToolOutputPart{
+			{
+				Type: schema.ToolPartTypeText,
+				Text: string(jsonBytes),
+			},
+		},
+	}
+
+	// === 多模态 part: 挂上前 N 条命中的 markdown 文件 ===
+	const maxAttachFiles = 3
+	attached := 0
+	for _, e := range out.Entries {
+		if attached >= maxAttachFiles {
+			break
+		}
+		if e.File == "" {
+			continue
+		}
+		// 只挂绝对路径下的文件,workdir/memory/ 下的相对路径转绝对
+		absPath := resolveMemoryFilePath(e.File)
+		if absPath == "" {
+			continue
+		}
+		filePart, ok := buildMemoryFilePart(absPath, e.File)
+		if !ok {
+			continue
+		}
+		result.Parts = append(result.Parts, filePart)
+		attached++
+	}
+	return &result, nil
+}
+
+// resolveMemoryFilePath 把 SearchOutput.File 的相对路径转成绝对路径。
+//
+// 兼容两种形式:
+//   - 已经是绝对路径（运维 / 测试场景）
+//   - 相对路径（默认相对 workdir/，这是 memory 索引里 file 字段的实际形式）
+func resolveMemoryFilePath(rel string) string {
+	if filepath.IsAbs(rel) {
+		return rel
+	}
+	// 尝试相对 workdir
+	if cwd, err := os.Getwd(); err == nil {
+		abs := filepath.Join(cwd, rel)
+		if _, err := os.Stat(abs); err == nil {
+			return abs
+		}
+	}
+	return ""
+}
+
+// buildMemoryFilePart 把磁盘文件转成 ToolOutputPart file 类型。
+//
+// 行为:
+//   - 文件存在 → 读字节,按文件扩展推断 MIME → base64 编码 → file part
+//   - 文件不存在或太大(>2MB)→ 跳过(返回 ok=false)
+//
+// 限制(2026-07-29): 单个 part 限 2MB,避免 tool_result 爆炸撑爆上下文。
+// 后续可改成"上传到对象存储并返回 URL",但当前项目体量暂不引入额外依赖。
+func buildMemoryFilePart(absPath, displayName string) (schema.ToolOutputPart, bool) {
+	const maxFileSize = 2 * 1024 * 1024 // 2MB
+	info, err := os.Stat(absPath)
+	if err != nil || info.Size() == 0 || info.Size() > maxFileSize {
+		return schema.ToolOutputPart{}, false
+	}
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		log.Printf("%s read attach file failed path=%s err=%v", memSearchLogPrefix, absPath, err)
+		return schema.ToolOutputPart{}, false
+	}
+	mime := guessMIMEFromExt(absPath)
+	encoded := base64.StdEncoding.EncodeToString(data)
+	return schema.ToolOutputPart{
+		Type: schema.ToolPartTypeFile,
+		File: &schema.ToolOutputFile{
+			MessagePartCommon: schema.MessagePartCommon{
+				Base64Data: &encoded,
+				MIMEType:   mime,
+			},
+		},
+	}, true
+}
+
+// guessMIMEFromExt 按文件后缀猜 MIME。
+// 极简版，只覆盖 markdown / text / 图片三类；其他走 application/octet-stream。
+func guessMIMEFromExt(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".md", ".markdown":
+		return "text/markdown"
+	case ".txt", ".log":
+		return "text/plain"
+	case ".json":
+		return "application/json"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".pdf":
+		return "application/pdf"
+	default:
+		return "application/octet-stream"
+	}
+}
+
 // 关键优化(2026-07-27)：
 //   - Default limit 从 20 降到 10(更易消化)
 //   - 自动添加 TimeAgo 字段(让模型更易判断条目时效)

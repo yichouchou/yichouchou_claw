@@ -450,6 +450,111 @@
             color: #9a3412;
             border-radius: 4px;
         }
+        /* 多模态 part 渲染（2026-07-29 新增） */
+        .mm-part {
+            margin: 6px 0;
+            padding: 6px 10px;
+            border-radius: 6px;
+            font-size: 13px;
+            background: #f3f4f6;
+        }
+        .mm-part-image img {
+            max-width: 100%;
+            max-height: 360px;
+            border-radius: 6px;
+            display: block;
+            border: 1px solid #e5e7eb;
+        }
+        .mm-part-image .mm-caption {
+            margin-top: 4px;
+            font-size: 12px;
+            color: #6b7280;
+        }
+        .mm-part-file {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+        }
+        .mm-part-file a {
+            color: #1d4ed8;
+            text-decoration: none;
+            font-weight: 500;
+        }
+        .mm-part-file a:hover {
+            text-decoration: underline;
+        }
+        .mm-part-file .mm-meta {
+            color: #6b7280;
+            font-size: 12px;
+        }
+        .mm-part-audio audio {
+            width: 100%;
+            margin-top: 4px;
+        }
+        .mm-part-video video {
+            max-width: 100%;
+            max-height: 360px;
+            border-radius: 6px;
+        }
+        /* 用户上传的预览（在输入框上方） */
+        .user-preview {
+            display: flex;
+            gap: 8px;
+            padding: 8px 12px;
+            background: #f9fafb;
+            border-top: 1px solid #e5e5e5;
+            flex-wrap: wrap;
+        }
+        .user-preview .preview-item {
+            position: relative;
+            display: inline-block;
+        }
+        .user-preview img {
+            max-width: 100px;
+            max-height: 80px;
+            border-radius: 6px;
+            border: 1px solid #e5e7eb;
+        }
+        .user-preview .preview-remove {
+            position: absolute;
+            top: -6px;
+            right: -6px;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #ef4444;
+            color: white;
+            font-size: 12px;
+            line-height: 18px;
+            text-align: center;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        /* 用户消息里的附件缩略图 */
+        .user-attachments {
+            margin-top: 6px;
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+        .user-attach-thumb {
+            max-width: 100px;
+            max-height: 80px;
+            border-radius: 6px;
+            border: 1px solid #e5e7eb;
+        }
+        .user-attach-file {
+            display: inline-block;
+            padding: 4px 10px;
+            background: #f3f4f6;
+            color: #374151;
+            border-radius: 6px;
+            font-size: 12px;
+            text-decoration: none;
+        }
         /* 输入区 */
         .input-area {
             padding: 16px 24px 24px 24px;
@@ -567,16 +672,23 @@
             </div>
         </div>
         <div class="input-area">
+            <div id="userPreview" class="user-preview" style="display: none;"></div>
             <div class="input-wrapper">
                 <div class="input-box">
-                    <textarea id="queryInput" rows="1" placeholder="发送消息给 yichouchou_claw..." onkeydown="handleKeyDown(event)" oninput="autoResize(this)"></textarea>
+                    <textarea id="queryInput" rows="1" placeholder="发送消息给 yichouchou_claw... (可用 ⬆️ 上传图片/PDF/Office/文本)" onkeydown="handleKeyDown(event)" oninput="autoResize(this)"></textarea>
+                    <input type="file" id="fileInput" accept="image/*,.pdf,.txt,.md,.log,.html,.htm,.docx,.xlsx,.pptx" multiple style="display: none;" onchange="handleFileSelect(event)">
+                    <button id="uploadButton" onclick="document.getElementById('fileInput').click()" title="上传图片/PDF/Office/文本(支持多选)">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <path d="M8 2v12M2 8h12" stroke="#6b7280" stroke-width="2" stroke-linecap="round"/>
+                        </svg>
+                    </button>
                     <button id="sendButton" onclick="sendMessage()">
                         <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
                             <path d="M2 8L14 8M14 8L8 2M14 8L8 14" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                         </svg>
                     </button>
                 </div>
-                <div class="input-hint">按 Enter 发送，Shift + Enter 换行</div>
+                <div class="input-hint">按 Enter 发送，Shift + Enter 换行 ｜ 上传图片/文件后会作为多模态附件</div>
             </div>
         </div>
     </div>
@@ -687,10 +799,194 @@
         let renderTimer = null;
         // 当前对话的 session_id，存于 localStorage 实现跨页面刷新保持上下文。
         let sessionId = localStorage.getItem('eino_session_id') || '';
+        // === 多模态附件状态 (2026-07-29 新增) ===
+        // 等待上传到服务端后的 URL 列表。
+        let pendingImages = [];   // 图片 URL
+        let pendingFiles = [];    // 通用文件 URL
+        // 待本地预览的 File 对象（发完后清空）。
+        let pendingLocalFiles = [];
 
         function autoResize(textarea) {
             textarea.style.height = 'auto';
             textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+        }
+
+        // === 多模态：处理文件选择 ===
+        async function handleFileSelect(event) {
+            const files = Array.from(event.target.files || []);
+            if (files.length === 0) return;
+            for (const f of files) {
+                pendingLocalFiles.push(f);
+            }
+            renderUserPreview();
+            // 顺序上传（避免并发抢带宽/抢顺序）。每个文件上传成功后挂到 _uploadedUrl,
+            // 让 removePending 能精确定位。
+            for (const f of files) {
+                try {
+                    const url = await uploadFileToServer(f);
+                    f._uploadedUrl = url;
+                    if (f.type.startsWith('image/')) {
+                        pendingImages.push(url);
+                    } else {
+                        pendingFiles.push(url);
+                    }
+                } catch (e) {
+                    console.error('upload failed', f.name, e);
+                    appendToContent(`\n\n[上传失败: ${f.name}: ${e.message}]`);
+                    // 上传失败的文件留在 pendingLocalFiles(用户可见),但 pendingImages/Files 不增加
+                }
+            }
+            renderUserPreview(); // 重新渲染以便 _uploadedUrl 标记生效(目前没用,但保持一致性)
+        }
+
+        // === 多模态：上传文件到服务端 ===
+        // 默认走 POST /upload,服务端负责把文件存到 workdir/uploads/,返回 URL。
+        // 失败 fallback: 用 data: URL(小文件) 或 base64。
+        async function uploadFileToServer(file) {
+            const fd = new FormData();
+            fd.append('file', file);
+            try {
+                const res = await fetch('/upload', { method: 'POST', body: fd });
+                if (!res.ok) throw new Error('upload http ' + res.status);
+                const j = await res.json();
+                if (j.url) return j.url;
+                throw new Error('no url in response');
+            } catch (e) {
+                console.warn('[upload] fallback to data URL for', file.name, e);
+                // fallback: 内联 base64(只对小文件)
+                if (file.size > 2 * 1024 * 1024) {
+                    throw new Error('upload failed and file too large for inline: ' + e.message);
+                }
+                return await new Promise((resolve, reject) => {
+                    const r = new FileReader();
+                    r.onload = () => resolve(r.result);
+                    r.onerror = () => reject(r.error);
+                    r.readAsDataURL(file);
+                });
+            }
+        }
+
+        // === 多模态：渲染输入区上方的预览 ===
+        function renderUserPreview() {
+            const el = document.getElementById('userPreview');
+            if (pendingLocalFiles.length === 0) {
+                el.style.display = 'none';
+                el.innerHTML = '';
+                return;
+            }
+            el.style.display = 'flex';
+            el.innerHTML = '';
+            pendingLocalFiles.forEach((f, idx) => {
+                const item = document.createElement('div');
+                item.className = 'preview-item';
+                if (f.type.startsWith('image/')) {
+                    const img = document.createElement('img');
+                    img.src = URL.createObjectURL(f);
+                    item.appendChild(img);
+                } else {
+                    const box = document.createElement('div');
+                    box.style.cssText = 'padding:4px 10px;background:#e5e7eb;border-radius:6px;font-size:12px;';
+                    box.textContent = '📎 ' + f.name;
+                    item.appendChild(box);
+                }
+                const rm = document.createElement('div');
+                rm.className = 'preview-remove';
+                rm.textContent = '×';
+                rm.title = '移除';
+                rm.onclick = () => removePending(idx);
+                item.appendChild(rm);
+                el.appendChild(item);
+            });
+        }
+
+        // === 多模态：移除某个待发送附件 ===
+        function removePending(idx) {
+            const removed = pendingLocalFiles[idx];
+            if (!removed) return;
+            pendingLocalFiles.splice(idx, 1);
+            // 通过 _uploadedUrl 精确从 pendingImages/Files 移除
+            if (removed._uploadedUrl) {
+                pendingImages = pendingImages.filter(u => u !== removed._uploadedUrl);
+                pendingFiles = pendingFiles.filter(u => u !== removed._uploadedUrl);
+            }
+            renderUserPreview();
+        }
+
+        // === 多模态：渲染一条 SSE multi_content part 到 message-body ===
+        function appendMultiPart(part) {
+            if (!currentAssistantMsg || !part || !part.type) return;
+            const body = currentAssistantMsg.querySelector('.message-body');
+            if (!body) return;
+            const div = document.createElement('div');
+            div.className = 'mm-part mm-part-' + part.type;
+            // 把 base64 + mime 拼成 data: URL(如果 part 只给了 base64)
+            const dataUrl = part.url
+                || (part.base64 && part.mime
+                    ? `data:${part.mime};base64,${part.base64}`
+                    : null);
+            switch (part.type) {
+                case 'image_url':
+                case 'ChatMessagePartTypeImageURL':
+                    if (dataUrl) {
+                        const img = document.createElement('img');
+                        img.src = dataUrl;
+                        img.alt = part.name || 'image';
+                        img.loading = 'lazy';
+                        div.appendChild(img);
+                        if (part.mime) {
+                            const cap = document.createElement('div');
+                            cap.className = 'mm-caption';
+                            cap.textContent = '🖼️ ' + part.mime;
+                            div.appendChild(cap);
+                        }
+                    }
+                    break;
+                case 'file_url':
+                case 'ChatMessagePartTypeFileURL':
+                    if (dataUrl) {
+                        const a = document.createElement('a');
+                        a.href = dataUrl;
+                        // data: URL 强制触发下载而不是跳转
+                        if (dataUrl.startsWith('data:')) {
+                            a.download = part.name || 'attachment';
+                        } else {
+                            a.target = '_blank';
+                            a.rel = 'noopener';
+                        }
+                        a.textContent = '📎 ' + (part.name || '附件');
+                        div.appendChild(a);
+                        if (part.mime) {
+                            const meta = document.createElement('span');
+                            meta.className = 'mm-meta';
+                            meta.textContent = ' (' + part.mime + ')';
+                            div.appendChild(meta);
+                        }
+                    }
+                    break;
+                case 'audio_url':
+                case 'ChatMessagePartTypeAudioURL':
+                    if (dataUrl) {
+                        const audio = document.createElement('audio');
+                        audio.src = dataUrl;
+                        audio.controls = true;
+                        div.appendChild(audio);
+                    }
+                    break;
+                case 'video_url':
+                case 'ChatMessagePartTypeVideoURL':
+                    if (dataUrl) {
+                        const video = document.createElement('video');
+                        video.src = dataUrl;
+                        video.controls = true;
+                        div.appendChild(video);
+                    }
+                    break;
+                default:
+                    // 未知类型,只显示 type 信息
+                    div.textContent = '[' + part.type + ']';
+            }
+            body.appendChild(div);
+            scrollToBottom();
         }
 
         function handleKeyDown(event) {
@@ -720,9 +1016,10 @@
             }
         }
 
-        function addUserMessage(content) {
+        function addUserMessage(content, attachments) {
             const wrapper = document.createElement('div');
             wrapper.className = 'message-wrapper';
+            const attachmentsHtml = buildUserAttachmentsHtml(attachments);
             wrapper.innerHTML = `
                 <div class="message user">
                     <div class="avatar user-avatar">U</div>
@@ -731,11 +1028,28 @@
                             <span>你</span>
                         </div>
                         <div class="message-content">${escapeHtml(content)}</div>
+                        ${attachmentsHtml}
                     </div>
                 </div>
             `;
             chatContainer.appendChild(wrapper);
             scrollToBottom();
+        }
+
+        // === 多模态：构造用户消息里的附件展示 HTML ===
+        function buildUserAttachmentsHtml(attachments) {
+            if (!attachments) return '';
+            const imgs = (attachments.images || []);
+            const files = (attachments.files || []);
+            if (imgs.length === 0 && files.length === 0) return '';
+            const imgHtml = imgs.map(u =>
+                `<img class="user-attach-thumb" src="${escapeHtml(u)}" loading="lazy" alt="image">`
+            ).join('');
+            const fileHtml = files.map(u => {
+                const name = u.split('/').pop() || u;
+                return `<a class="user-attach-file" href="${escapeHtml(u)}" target="_blank" rel="noopener">📎 ${escapeHtml(name)}</a>`;
+            }).join('');
+            return `<div class="user-attachments">${imgHtml}${fileHtml}</div>`;
         }
 
         function startAssistantMessage(agentName) {
@@ -867,14 +1181,76 @@
             queryInput.style.height = 'auto';
 
             welcomeMessage.style.display = 'none';
-            addUserMessage(query);
+            // === 多模态：把待发送的附件缩略图也放进用户消息(可选) ===
+            addUserMessage(query, { images: pendingImages.slice(), files: pendingFiles.slice() });
 
             startAssistantMessage('RouterAgent');
 
             try {
                 // 如果有 session_id 则一并传给后端，让它在该会话上累积上下文。
-                const sessionParam = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : '';
-                const response = await fetch(`/chat?query=${encodeURIComponent(query)}${sessionParam}`);
+                // === 修复: sessionQuery 用 ? 起始(POST + body 模式,query string 在 URL) ===
+                const sessionQuery = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
+                // === 多模态: 彻底改 POST + JSON body(2026-07-29 修复) ===
+                //
+                // 关键修复: 不要在 HTTP Header 里传 base64/data URL。
+                //   - Header 单行: base64 可能含换行被截断
+                //   - Header 字符限制: + / = 等字符可能被某些框架特殊处理
+                //   - Header 长度限制: base64 一般 > 8KB,可能超过 header 大小
+                //   - 单行长度受限
+                // 我们改成 POST + JSON body,把 image_data[](base64) + image_mime[]
+                // + image_url[] (http(s) 或相对路径) 单独字段传。后端在 /chat
+                // handler 里 BindAndValidate 读 body,完全不进 header。
+                //
+                const requestBody = {
+                    query: query,
+                    session_id: sessionId || undefined,
+                    // === 多模态字段 ===
+                    image_data: [],
+                    image_mime: [],
+                    image_url: [],   // http(s) URL(未来对接对象存储)
+                    file_data: [],
+                    file_mime: [],
+                    file_name: [],
+                    file_url: [],
+                };
+                pendingImages.forEach(u => {
+                    if (u.startsWith('data:')) {
+                        const m = u.match(/^data:([^;]+);base64,(.+)$/);
+                        if (m) {
+                            requestBody.image_data.push(m[2]);
+                            requestBody.image_mime.push(m[1]);
+                        } else {
+                            console.warn('malformed data URL skipped:', u.slice(0, 50));
+                        }
+                    } else if (u.startsWith('http://') || u.startsWith('https://')) {
+                        requestBody.image_url.push(u);
+                    } else {
+                        // 相对路径 /uploads/xxx → 后端从磁盘读 base64
+                        requestBody.image_url.push(u);
+                    }
+                });
+                pendingFiles.forEach(u => {
+                    if (u.startsWith('data:')) {
+                        const m = u.match(/^data:([^;]+);base64,(.+)$/);
+                        if (m) {
+                            requestBody.file_data.push(m[2]);
+                            requestBody.file_mime.push(m[1]);
+                            requestBody.file_name.push('attachment');
+                        } else {
+                            console.warn('malformed data URL skipped:', u.slice(0, 50));
+                        }
+                    } else if (u.startsWith('http://') || u.startsWith('https://')) {
+                        requestBody.file_url.push(u);
+                    } else {
+                        requestBody.file_url.push(u);
+                    }
+                });
+                // POST + JSON body
+                const response = await fetch(`/chat${sessionQuery}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(requestBody),
+                });
 
                 if (!response.ok) {
                     appendToContent(`\n\n[请求失败: HTTP ${response.status}]`);
@@ -923,7 +1299,7 @@
             } catch (error) {
                 appendToContent(`\n\n[请求失败: ${error.message}]`);
             } finally {
-                // 流结束：做最后一次完整渲染，确保所有代码块都已高亮
+                // 流结束：做最后一次完整渲染，确保所有代码块都已多模态高亮
                 flushRender();
                 isStreaming = false;
                 sendButton.disabled = false;
@@ -931,6 +1307,11 @@
                 currentContentEl = null;
                 currentThinkingBlock = null;
                 currentThinkingBody = null;
+                // === 多模态：清空本轮附件状态（2026-07-29 新增） ===
+                pendingImages = [];
+                pendingFiles = [];
+                pendingLocalFiles = [];
+                renderUserPreview();
                 queryInput.focus();
             }
         }
@@ -952,6 +1333,10 @@
                         if (currentAgentTag && agentName && !currentAgentTag.textContent) {
                             currentAgentTag.textContent = agentName;
                         }
+                    }
+                    // === 多模态 part 渲染（2026-07-29 新增） ===
+                    if (Array.isArray(data.multi_content) && data.multi_content.length > 0) {
+                        data.multi_content.forEach(p => appendMultiPart(p));
                     }
                     break;
 

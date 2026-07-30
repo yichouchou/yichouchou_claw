@@ -19,7 +19,9 @@ package main
 import (
 	"context"
 	"embed"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"os"
@@ -42,6 +44,7 @@ import (
 	"github.com/yichouchou/yichouchou_claw/internal/localcommand"
 	"github.com/yichouchou/yichouchou_claw/internal/memory"
 	"github.com/yichouchou/yichouchou_claw/internal/message"
+	"github.com/yichouchou/yichouchou_claw/internal/office"
 	"github.com/yichouchou/yichouchou_claw/internal/session"
 	"github.com/yichouchou/yichouchou_claw/subagents"
 )
@@ -102,22 +105,30 @@ func main() {
 	skillsRoot := resolvePath(wd, appCfg.Paths.Skills)
 	memoryRoot := resolvePath(wd, appCfg.Paths.Memory)
 
-	// 进程级别的会话存储。
-	store := session.NewStore(appCfg.Session.MaxRounds)
+	// 进程级别的会话存储(2026-07-30 回退到原始逻辑: 始终磁盘持久化)。
+	//
+	// 用户上传的图片/文件按 Claude Code 精神"用完即丢不存盘";但会话内容、
+	// memory 长期记忆仍走原来的磁盘持久化逻辑。
+	//
+	// 设计原则:
+	//   - 会话和 memory 落盘 → 保留原始逻辑(NewStoreWithPersist + Recorder)
+	//   - 上传文件不落盘    → 硬编码,新行为
+	//   - 不引入 PERSIST_DISK 开关
+	//
+	store := session.NewStoreWithPersist(appCfg.Session.MaxRounds, resolvePath(wd, "workdir/sessions"))
+	if err := store.LoadFromDisk(); err != nil {
+		log.Printf("[main] session.LoadFromDisk failed: %v (继续运行,内存会话不受影响)", err)
+	}
 
 	// =====================================================================
-	// Memory Recorder 初始化
+	// Memory Recorder 初始化(2026-07-30 回退: 始终启用)
 	// =====================================================================
 	memRecorder, err := memory.NewAsyncMarkdownRecorder(memoryRoot)
 	if err != nil {
 		log.Fatalf("[main] failed to init memory recorder: %v", err)
 	}
-	if memRecorder != nil {
-		memory.SetRecorder(memRecorder)
-		log.Printf("[main] memory recorder enabled at %s (async)", memRecorder.Root())
-	} else {
-		log.Printf("[main] memory recorder disabled")
-	}
+	memory.SetRecorder(memRecorder)
+	log.Printf("[main] memory recorder enabled at %s (async)", memRecorder.Root())
 
 	// === Memory Index（长期记忆快速查询）===
 	// 索引文件位于 memRecorder.Root()/.index.jsonl；
@@ -229,7 +240,14 @@ func main() {
 		adk.WithDisallowTransferToParent(),
 	)
 	// RouterAgent 挂上 PersistMiddleware，让最外层 ChatModelAgent 维护 messages。
-	routerAgent := subagents.NewRouterAgent(store, memory.NewMemoryMiddleware("RouterAgent"))
+	//
+	// 2026-07-29 修复:之前这里没真正挂 PersistMiddleware,所有对话只活在内存里,
+	// 多模态附件(图片 base64)直接丢。修复后每条 assistant + tool 消息会被
+	// Append 到 store,store 启用 PersistPath 时同步落盘。
+	routerAgent := subagents.NewRouterAgent(store,
+		session.NewPersistMiddleware(store),
+		memory.NewMemoryMiddleware("RouterAgent"),
+	)
 
 	ctx := context.Background()
 	a, err := adk.SetSubAgents(ctx, routerAgent, []adk.Agent{
@@ -266,12 +284,39 @@ func main() {
 			c.String(consts.StatusInternalServerError, "Failed to load index.html")
 			return
 		}
+		// === 2026-07-29: 强制不缓存,避免前端拿到旧 HTML 后 404 ===
+		c.Response.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		c.Response.Header.Set("Pragma", "no-cache")
+		c.Response.Header.Set("Expires", "0")
 		c.Data(consts.StatusOK, "text/html; charset=utf-8", data)
 	})
 
-	h.GET("/chat", func(ctx context.Context, c *app.RequestContext) {
-		handleChat(ctx, c, runner, store)
+	h.GET("/chat", handleChatWrapper(ctx, runner, store, true))
+	// === 多模态修复(2026-07-29): 支持 POST + JSON body ===
+	// 旧 GET 把多模态放在 header/base64 中不可靠,改成 POST + body。
+	h.POST("/chat", handleChatWrapper(ctx, runner, store, false))
+
+	// === 多模态文件上传端点（2026-07-29 新增）===
+	// 前端 fetch('/upload', FormData) 走这里。
+	// 文件存到 workdir/uploads/<random>-<sanitized-name>,返回 URL。
+	// === === === === === === === === === === === === === === === === === === === ===
+	// 上传路由(2026-07-30): hardcoded 不落盘
+	// Claude Code 精神: 用完即丢。后端走 inline base64,前端再 POST 到 /chat。
+	// === === === === === === === === === === === === === === === === === === === ===
+	h.POST("/upload", func(ctx context.Context, c *app.RequestContext) {
+		handleUpload(ctx, c)
 	})
+	// /uploads/*filepath 静态服务已删(永远走 inline base64,不存磁盘)
+
+	// === 隐私: DELETE /api/sessions/:id(让用户主动擦除会话+memory) ===
+	// 会话本身我们仍持久化(按你的要求),但是用户依然可以主动清除。
+	h.DELETE("/api/sessions/*sessionId", func(ctx context.Context, c *app.RequestContext) {
+		handleDeleteSession(ctx, c, store)
+	})
+
+	// === 多模态：静态文件服务已删除(2026-07-30) ===
+	// 原因: Claude Code 精神,用户上传文件永远不存盘,所以 /uploads/<file> 没有意义。
+	// 当前端收到 image_data 后只走 /chat POST body → LLM 上下文 → 丢弃。
 
 	log.Printf("Server starting on http://localhost%s", appCfg.Server.Host)
 	// 示例 URL 中的 query 参数是 "北京天气怎样" 的 URL 编码。
@@ -315,20 +360,102 @@ func applyRefinerConfig(dst *memory.RefinerConfig, src config.RefinerConfig) {
 	}
 }
 
+// handleChatWrapper 返回一个 dispatch 函数,把 /chat 的 GET / POST 都包进来。
+//
+// isGET 用来区分:
+//   - true  → 原 URL 路径 /chat (GET 模式)
+//   - false → POST 模式从 body 读
+//
+// 兜底: 如果发现请求 URL 是 /chat&xxx(老前端误用),自动把 & 换成 ? 并
+// 重写 path/hertz 的 Router 不支持 "&" 通配符,所以这里在 dispatcher 内部判断。
+//
+// 详细:
+//
+//	HERTZ panic 修复(2026-07-30):
+//	panic: no / before wildcards in path /chat&*rest
+//	hertz 路由解析器要求通配符( *xxx ) 必须前接 '/'。'&' 不是路径分隔符,
+//	它在 URL 里是 query 分隔符,所以 hertz 拒绝注册。但浏览器收到的"旧前端
+//	拼错的 URL"是 /chat&session_id=xxx,hertz 看到的 path 是 "chat&session_id=xxx"
+//	没法在注册阶段处理,所以我们在 dispatcher 阶段做 rewrite。
+func handleChatWrapper(ctx context.Context, runner *adk.Runner, store *session.Store, _ bool) app.HandlerFunc {
+	return func(c context.Context, rc *app.RequestContext) {
+		// === 兜底 rewrite: /chat&xxx → /chat?xxx ===
+		// hertz 已经按 path 段匹配了 "/chat";path 里 & 后面的部分在 hertz
+		// 看来是 "额外的 path" 而非 query。我们读 URI 来检测并重写。
+		uri := string(rc.Request.RequestURI())
+		if i := strings.Index(uri, "&"); i >= 0 && strings.HasPrefix(uri, "/chat") {
+			// "/chat&session_id=xxx" → "/chat?session_id=xxx"
+			rebuilt := "/chat?" + uri[i+1:]
+			rc.Request.SetRequestURI(rebuilt)
+			log.Printf("[main] rewrote malformed URL %s → %s", uri, rebuilt)
+		}
+		handleChat(ctx, rc, runner, store)
+	}
+}
+
+// ChatRequest 是 /chat 的统一请求体。
+//
+// 协议(2026-07-29 修复): 从 GET + query/header 改成 POST + JSON body。
+// 原因: HTTP Header 无法稳定传输 base64 / data URL。
+//   - Header 单行,base64 可能含换行
+//   - 字符 + / = 在 Header 中可能被框架特殊处理
+//   - base64 长度常常 > 8KB,超过 Header 大小限制
+//
+// 请求字段:
+//   - query           用户文本
+//   - session_id      可选,客户端复用同一 session
+//   - image_url       可选, []string, http(s) URL 或相对路径("/uploads/...")
+//   - image_data      可选, []string, base64-encoded(不带 data: 前缀)
+//   - image_mime      可选, []string, 与 image_data 一一对应的 MIME
+//   - file_url/file_data/file_mime/file_name 类似,通用文件
+type ChatRequest struct {
+	Query     string   `json:"query"`
+	SessionID string   `json:"session_id,omitempty"`
+	ImageURL  []string `json:"image_url,omitempty"`  // http(s) URL
+	ImageData []string `json:"image_data,omitempty"` // base64 (no data: prefix)
+	ImageMime []string `json:"image_mime,omitempty"` // MIME for image_data
+	FileURL   []string `json:"file_url,omitempty"`
+	FileData  []string `json:"file_data,omitempty"`
+	FileMime  []string `json:"file_mime,omitempty"`
+	FileName  []string `json:"file_name,omitempty"`
+}
+
 func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, store *session.Store) {
-	query := c.Query("query")
+	// === 兼容 GET(旧)和 POST+JSON body(新) ===
+	// 旧版:GPT query=xxx&session_id=xxx
+	// 新版:POST body = {"query":"...", "session_id":"...", "image_data":["xxx"], ...}
+	var req ChatRequest
+	var query, sessionID string
+
+	if string(c.Request.Method()) == "GET" {
+		query = c.Query("query")
+		sessionID = c.Query("session_id")
+	} else {
+		// POST + JSON body
+		if err := c.BindAndValidate(&req); err != nil {
+			c.JSON(consts.StatusBadRequest, map[string]string{
+				"error": "invalid request body: " + err.Error(),
+			})
+			return
+		}
+		query = req.Query
+		sessionID = req.SessionID
+	}
+
 	if query == "" {
 		c.JSON(consts.StatusBadRequest, map[string]string{
-			"error": "query parameter is required",
+			"error": "query is required",
 		})
 		return
 	}
 
 	// session_id: 客户端传入则复用；不传则由服务端生成。
-	sessionID := c.Query("session_id")
 	if sessionID == "" {
 		sessionID = uuid.NewString()
 	}
+	log.Printf("[chat] method=%s session=%s query_len=%d image_data=%d image_url=%d file_data=%d file_url=%d",
+		string(c.Request.Method()), sessionID, len(query),
+		len(req.ImageData), len(req.ImageURL), len(req.FileData), len(req.FileURL))
 
 	// === Memory: 本次浏览器请求的组 ID ===
 	requestGID := memory.NewRequestGroupID()
@@ -336,7 +463,7 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 	log.Printf("[main] new request_group_id=%s session=%s", requestGID, sessionID)
 
 	// === Memory: 记录浏览器/客户端用户请求 ===
-	memory.SafeRecordUserRequest(ctx, requestGID, sessionID, "RouterAgent", []byte(query))
+	// (由下方构造 messages 完成后补记,把 inline 标记 + 多模态标签都算进去)
 
 	// 关键：通过 adk.WithSessionValues 把 session_id 和 request_group_id 注入 ctx。
 	opts := []adk.AgentRunOption{
@@ -348,10 +475,232 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 
 	// 加载上一轮 SDK 维护的完整多轮 messages，作为本轮的输入。
 	history := store.Get(sessionID)
-	messages := append(history, schema.UserMessage(query))
 
-	log.Printf("[main] Run session=%s history_len=%d query=%q",
-		sessionID, len(history), query)
+	// === 多模态入参(2026-07-29 修复) ===
+	//
+	// 客户端入参方式(优先级 image_data > image_url > @image 标记):
+	//   1. POST body.image_data[]   base64(无 data: 前缀)+ image_mime[]        ← 推荐
+	//   2. POST body.image_url[]    http(s) URL 或相对路径("/uploads/...")      ← 兜底
+	//   3. query 里 "@image:<URL>" / "@file:<URL>" 的 inline 标记            ← 调试用
+	//
+	// base64 走 Go 进程 memory → 不会污染 header/URL,Anthropic 100% 接受。
+	parts := []schema.MessageInputPart{
+		{Type: schema.ChatMessagePartTypeText, Text: query},
+	}
+
+	// === 方式 1: POST body 里的 base64(最稳定) ===
+	// 严格按 base64 校验;长度超限(<1B 或 >8MB)跳过
+	const maxBase64Size = 8 * 1024 * 1024
+	for i, b64 := range req.ImageData {
+		if b64 == "" {
+			continue
+		}
+		// base64 字符校验(可选,无效字符会让 LLM 浪费 token)
+		if !isLikelyBase64(b64) {
+			log.Printf("[chat] image_data[%d] not base64 (len=%d), skip", i, len(b64))
+			continue
+		}
+		if len(b64) < 100 || len(b64) > maxBase64Size {
+			log.Printf("[chat] image_data[%d] size out of range (len=%d), skip", i, len(b64))
+			continue
+		}
+		mime := "image/png"
+		if i < len(req.ImageMime) && req.ImageMime[i] != "" {
+			mime = req.ImageMime[i]
+		}
+		b := b64
+		m := mime
+		parts = append(parts, schema.MessageInputPart{
+			Type: schema.ChatMessagePartTypeImageURL,
+			Image: &schema.MessageInputImage{
+				MessagePartCommon: schema.MessagePartCommon{
+					Base64Data: &b,
+					MIMEType:   m,
+				},
+			},
+		})
+	}
+	for i, b64 := range req.FileData {
+		if b64 == "" {
+			continue
+		}
+		if !isLikelyBase64(b64) {
+			log.Printf("[chat] file_data[%d] not base64 (len=%d), skip", i, len(b64))
+			continue
+		}
+		if len(b64) < 10 || len(b64) > maxBase64Size {
+			log.Printf("[chat] file_data[%d] size out of range (len=%d), skip", i, len(b64))
+			continue
+		}
+		mime := "application/octet-stream"
+		if i < len(req.FileMime) && req.FileMime[i] != "" {
+			mime = req.FileMime[i]
+		}
+		name := "attachment"
+		if i < len(req.FileName) && req.FileName[i] != "" {
+			name = req.FileName[i]
+		}
+		b := b64
+		m := mime
+		n := name
+		parts = append(parts, schema.MessageInputPart{
+			Type: schema.ChatMessagePartTypeFileURL,
+			File: &schema.MessageInputFile{
+				MessagePartCommon: schema.MessagePartCommon{
+					Base64Data: &b,
+					MIMEType:   m,
+				},
+				Name: n,
+			},
+		})
+	}
+
+	// === 方式 2: POST body.image_url / file_url(http(s) URL 或 /uploads/ 相对路径) ===
+	for _, rawURL := range req.ImageURL {
+		rawURL = strings.TrimSpace(rawURL)
+		if rawURL == "" {
+			continue
+		}
+		// 相对路径(/uploads/xxx) → 后端从磁盘读 base64
+		if strings.HasPrefix(rawURL, "/") {
+			b64, mime, ok := loadDiskAsBase64(strings.TrimPrefix(rawURL, "/"))
+			if !ok {
+				log.Printf("[chat] image_url=%s disk read failed, skip", rawURL)
+				continue
+			}
+			b := b64
+			m := mime
+			parts = append(parts, schema.MessageInputPart{
+				Type: schema.ChatMessagePartTypeImageURL,
+				Image: &schema.MessageInputImage{
+					MessagePartCommon: schema.MessagePartCommon{
+						Base64Data: &b,
+						MIMEType:   m,
+					},
+				},
+			})
+			continue
+		}
+		if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+			log.Printf("[chat] image_url=%s not http(s), skip", rawURL)
+			continue
+		}
+		url := rawURL
+		parts = append(parts, schema.MessageInputPart{
+			Type:  schema.ChatMessagePartTypeImageURL,
+			Image: &schema.MessageInputImage{MessagePartCommon: schema.MessagePartCommon{URL: &url}},
+		})
+	}
+	for _, rawURL := range req.FileURL {
+		rawURL = strings.TrimSpace(rawURL)
+		if rawURL == "" {
+			continue
+		}
+		if strings.HasPrefix(rawURL, "/") {
+			b64, mime, ok := loadDiskAsBase64(strings.TrimPrefix(rawURL, "/"))
+			if !ok {
+				log.Printf("[chat] file_url=%s disk read failed, skip", rawURL)
+				continue
+			}
+			name := extractFileNameFromURL(rawURL)
+			b := b64
+			m := mime
+			n := name
+			parts = append(parts, schema.MessageInputPart{
+				Type: schema.ChatMessagePartTypeFileURL,
+				File: &schema.MessageInputFile{
+					MessagePartCommon: schema.MessagePartCommon{
+						Base64Data: &b,
+						MIMEType:   m,
+					},
+					Name: n,
+				},
+			})
+			continue
+		}
+		if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+			log.Printf("[chat] file_url=%s not http(s), skip", rawURL)
+			continue
+		}
+		url := rawURL
+		name := extractFileNameFromURL(url)
+		parts = append(parts, schema.MessageInputPart{
+			Type: schema.ChatMessagePartTypeFileURL,
+			File: &schema.MessageInputFile{
+				MessagePartCommon: schema.MessagePartCommon{URL: &url},
+				Name:              name,
+			},
+		})
+	}
+
+	// 把 query 文本里残留的 "@image:xxx" inline 标记剥离（避免污染 LLM 看到的内容）
+	cleanQuery := query
+	for _, rawURL := range parseInlineAttachments(query, "@image") {
+		url := rawURL
+		parts = append(parts, schema.MessageInputPart{
+			Type:  schema.ChatMessagePartTypeImageURL,
+			Image: &schema.MessageInputImage{MessagePartCommon: schema.MessagePartCommon{URL: &url}},
+		})
+		cleanQuery = strings.ReplaceAll(cleanQuery, "@image:"+rawURL, "")
+	}
+	for _, rawURL := range parseInlineAttachments(query, "@file") {
+		url := rawURL
+		name := extractFileNameFromURL(url)
+		parts = append(parts, schema.MessageInputPart{
+			Type: schema.ChatMessagePartTypeFileURL,
+			File: &schema.MessageInputFile{
+				MessagePartCommon: schema.MessagePartCommon{URL: &url},
+				Name:              name,
+			},
+		})
+		cleanQuery = strings.ReplaceAll(cleanQuery, "@file:"+rawURL, "")
+	}
+	// 用清理后的 query 作为 text part（如果没解析到任何 part，parts 只有 text）
+	if len(parts) == 1 {
+		// 没解析到多模态 part → 退化为纯文本（保持行为兼容）
+		parts[0].Text = cleanQuery
+	} else {
+		// 第一个 text part 用清理后的 query
+		parts[0] = schema.MessageInputPart{
+			Type: schema.ChatMessagePartTypeText,
+			Text: strings.TrimSpace(cleanQuery),
+		}
+	}
+
+	userMsg := &schema.Message{
+		Role:                  schema.User,
+		Content:               parts[0].Text,
+		UserInputMultiContent: parts,
+	}
+	messages := append(history, userMsg)
+
+	// === Memory: 记录本轮用户请求(2026-07-29 多模态改造) ===
+	// 把 inline 标记 + 多模态附件都序列化到 memory,便于 memory 检索。
+	memQuery := cleanQuery
+	if len(parts) > 1 {
+		imgCount := 0
+		fileCount := 0
+		for _, p := range parts {
+			switch p.Type {
+			case schema.ChatMessagePartTypeImageURL:
+				imgCount++
+			case schema.ChatMessagePartTypeFileURL:
+				fileCount++
+			}
+		}
+		extra := ""
+		if imgCount > 0 {
+			extra += fmt.Sprintf(" [%d image]", imgCount)
+		}
+		if fileCount > 0 {
+			extra += fmt.Sprintf(" [%d file]", fileCount)
+		}
+		memQuery = cleanQuery + extra
+	}
+	memory.SafeRecordUserRequest(ctx, requestGID, sessionID, "RouterAgent", []byte(memQuery))
+
+	log.Printf("[main] Run session=%s history_len=%d query=%q multimodal_parts=%d",
+		sessionID, len(history), query, len(parts))
 
 	// === 整个 run 的兜底超时(2026-07-29 新增) ===
 	// 来源: application.yml → agent.total_run_timeout_seconds
@@ -448,4 +797,364 @@ func eventToMemoryString(event *adk.AgentEvent) string {
 func stripThinkTags(s string) string {
 	re := regexp.MustCompile(`(?is)<think>.*?</think>`)
 	return strings.TrimSpace(re.ReplaceAllString(s, ""))
+}
+
+// handleUpload 处理 multipart/form-data 文件上传请求。
+//
+// 入参:标准 form 表单,字段名 "file"(可多个)
+//
+// 返回模式(由 query 参数 ?mode= 决定):
+//   - mode=url(默认): 返回 URL 路径("/uploads/..."),前端用 location.origin + url
+//     拼成绝对 URL;但 Anthropic/OpenAI 这种**外部**模型仍然抓不到 localhost
+//     URL → 仅适用于 server-tool 链路；多模态 chat 路径强烈建议 mode=inline。
+//   - mode=inline: 返回 data:[mime];base64,... 内联;Anthropic/OpenAI 都能直接
+//     读取。代价:体积膨胀约 33%,单条 message 可能撑大上下文。
+//
+// 行为:
+//   - 文件保存到 <workdir>/uploads/<random>-<safe-name>(不论 mode,都落盘,便于重发)
+//   - 限制单文件 <=32MB
+//   - 返回 JSON:
+//     {
+//     "url":  "<path or data: URL>",
+//     "name": "...",
+//     "size": N,
+//     "mode": "url" | "inline"
+//     }
+//
+// 设计取舍:
+//   - 不做 mime 校验 / 病毒扫描:前端已限制 accept=image/*,.pdf,.txt,.md,.log
+//   - 不做权限校验:多模态改造阶段暂不引入用户体系,后续多用户化时加
+//
+// 2026-07-29: image_url 错误"disallowed url: http://127.0.0.1:28080/uploads/..."
+// 是因为 Anthropic / OpenAI 这类云端 LLM 从它们**自己的 server** 拉图片,
+// 抓不到 localhost。这个修复就是默认走 inline(base64),云端模型能直接解析。
+func handleUpload(_ context.Context, c *app.RequestContext) {
+	const maxFileSize = 32 * 1024 * 1024 // 32MB
+	// uploadDir 现在只用来"清理目标",不再写文件
+	const uploadDir = "workdir/uploads"
+
+	// === 2026-07-30: 硬编码不存盘, 对齐 Claude Code ===
+	//
+	// 不管前端传 ?mode=url 还是默认 mode=inline,后端都强制把 mode 改成 inline,
+	// 且整个函数体内 **不调用 os.WriteFile**。字节只在内存里走一遍 base64 编码后
+	// 通过响应回前端,前端再走 POST /chat 把它送进 LLM。
+	//
+	// 上传的字节流从进入到离开这个函数,从未接触过 workdir/uploads/ 磁盘。
+	// 注意: 以前的 mode 变量删除了,响应里 mode 字段硬编码写 "inline"。
+	log.Printf("[upload] 2026-07-30 Claude Code 模式: 不落盘, 强制 inline")
+	// 这样无论客户端怎么走,字节都只在内存里 — Claude Code 精神。
+
+	// 解析 multipart
+	form, err := c.Request.MultipartForm()
+	if err != nil {
+		c.JSON(consts.StatusBadRequest, map[string]string{
+			"error": "invalid multipart form: " + err.Error(),
+		})
+		return
+	}
+	files := form.File["file"]
+	if len(files) == 0 {
+		c.JSON(consts.StatusBadRequest, map[string]string{
+			"error": "no file field in form",
+		})
+		return
+	}
+	// 单次上传只取第一个文件(简化);多文件走多次上传
+	fh := files[0]
+	if fh.Size > maxFileSize {
+		c.JSON(consts.StatusRequestEntityTooLarge, map[string]string{
+			"error": "file too large",
+		})
+		return
+	}
+
+	// === 2026-07-30: 字节只读一次到内存,从不落盘 ===
+	//
+	// 不再:
+	//   - os.MkdirAll(uploadDir, ...)  创建目录(由 main 启动时一次性创建)
+	//   - os.Create(target) / os.WriteFile(target, ...)  写盘
+	//   - os.ReadFile(target)  回读(因为根本没写)
+	// 只用 io.ReadAll + base64。
+	src, err := fh.Open()
+	if err != nil {
+		c.JSON(consts.StatusInternalServerError, map[string]string{
+			"error": "open upload failed: " + err.Error(),
+		})
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(src, maxFileSize+1))
+	src.Close()
+	if err != nil {
+		c.JSON(consts.StatusInternalServerError, map[string]string{
+			"error": "read upload failed: " + err.Error(),
+		})
+		return
+	}
+	if int64(len(data)) > maxFileSize {
+		c.JSON(consts.StatusRequestEntityTooLarge, map[string]string{
+			"error": "file too large",
+		})
+		return
+	}
+
+	// 安全验证:用 mime 做粗略 sanity check(让前端知道 base64 是 OK 的)
+	mime := guessUploadMIME(fh.Filename)
+
+	// === 2026-07-30: Office 文档在上传时即抽取纯文本 ===
+	//
+	// .docx / .xlsx / .pptx 不能直接发给 Anthropic(它不支持)。我们这里做一次
+	// 服务器端的 format 转换:
+	//   1. 解压 OOXML(zip + XML)
+	//   2. 抽 <w:t> / shared string + cell / slide text frame
+	//   3. 输出 markdown-like 文本
+	//   4. 把 mime 重新标成 text/plain,继续走 PlainTextSource 路径
+	//
+	// 旧二进制格式 .doc/.xls/.ppt 不支持(失败告诉前端)。
+	//
+	// 全部在内存里完成,符合 Claude Code 精神不落盘。
+	if office.IsOOXML(mime) {
+		text, ok := office.ExtractText(data, mime)
+		if !ok {
+			c.JSON(consts.StatusUnsupportedMediaType, map[string]any{
+				"error": "office document extraction failed",
+				"hint": map[string]string{
+					"old_binary_formats": ".doc/.xls/.ppt (旧 OLE 格式) 当前不支持,请另存为 .docx/.xlsx/.pptx 或用 LibreOffice 转 PDF 再上传",
+					"alternative":        "PDF / txt / md 格式可直接被 Anthropic 接受",
+				},
+			})
+			return
+		}
+		// 把 data 替换成纯文本字节,mime 改成 text/plain
+		data = []byte(text)
+		mime = "text/plain"
+		log.Printf("[upload] office extracted: name=%s, extracted_len=%d, new mime=text/plain",
+			fh.Filename, len(text))
+	}
+
+	encoded := base64.StdEncoding.EncodeToString(data)
+	dataURL := fmt.Sprintf("data:%s;base64,%s", mime, encoded)
+
+	log.Printf("[upload] ok name=%s size=%d mime=%s mode=inline (no-disk Claude Code 模式)",
+		fh.Filename, len(data), mime)
+
+	c.JSON(consts.StatusOK, map[string]any{
+		"url":  dataURL, // 直接给 data URL,前端走 /chat body 用 image_data[]
+		"name": fh.Filename,
+		"size": len(data),
+		"mode": "inline",
+		// 注意: 没有 disk_url 字段,因为根本没存盘。
+		// 防止前端缓存的旧代码做无效的 fetch('/uploads/...')。
+	})
+}
+
+// isOfficeOOXML 已迁移到 internal/office/office.go 下的 office.IsOOXML()
+
+// guessUploadMIME 按文件扩展名推断 MIME。
+// 与 chatmodel.go / memory/search_tool.go 里的实现保持一致,便于排查。
+func guessUploadMIME(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".pdf":
+		return "application/pdf"
+	case ".txt", ".log":
+		return "text/plain"
+	case ".md":
+		return "text/markdown"
+	case ".html", ".htm":
+		return "text/html"
+	// === 2026-07-30: Office 文档 MIME ===
+	// .docx / .xlsx / .pptx 是 OOXML 规范文件 = ZIP 容器 + XML。
+	// Anthropic 不直接接受,但我们可以用 zip+xml 抽纯文本进 PlainTextSource,
+	// 或调用本地 LibreOffice 转 PDF(可选)。
+	case ".docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case ".xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case ".pptx":
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+	case ".doc":
+		return "application/msword"
+	case ".xls":
+		return "application/vnd.ms-excel"
+	case ".ppt":
+		return "application/vnd.ms-powerpoint"
+	default:
+		// 兜底:用 http.DetectContentType 嗅探
+		return "application/octet-stream"
+	}
+}
+
+// isLikelyBase64 用字符频次粗略判断字符串是否像 base64。
+//
+// 返回 true 的条件: 字符全部 ∈ [A-Za-z0-9+/=] (允许末尾 0-2 个 = padding)。
+// 不做严格解码测试(开销大);只快速过滤明显非 base64 的输入。
+//
+// 设计取舍:
+//   - 严格解码会扫描 4 字符一组,对 5MB 的 base64 会引入额外 1MB+ 内存压力
+//   - 这里用简单字符校验已经足够;LLM 接收到非 base64 时仍会报错,但
+//     至少能在日志里看到 "skip" 提示
+func isLikelyBase64(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, c := range s {
+		switch {
+		case c >= 'A' && c <= 'Z':
+		case c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+		case c == '+' || c == '/':
+		case c == '=' && (i == len(s)-1 || i == len(s)-2):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// loadDiskAsBase64 从磁盘读取文件,返回 base64 + MIME + ok。
+//
+// 输入: 相对路径(不带前导 /),例如 "uploads/xxx.png"
+// 输出: base64 字符串 + MIME + 是否成功
+//
+// 安全:
+//   - 拒绝 ..
+//   - 拒绝绝对路径
+//   - 限定根目录: workdir/
+func loadDiskAsBase64(relPath string) (string, string, bool) {
+	if strings.Contains(relPath, "..") {
+		return "", "", false
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", "", false
+	}
+	candidates := []string{
+		filepath.Join(wd, relPath),
+		filepath.Join(wd, "workdir", relPath),
+	}
+	if !strings.HasPrefix(relPath, "uploads/") {
+		candidates = append(candidates, filepath.Join(wd, "workdir", "uploads", relPath))
+	}
+	for _, path := range candidates {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() && info.Size() < 8*1024*1024 {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			return base64.StdEncoding.EncodeToString(data), guessUploadMIME(path), true
+		}
+	}
+	return "", "", false
+}
+
+// extractFileNameFromURL 从 URL 路径末尾取文件名,去掉 query string。
+//
+// 例:
+//
+//	"http://x.com/uploads/abc.png"  → "abc.png"
+//	"http://x.com/path/foo.pdf?x=1" → "foo.pdf"
+//	"https://x.com"                  → "download"
+func extractFileNameFromURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Path == "" {
+		return "download"
+	}
+	base := filepath.Base(u.Path)
+	if base == "." || base == "/" || base == "" {
+		return "download"
+	}
+	return base
+}
+
+// sanitizeUploadName 把上传文件名里的不安全字符替换成下划线。
+//
+// 不依赖 session 包里的 sanitizeFileName,避免循环依赖。
+func sanitizeUploadName(name string) string {
+	r := strings.NewReplacer(
+		"/", "_", "\\", "_",
+		":", "_", "*", "_",
+		"?", "_", "\"", "_",
+		"<", "_", ">", "_",
+		"|", "_",
+	)
+	return r.Replace(name)
+}
+
+// handleDeleteSession 处理 DELETE /api/sessions/:id。
+//
+// 行为:
+//   - 从内存 store 清掉该 session
+//   - 磁盘的 <PersistPath>/<id>.json 由 store.Reset 内部触发持久层清理
+//   - 不清理上传文件(因为 2026-07-30 后已经不再落盘了)
+//
+// 返回: 200 / 400 / 404
+func handleDeleteSession(_ context.Context, c *app.RequestContext, store *session.Store) {
+	sessionID := c.Param("sessionId")
+	// hertz 的 *sessionId 通配符带前导 "/" → 去掉
+	if strings.HasPrefix(sessionID, "/") {
+		sessionID = strings.TrimPrefix(sessionID, "/")
+	}
+	if sessionID == "" {
+		c.JSON(consts.StatusBadRequest, map[string]string{
+			"error": "session_id is required",
+		})
+		return
+	}
+
+	store.Reset(sessionID)
+	log.Printf("[delete-session] cleared session=%s", sessionID)
+
+	c.JSON(consts.StatusOK, map[string]any{
+		"deleted": sessionID,
+		"mode":    "memory+disk",
+	})
+}
+
+// === handleUploadServe 已在 2026-07-30 删除 ===
+//
+// Claude Code 精神: 用户上传文件永远不存盘,所以 /uploads/<file> 静态服务
+// 没有意义。未来如需重新启用 URL 模式(接对象存储),请:
+//   1. 重新注册路由 h.GET("/uploads/*filepath", ...)
+//   2. 重新实现该函数(从旧版可查 git log)
+
+// parseInlineAttachments 从 query 文本里提取 @<tag>:<URL> 形式的附件引用。
+//
+// 行为：
+//   - @<tag>:<URL>：整段匹配，URL 段允许字母数字 / : / . / / / - / _ / ? / = / &
+//   - 返回所有匹配到的 URL（不重复；顺序保持）
+//   - 找不到匹配 → 返回 nil
+//
+// 用法：parseInlineAttachments(query, "@image") / parseInlineAttachments(query, "@file")
+// 设计取舍：保留 inline 形式是为了方便调试和 CLI/curl 测试；生产环境
+// 强烈推荐用 Header X-Image-URL / X-File-URL 显式传，文本不会被污染。
+func parseInlineAttachments(query, tag string) []string {
+	if !strings.HasPrefix(tag, "@") {
+		tag = "@" + tag
+	}
+	// 用正则匹配 @<tag>:<URL>；URL 部分尽量宽松但避免吞掉空白
+	pattern := regexp.QuoteMeta(tag) + `:([^\s]+)`
+	re := regexp.MustCompile(pattern)
+	matches := re.FindAllStringSubmatch(query, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		url := strings.TrimRight(m[1], ".,;:!?)]}'\"")
+		if _, dup := seen[url]; dup {
+			continue
+		}
+		seen[url] = struct{}{}
+		out = append(out, url)
+	}
+	return out
 }
