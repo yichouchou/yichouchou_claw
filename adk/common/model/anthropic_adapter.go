@@ -497,12 +497,20 @@ func buildAnthropicDocumentBlock(file *schema.MessageInputFile) anthropic.Conten
 				return anthropic.ContentBlockParamUnion{}
 			}
 			log.Printf("[AnthropicAdapter] document text mime=%s size=%d", mime, len(decoded))
+
+			// === 2026-07-30: 让 LLM 知道文本格式语义 ===
+			//
+			// Anthropic PlainTextSourceParam 只接受 MediaType=text/plain,
+			// 这意味着我们无法把 mime=text/markdown / text/html 精确传给 LLM。
+			// 但模型是 markdown / html 双语料训练的,我们给内容加个 "格式提示前缀",
+			// 让 LLM 明确把内容当 markdown/html 解析,而不是 raw text。
+			//
+			// 例如用户问 "总结这份 md 的大纲",模型就知道按 markdown 结构去读。
+			prefix := textFormatHint(mime)
+
 			return anthropic.NewDocumentBlock(anthropic.PlainTextSourceParam{
-				Data: decoded,
-				// 注意: PlainTextSource 默认 MediaType=text/plain。
-				// Anthropic 当前 SDK 没有"自定义 plain text 的 mime"参数(支持是
-				// text/plain / text/markdown / text/html 走单独的 Param 类型)。
-				// 简化处理: 所有 text/* 一律按 text/plain 上送。
+				Data: prefix + decoded,
+				// MediaType 默认 text/plain,这里就算 SDK 不让也没办法。
 			})
 		}
 		log.Printf("[AnthropicAdapter] text document missing base64data, skipping (URL not supported)")
@@ -523,6 +531,30 @@ func buildAnthropicDocumentBlock(file *schema.MessageInputFile) anthropic.Conten
 		}
 		log.Printf("[AnthropicAdapter] unknown mime=%s missing base64, skipping", mime)
 		return anthropic.ContentBlockParamUnion{}
+	}
+}
+
+// textFormatHint 根据 mime 给出提示前缀,让 LLM 知道文本格式。
+//
+// 返回 "" 表示无需提示(纯文本 / log / 未知 mime)。
+// 返回 "<hint>\n" 表示在前缀后追加内容。
+//
+// 用法示例:
+//
+//	mime=text/markdown  → 返回 "以下内容是 Markdown 格式,请按 Markdown 语法识别:\n"
+//	mime=text/html      → 返回 "以下内容是 HTML 源码,请按 HTML 结构识别:\n"
+//	mime=text/plain     → 返回 ""
+//	mime=log/text-log   → 返回 ""
+func textFormatHint(mime string) string {
+	switch mime {
+	case "text/markdown":
+		return "以下内容是 Markdown 格式,请按 Markdown 语法(标题、列表、代码块、链接等)识别:\n\n"
+	case "text/html":
+		return "以下内容是 HTML 源代码,请按 HTML 结构(标签、属性、文本节点)识别,而不是渲染后的可视化样式:\n\n"
+	case "text/plain":
+		return ""
+	default:
+		return ""
 	}
 }
 
