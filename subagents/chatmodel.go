@@ -425,10 +425,12 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string, store *session.
 			}
 			return nil
 		}()), skillMw), extraHandlers...),
-		// 一次 ChatModel 生成 cycle 默认上限是 20。复杂排障场景下需要跑
-		// 大量命令（如 git fetch 失败 → 跑 7 步网络诊断），20 次会触顶报错
-		// "exceeds max iterations"。提到 50 留足余量。
-		MaxIterations: 50,
+		// MaxIterations 从 application.yml → agent.per_agent_max_iterations.local_command
+		// 读取,fallback 到 agent.max_iterations,再 fallback 到 eino 默认 20。
+		// 本机排障场景经常需要 7+ 步（DNS → 代理 → 测 github → 测 baidu →
+		// 换镜像 → 重试），20 不够，默认 50 留足余量。
+		// 调小时务必同步调整 sandbox 总超时。
+		MaxIterations: config.GetMaxIterationsFor("local_command"),
 	})
 	if err != nil {
 		log.Fatal(err)

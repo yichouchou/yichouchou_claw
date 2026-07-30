@@ -353,7 +353,22 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 	log.Printf("[main] Run session=%s history_len=%d query=%q",
 		sessionID, len(history), query)
 
-	iter := runner.Run(ctx, messages, opts...)
+	// === 整个 run 的兜底超时(2026-07-29 新增) ===
+	// 来源: application.yml → agent.total_run_timeout_seconds
+	// 默认 600 秒。调到 0 则不设超时(不推荐)。
+	// 落点: eino 内部的 ChatModel 调用 / 工具调用都会感知到 ctx.Done()。
+	runCtx := ctx
+	runCfg := config.GetApplication()
+	if runCfg != nil && runCfg.Agent.TotalRunTimeoutSeconds > 0 {
+		timeout := time.Duration(runCfg.Agent.TotalRunTimeoutSeconds) * time.Second
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, timeout)
+		// 重要: cancel 必须在 handleChat 返回前调,否则上下文泄漏
+		defer cancel()
+		log.Printf("[main] run timeout=%s session=%s", timeout, sessionID)
+	}
+
+	iter := runner.Run(runCtx, messages, opts...)
 
 	// 把 SSE 流挂到 hertz 响应上。
 	s := sse.NewStream(c)

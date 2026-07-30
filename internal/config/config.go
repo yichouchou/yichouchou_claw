@@ -188,6 +188,60 @@ type SessionConfig struct {
 	MaxRounds int `yaml:"max_rounds"`
 }
 
+// AgentConfig 各 Agent 的运行时参数（2026-07-29 新增）。
+//
+// 统一收纳"agent 维度的可调参数"：
+//   - MaxIterations / PerAgentMaxIterations: 单次 ChatModelAgent.Run 内部
+//     "调 ChatModel → 工具调用 → 观察结果 → 再调 ChatModel" 循环上限。
+//     触顶会报 "exceeds max iterations" 整个 run 失败。
+//   - TotalRunTimeoutSeconds: 整个 run 的兜底超时（main.go 在 runner.Run 侧用）。
+//
+// 注意：单条沙箱命令超时由 localcommand.single_command_timeout_seconds 控
+// （属于 localcommand 包的运行参数，不属于 agent 层面的可调项）。
+//
+// 设计取舍：
+//   - 默认 20（eino 框架默认值）：普通 ChatAgent / WeatherAgent / RouterAgent 够用。
+//   - LocalCommandAgent 调到 50：本机排障场景经常需要 7+ 步（DNS → 代理 →
+//     测 github → 测 baidu → 换镜像 → 重试），20 不够。
+//   - 应用层不再 hardcoded，全部由 application.yml 控制。
+type AgentConfig struct {
+	// MaxIterations 通用默认上限（PerAgentMaxIterations 没覆盖时用）。
+	// 0 = 用框架默认 20。
+	// yml 路径: application.yml → agent.max_iterations
+	MaxIterations int `yaml:"max_iterations"`
+
+	// PerAgentMaxIterations 按 agent 名覆盖上限。
+	// key: agent 名（local_command / chat / weather / router）
+	// 0 或未配置 → 用 MaxIterations 兜底
+	PerAgentMaxIterations map[string]int `yaml:"per_agent_max_iterations"`
+
+	// TotalRunTimeoutSeconds 整个 ChatModelAgent.Run 的兜底超时（秒）。
+	// main.go 在 runner.Run(ctx, ...) 里用 context.WithTimeout 套一层。
+	// 0 = 不设超时（不推荐）。
+	// yml 路径: application.yml → agent.total_run_timeout_seconds
+	TotalRunTimeoutSeconds int `yaml:"total_run_timeout_seconds"`
+}
+
+// DefaultAgentConfig 返回带默认值的 AgentConfig。
+func DefaultAgentConfig() AgentConfig {
+	return AgentConfig{
+		MaxIterations:          50, // LocalCommandAgent 排障场景下预留余量
+		PerAgentMaxIterations:  nil,
+		TotalRunTimeoutSeconds: 600,
+	}
+}
+
+// MaxIterationsFor 返回指定 agent 的 MaxIterations。
+//
+// 查找顺序：PerAgentMaxIterations[agentName] → MaxIterations → 0
+// 返回 0 表示让 eino 用其内部默认 20。
+func (a AgentConfig) MaxIterationsFor(agentName string) int {
+	if v, ok := a.PerAgentMaxIterations[agentName]; ok && v > 0 {
+		return v
+	}
+	return a.MaxIterations
+}
+
 // LocalCommandConfig 沙箱命令执行配置。
 type LocalCommandConfig struct {
 	SingleCommandTimeoutSeconds   int `yaml:"single_command_timeout_seconds"`
@@ -303,6 +357,7 @@ type ApplicationConfig struct {
 	Session      SessionConfig      `yaml:"session"`
 	LocalCommand LocalCommandConfig `yaml:"localcommand"`
 	Sandbox      SandboxConfig      `yaml:"sandbox"`
+	Agent        AgentConfig        `yaml:"agent"`
 }
 
 // =====================================================================
@@ -451,7 +506,48 @@ func defaultApplicationConfig() *ApplicationConfig {
 			SingleCommandTimeoutSeconds:   30,
 			PipelineCommandTimeoutSeconds: 60,
 		},
+		Agent: AgentConfig{
+			MaxIterations: 50,
+			PerAgentMaxIterations: map[string]int{
+				"local_command": 50, // 排障场景
+				"chat":          20, // 闲聊不需要多轮
+				"weather":       20, // 天气查询 1 次就够
+				"router":        30, // 路由 + 偶尔查 memory
+			},
+			TotalRunTimeoutSeconds: 600,
+		},
 	}
+}
+
+// GetMaxIterations 便捷读取 AgentConfig.MaxIterations（通用兜底）。
+//
+// 行为：
+//   - application.yml 未加载 → 返回 0（让 eino 用内部默认 20）
+//   - 用户在 yml 中显式设为 0 → 同样返回 0（同上语义）
+//   - 用户配置 > 0 → 原样返回
+//
+// 注意：返回 0 不代表"不限制"，而是触发 eino 框架默认 20 次上限。
+// 如需"完全无限制"或"调大"，必须在 yml 显式给值。
+//
+// 推荐用 GetMaxIterationsFor(agentName) 拿某个 agent 的具体值,会自动
+// 走 PerAgentMaxIterations 的覆盖逻辑。
+func GetMaxIterations() int {
+	app := GetApplication()
+	if app == nil {
+		return 0
+	}
+	return app.Agent.MaxIterations
+}
+
+// GetMaxIterationsFor 便捷读取指定 agent 的 MaxIterations。
+//
+// 查找顺序：PerAgentMaxIterations[agentName] → MaxIterations → 0
+func GetMaxIterationsFor(agentName string) int {
+	app := GetApplication()
+	if app == nil {
+		return 0
+	}
+	return app.Agent.MaxIterationsFor(agentName)
 }
 
 // GetApplication 返回当前 application.yml 配置。nil 表示未加载（极端情况）。
