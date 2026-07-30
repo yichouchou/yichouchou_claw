@@ -89,6 +89,33 @@ localcommand:
   single_command_timeout_seconds: 30         # 单条命令超时
   pipeline_command_timeout_seconds: 60        # 管道命令链超时
 
+# Agent 运行时参数（2026-07-29 新增）
+# 统一控制 Agent 维度的可调参数。
+#
+#   - max_iterations: 通用 ChatModelAgent.Run 循环上限,作为 per_agent 兜底
+#   - per_agent_max_iterations: 按 agent 名单独覆盖,优先级更高
+#   - total_run_timeout_seconds: 整个 run 兜底超时(main.go 侧 context.WithTimeout)
+#
+# 单次 ChatModelAgent.Run 内部 "调 ChatModel → 工具 → 观察" 循环上限。
+# 触顶会报 "exceeds max iterations" 整个 run 失败。
+#
+# 注意：单条沙箱命令超时由 localcommand.single_command_timeout_seconds 控制
+#（属于 localcommand 包运行参数，不属于 agent 层面的可调项）。
+#
+# 设计取舍：
+#   - 默认 20（eino 框架默认，对 ChatAgent / WeatherAgent 够用）
+#   - 本机排障常需要 7+ 步（DNS → 代理 → 测 github → 测 baidu → 换镜像 → 重试），
+#     默认 50 留足余量
+#   - 0 = 让 eino 用框架默认 20（不建议）
+agent:
+  max_iterations: 50                          # 通用兜底
+  per_agent_max_iterations:                   # 各 agent 单独控制
+    local_command: 50                         # 排障: 7+ 步是常态
+    chat: 20                                  # 闲聊不需要多轮
+    weather: 20                               # 天气查询 1 次就够
+    router: 30                                # 路由 + 偶尔查 memory
+  total_run_timeout_seconds: 600              # 整个 run 兜底（10 分钟）
+
 # Sandbox 安全（2026-07-27 新增，整合四个安全阶段）
 #
 # 设计参考：
