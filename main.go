@@ -540,19 +540,32 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 		if i < len(req.FileName) && req.FileName[i] != "" {
 			name = req.FileName[i]
 		}
-		b := b64
-		m := mime
-		n := name
-		parts = append(parts, schema.MessageInputPart{
-			Type: schema.ChatMessagePartTypeFileURL,
-			File: &schema.MessageInputFile{
-				MessagePartCommon: schema.MessagePartCommon{
-					Base64Data: &b,
-					MIMEType:   m,
-				},
-				Name: n,
-			},
-		})
+
+		// === 2026-07-30: Ark 模型 bug 修复 ===
+		//
+		// eino Ark adapter (chat_completion_api.go:704) **不支持** ChatMessagePartTypeFileURL。
+		// 用户模型实际为 ark( MiniMax-M3 ),之前传 .md/.pdf/.docx 会报:
+		//   "unsupported chat message part type in user message: file_url"
+		//
+		// 修复:把文件 base64 解码 → 拼成 Markdown 风格文本 → 直接进 ChatMessagePartTypeText part。
+		// 这样无论底层是 Ark / Anthropic / OpenAI 都接受(TEXT 所有 provider 都支持)。
+		//
+		// 限制:二进制 PDF 直接 base64 解码会乱码。我们按 mime 分流:
+		//   - text/* (txt/md/html/log)       → 解 base64,得到 UTF-8 字符串,正常并入
+		//   - application/pdf                 → 标注 "[PDF 附件,具体内容无法以文本传输,请用户口头描述]"
+		//   - application/vnd.openxmlformats-* → 同样内容已经过 office.ExtractText 转 text/plain
+		//                                       (handleUpload 在上传时已经做了抽取),所以这里
+		//                                       mime 是 text/plain,会进 text 分支,正常显示
+		//   - 其他二进制                       → 标注格式不支持
+		attachmentText := buildAttachmentText(b64, mime, name)
+		if attachmentText != "" {
+			parts = append(parts, schema.MessageInputPart{
+				Type: schema.ChatMessagePartTypeText,
+				Text: attachmentText,
+			})
+			log.Printf("[chat] file[%d] name=%s mime=%s as-text len=%d",
+				i, name, mime, len(attachmentText))
+		}
 	}
 
 	// === 方式 2: POST body.image_url / file_url(http(s) URL 或 /uploads/ 相对路径) ===
@@ -990,6 +1003,113 @@ func guessUploadMIME(name string) string {
 		// 兜底:用 http.DetectContentType 嗅探
 		return "application/octet-stream"
 	}
+}
+
+// buildAttachmentText 把上传的附件 base64 转成可拼到 message 里的文本片段。
+//
+// 解决 Ark / 多数 OpenAI 兼容 API **不支持 ChatMessagePartTypeFileURL** 的问题。
+// 我们用 chat 协议"人人支持"的 TextPart,绕开所有 model-specific 的 part 类型支持差异。
+//
+// 入参:
+//   - b64:  文件 base64 字符串(由前端 handleUpload 生成的 data URL 截取纯 base64 部分)
+//   - mime: application/pdf / text/markdown / application/vnd.openxmlformats-… 等等
+//   - name: 上传时的文件名(用于错误信息)
+//
+// 返回:
+//   - string: 可直接喂给 TextPart 的文本片段;"" 表示无法表示
+//
+// 分流策略:
+//   - text/* (text/plain, text/markdown, text/html): 解 base64 → UTF-8 字符串 → 拼"文档"块
+//     真实的内容已经被 office_extract.go 抽取成 text/plain(对 .docx/.xlsx/.pptx),所以
+//     走到这里 mime 已经是 text/plain;Office 也自然支持。
+//   - application/pdf: PDF 是二进制,base64 解码是乱码,无法做"读"操作;
+//     标注"[PDF 附件,模型无法直接读 PDF 内容,用户需提供文字摘要]"。
+//   - 其它(application/octet-stream 或未知 mime): fallback,按纯文本尝试解码,失败则丢占位。
+func buildAttachmentText(b64, mime, name string) string {
+	// text/* 全部分支:实际可解码出 UTF-8 字符串
+	if strings.HasPrefix(mime, "text/") {
+		decoded, err := decodeBase64String(b64)
+		if err != nil {
+			log.Printf("[chat] text attachment base64 decode failed: %v", err)
+			return fmt.Sprintf("\n[附件 %s (%s)] base64 解码失败,请重传\n", name, mime)
+		}
+		// 控制最大长度:防止单个附件爆 markdown
+		const maxAttachmentText = 256 * 1024 // 256KB 文本片段
+		if len(decoded) > maxAttachmentText {
+			decoded = decoded[:maxAttachmentText] + "\n...(已截断,共 " +
+				fmt.Sprintf("%d", len(decoded)) + " 字)..."
+		}
+		// 加格式提示:让 LLM 知道这是 markdown / html(2026-07-30 优化)
+		prefix := textFormatHintForAttachment(mime)
+		if prefix != "" {
+			return "\n[附件 " + name + " (" + mime + ")]\n" + prefix + decoded + "\n[/附件]\n"
+		}
+		return "\n[附件 " + name + " (" + mime + ")]\n" + decoded + "\n[/附件]\n"
+	}
+
+	// application/pdf 是二进制,base64 解码是乱码
+	if mime == "application/pdf" {
+		return "\n[附件 " + name + " (application/pdf)] ⚠️ PDF 是二进制格式,当前后端模型不支持直接读取 PDF 内容。请把 PDF 转成 Markdown / 纯文本后再上传,或用文字描述你想问 PDF 的哪个部分。\n[/附件]\n"
+	}
+
+	// 其它未知 mime:尝试 base64 解码,失败则标占位
+	decoded, err := decodeBase64String(b64)
+	if err == nil && isPrintableUTF8(decoded) {
+		const maxAttachmentText = 256 * 1024
+		if len(decoded) > maxAttachmentText {
+			decoded = decoded[:maxAttachmentText] + "\n...(已截断)..."
+		}
+		return "\n[附件 " + name + " (" + mime + ")]\n" + decoded + "\n[/附件]\n"
+	}
+	return "\n[附件 " + name + " (" + mime + ")] 二进制文件无法作为文本直接展示,当前 base64 size=" +
+		fmt.Sprintf("%d", len(b64)) + "。请提供文字描述。\n[/附件]\n"
+}
+
+// textFormatHintForAttachment 是与 anthropic_adapter.textFormatHint 同语义的 helper,
+// 但放在 main.go(独立于 adapter 实现)用,所以不复用。
+func textFormatHintForAttachment(mime string) string {
+	switch mime {
+	case "text/markdown":
+		return "以下内容是 Markdown 格式,请按 Markdown 语法识别:\n\n"
+	case "text/html":
+		return "以下内容是 HTML 源代码,请按 HTML 结构识别:\n\n"
+	default:
+		return ""
+	}
+}
+
+// decodeBase64String 解码标准或 URL-safe base64,容错无 padding 的情况。
+func decodeBase64String(s string) (string, error) {
+	padded := s
+	if mod := len(padded) % 4; mod != 0 {
+		padded += strings.Repeat("=", 4-mod)
+	}
+	raw, err := base64.StdEncoding.DecodeString(padded)
+	if err != nil {
+		// 尝试 url-safe 编码
+		raw2, err2 := base64.URLEncoding.DecodeString(padded)
+		if err2 != nil {
+			return "", err
+		}
+		return string(raw2), nil
+	}
+	return string(raw), nil
+}
+
+// isPrintableUTF8 粗略判断 string 是否像可读文本(全部字符可打印 + 主要是 ASCII / UTF-8 多字节)。
+func isPrintableUTF8(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	nonPrintable := 0
+	for _, r := range s {
+		// 控制字符(除 \t \n \r 外)判失败
+		if r < 32 && r != '\t' && r != '\n' && r != '\r' {
+			nonPrintable++
+		}
+	}
+	// 超过 5% 不可打印字符 → 判为二进制
+	return nonPrintable*20 < len(s)
 }
 
 // isLikelyBase64 用字符频次粗略判断字符串是否像 base64。
