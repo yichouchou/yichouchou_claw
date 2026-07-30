@@ -161,14 +161,20 @@ func (m *MemoryMiddleware) WrapInvokableToolCall(ctx context.Context, endpoint a
 }
 
 // formatMessagesAsInput 把即将发给模型的多轮 messages 渲染成可读文本。
+//
+// 多模态支持(2026-07-29):
+//   - 单独统计 text_len / multi_parts 两个指标,避免单数字 metric 误判
+//   - 对每条 multi_part 输出一行: type / mime / url(摘要)
+//   - 大幅 base64 数据不展开,只统计长度(避免 trace 文件被 base64 撑爆)
 func formatMessagesAsInput(msgs []*schema.Message) string {
 	if len(msgs) == 0 {
 		return "(no messages)"
 	}
 	var buf bytes.Buffer
 	for i, msg := range msgs {
-		fmt.Fprintf(&buf, "[%02d] role=%s content_len=%d tool_calls=%d\n",
-			i, msg.Role, len(msg.Content), len(msg.ToolCalls))
+		multiPartCount := len(msg.UserInputMultiContent) + len(msg.AssistantGenMultiContent)
+		fmt.Fprintf(&buf, "[%02d] role=%s text_len=%d multi_parts=%d tool_calls=%d\n",
+			i, msg.Role, len(msg.Content), multiPartCount, len(msg.ToolCalls))
 		if msg.Role == schema.Tool {
 			fmt.Fprintf(&buf, "     tool_call_id=%s tool_name=%s\n",
 				msg.ToolCallID, msg.ToolName)
@@ -179,11 +185,95 @@ func formatMessagesAsInput(msgs []*schema.Message) string {
 					tc.ID, tc.Function.Name, truncate(tc.Function.Arguments, 500))
 			}
 		}
+		// 用户多模态输入
+		for j, p := range msg.UserInputMultiContent {
+			fmt.Fprintf(&buf, "     - input_part[%d] type=%s mime=%s url=%s\n",
+				j, p.Type, getInputPartMIME(p), getInputPartURLOrSummary(p))
+		}
+		// 模型多模态输出
+		for j, p := range msg.AssistantGenMultiContent {
+			fmt.Fprintf(&buf, "     - output_part[%d] type=%s mime=%s url=%s\n",
+				j, p.Type, getOutputPartMIME(p), getOutputPartURLOrSummary(p))
+		}
 		if msg.Content != "" {
 			fmt.Fprintf(&buf, "     content: %s\n", truncate(msg.Content, MaxContentPreview))
 		}
 	}
 	return buf.String()
+}
+
+// getInputPartMIME 从 MessageInputPart 拿 MIME(可能为空)。
+func getInputPartMIME(p schema.MessageInputPart) string {
+	switch {
+	case p.Image != nil:
+		return p.Image.MIMEType
+	case p.Audio != nil:
+		return p.Audio.MIMEType
+	case p.Video != nil:
+		return p.Video.MIMEType
+	case p.File != nil:
+		return p.File.MIMEType
+	}
+	return ""
+}
+
+// getInputPartURLOrSummary 拿 URL/base64 长度摘要。
+//
+// 大幅 base64 (>=256 字节) 不展开,只输出长度,避免 trace 文件被撑爆。
+func getInputPartURLOrSummary(p schema.MessageInputPart) string {
+	switch {
+	case p.Image != nil:
+		return inputDataURLOrSummary(p.Image.URL, p.Image.Base64Data)
+	case p.Audio != nil:
+		return inputDataURLOrSummary(p.Audio.URL, p.Audio.Base64Data)
+	case p.Video != nil:
+		return inputDataURLOrSummary(p.Video.URL, p.Video.Base64Data)
+	case p.File != nil:
+		return inputDataURLOrSummary(p.File.URL, p.File.Base64Data)
+	}
+	return p.Text
+}
+
+func inputDataURLOrSummary(url, b64 *string) string {
+	if url != nil && *url != "" {
+		return *url
+	}
+	if b64 != nil && *b64 != "" {
+		if len(*b64) > 256 {
+			return fmt.Sprintf("<base64 %d bytes>", len(*b64))
+		}
+		return *b64
+	}
+	return ""
+}
+
+// getOutputPartMIME 从 MessageOutputPart 拿 MIME(可能为空)。
+func getOutputPartMIME(p schema.MessageOutputPart) string {
+	switch {
+	case p.Image != nil:
+		return p.Image.MIMEType
+	case p.Audio != nil:
+		return p.Audio.MIMEType
+	case p.Video != nil:
+		return p.Video.MIMEType
+	}
+	return ""
+}
+
+// getOutputPartURLOrSummary 与 getInputPartURLOrSummary 同形,只接收 output 类型。
+func getOutputPartURLOrSummary(p schema.MessageOutputPart) string {
+	switch {
+	case p.Image != nil:
+		return inputDataURLOrSummary(p.Image.URL, p.Image.Base64Data)
+	case p.Audio != nil:
+		return inputDataURLOrSummary(p.Audio.URL, p.Audio.Base64Data)
+	case p.Video != nil:
+		return inputDataURLOrSummary(p.Video.URL, p.Video.Base64Data)
+	}
+	if p.Reasoning != nil {
+		return fmt.Sprintf("<reasoning %d bytes>", len(p.Reasoning.Text))
+	}
+	return ""
 }
 
 // formatMessageAsOutput 渲染一条助手消息(含 tool_calls)。
@@ -192,8 +282,9 @@ func formatMessageAsOutput(msg *schema.Message) string {
 		return "(nil message)"
 	}
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "role=%s content_len=%d tool_calls=%d\n",
-		msg.Role, len(msg.Content), len(msg.ToolCalls))
+	multiPartCount := len(msg.UserInputMultiContent) + len(msg.AssistantGenMultiContent)
+	fmt.Fprintf(&buf, "role=%s text_len=%d multi_parts=%d tool_calls=%d\n",
+		msg.Role, len(msg.Content), multiPartCount, len(msg.ToolCalls))
 	if msg.Role == schema.Tool {
 		fmt.Fprintf(&buf, "tool_call_id=%s tool_name=%s\n",
 			msg.ToolCallID, msg.ToolName)
@@ -203,6 +294,11 @@ func formatMessageAsOutput(msg *schema.Message) string {
 			fmt.Fprintf(&buf, "tool_call id=%s name=%s args=%s\n",
 				tc.ID, tc.Function.Name, truncate(tc.Function.Arguments, 500))
 		}
+	}
+	// 多模态输出 part 摘要(2026-07-29 新增)
+	for j, p := range msg.AssistantGenMultiContent {
+		fmt.Fprintf(&buf, "output_part[%d] type=%s mime=%s url=%s\n",
+			j, p.Type, getOutputPartMIME(p), getOutputPartURLOrSummary(p))
 	}
 	if msg.Content != "" {
 		fmt.Fprintf(&buf, "content: %s\n", msg.Content)

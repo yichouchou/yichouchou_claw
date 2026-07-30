@@ -18,8 +18,10 @@ package subagents
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -269,22 +271,36 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string, store *session.
 	// 防止"上下文断层"——RouterAgent 复述得再清楚,LocalCommandAgent 也得有
 	// 原始 recent memory 作为兜底。
 	localCmdDynamicRecentMw := newDynamicRecentMemoryMiddleware(config.GetRecentMemoryConfig())
-	localCmdTool, err := utils.InferTool(
+	// 多模态升级(2026-07-29): 改用 utils.InferEnhancedTool,
+	// 让 ToolResult 既包含文本 part(命令输出 + exit code + duration),
+	// 也包含命令生成的"产物文件"作为附件(PDF / 图片 / 日志等)。
+	localCmdTool, err := utils.InferEnhancedTool(
 		"local_command",
 		localCommandToolDesc,
-		func(ctx context.Context, input *localcommand.CommandInput) (string, error) {
+		func(ctx context.Context, input *localcommand.CommandInput) (*schema.ToolResult, error) {
 			// 把 agent 名注入到 ctx,沙箱里的 per-agent 白/黑名单缓存才能命中。
-			// 否则 fallback 到 "main",沙箱里"无白名单",所有命令都会被报"不在白名单"。
 			ctx = localcommand.WithAgentName(ctx, "LocalCommandAgent")
-			// Execute 内部会从 ctx 读取 AuthorizationScope 决定是否放行软禁止
 			result, err := localcommand.Execute(ctx, input)
 			if err != nil {
-				return "", err
+				return nil, err
 			}
-			// 格式化输出
-			output := fmt.Sprintf("命令执行完成:\n退出码: %d\n耗时: %s\n标准输出:\n%s\n标准错误:\n%s",
+			textPart := fmt.Sprintf("命令执行完成:\n退出码: %d\n耗时: %s\n标准输出:\n%s\n标准错误:\n%s",
 				result.ExitCode, result.Duration, result.Stdout, result.Stderr)
-			return output, nil
+			result2 := &schema.ToolResult{
+				Parts: []schema.ToolOutputPart{
+					{Type: schema.ToolPartTypeText, Text: textPart},
+				},
+			}
+			// === 扫描命令生成的产物文件（2026-07-29 新增） ===
+			// 约定: 命令在当前工作目录下生成的"常见产物"会作为附件一并返回。
+			// 只挂小文件(<=2MB)且扩展名匹配已知类型,避免把全盘 / cache 都挂上去。
+			artifacts := detectCommandArtifacts(input.Command)
+			for _, p := range artifacts {
+				if part, ok := buildArtifactFilePart(p); ok {
+					result2.Parts = append(result2.Parts, part)
+				}
+			}
+			return result2, nil
 		},
 	)
 	if err != nil {
@@ -818,4 +834,128 @@ func (m *dynamicRecentMemoryMiddleware) BeforeModelRewriteState(
 		break
 	}
 	return ctx, state, nil
+}
+
+// ==== 多模态产物文件检测 (2026-07-29 新增) ====
+//
+// 约定: local_command 工具执行后,如果命令"应当"产生产物(比如 pdftotext 生成
+// .txt、matplotlib 生成 .png、pandoc 生成 .pdf),我们尝试在当前工作目录下扫
+// 描最近生成的"已知产物类型"作为附件一并返回。
+//
+// 严格约束:
+//   - 仅识别白名单扩展名(.png/.pdf/.txt/.md/.log/.html/.svg),不挂任意文件
+//   - 单文件 <=2MB,避免撑爆上下文
+//   - 只扫描命令字符串里明确出现的"输出路径";避免误把整个 cwd 当产物
+//     (注:无法访问沙箱 cwd,只能从命令字符串里猜,所以是"启发式")
+
+// artifactExtWhiteList 是会被作为产物附件的文件后缀白名单。
+var artifactExtWhiteList = map[string]bool{
+	".png":  true,
+	".jpg":  true,
+	".jpeg": true,
+	".gif":  true,
+	".pdf":  true,
+	".txt":  true,
+	".md":   true,
+	".html": true,
+	".svg":  true,
+	".log":  true,
+}
+
+// detectCommandArtifacts 从命令字符串里提取可能的产物文件路径。
+//
+// 启发式:
+//   - 拆 token,识别 ">/" 或 "-o" 或 "tee" 后面的路径
+//   - 识别 .ext 后缀的 token 本身
+//   - 不递归 cwd; 只返回命令里"明示"的路径
+func detectCommandArtifacts(cmd string) []string {
+	out := []string{}
+	tokens := strings.Fields(cmd)
+	for i, tok := range tokens {
+		// 1) > / >> 重定向目标
+		if (tok == ">" || tok == ">>") && i+1 < len(tokens) {
+			out = append(out, tokens[i+1])
+		}
+		// 2) -o / --output 参数
+		if (tok == "-o" || tok == "--output") && i+1 < len(tokens) {
+			out = append(out, tokens[i+1])
+		}
+		// 3) | tee <file>
+		if tok == "tee" && i+1 < len(tokens) {
+			out = append(out, tokens[i+1])
+		}
+	}
+	// 4) 任何 token 自身是 .png/.pdf 等已知扩展
+	for _, tok := range tokens {
+		ext := strings.ToLower(filepath.Ext(tok))
+		if artifactExtWhiteList[ext] {
+			out = append(out, tok)
+		}
+	}
+	// 去重 + 简单路径过滤(避免 ../ / 绝对路径越界)
+	uniq := map[string]struct{}{}
+	cleaned := make([]string, 0, len(out))
+	for _, p := range out {
+		if strings.Contains(p, "..") || strings.HasPrefix(p, "/etc") || strings.HasPrefix(p, "/proc") || strings.HasPrefix(p, "/sys") {
+			continue
+		}
+		if _, ok := uniq[p]; ok {
+			continue
+		}
+		uniq[p] = struct{}{}
+		cleaned = append(cleaned, p)
+	}
+	return cleaned
+}
+
+// buildArtifactFilePart 把磁盘文件转成 ToolOutputPart file 类型。
+//
+// 与 search_tool.go 同形,这里复制一份以避免跨包依赖;
+// 后续可以提到一个 internal/multimodal 包里共用。
+func buildArtifactFilePart(path string) (schema.ToolOutputPart, bool) {
+	const maxFileSize = 2 * 1024 * 1024
+	info, err := os.Stat(path)
+	if err != nil || info.Size() == 0 || info.Size() > maxFileSize {
+		return schema.ToolOutputPart{}, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("[local_command artifact] read failed path=%s err=%v", path, err)
+		return schema.ToolOutputPart{}, false
+	}
+	encoded := base64.StdEncoding.EncodeToString(data)
+	mime := guessArtifactMIME(path)
+	return schema.ToolOutputPart{
+		Type: schema.ToolPartTypeFile,
+		File: &schema.ToolOutputFile{
+			MessagePartCommon: schema.MessagePartCommon{
+				Base64Data: &encoded,
+				MIMEType:   mime,
+			},
+		},
+	}, true
+}
+
+func guessArtifactMIME(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".pdf":
+		return "application/pdf"
+	case ".txt", ".log":
+		return "text/plain"
+	case ".md":
+		return "text/markdown"
+	case ".html":
+		return "text/html"
+	case ".svg":
+		return "image/svg+xml"
+	default:
+		return "application/octet-stream"
+	}
 }

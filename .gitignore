@@ -2,3 +2,4 @@
 *.log
 workdir/memory/*
 /vendor/
+/workdir/sessions/
