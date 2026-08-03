@@ -291,13 +291,42 @@ func NewLocalCommandAgent(ctx context.Context, skillsDir string, store *session.
 					{Type: schema.ToolPartTypeText, Text: textPart},
 				},
 			}
-			// === 扫描命令生成的产物文件（2026-07-29 新增） ===
+			// === 扫描命令生成的产物文件(2026-07-29 新增) ===
 			// 约定: 命令在当前工作目录下生成的"常见产物"会作为附件一并返回。
 			// 只挂小文件(<=2MB)且扩展名匹配已知类型,避免把全盘 / cache 都挂上去。
 			artifacts := detectCommandArtifacts(input.Command)
+			// === 2026-07-30: 图片类产物同步以 markdown image 嵌入 text(关键) ===
+			//
+			// 背景: drawio / matplotlib / pdftoppm 等命令会生成 PNG。ChatAgent 的 LLM
+			// 上下文会以 tool 结果形式接收 ToolOutputPart(图像多模态),但 **LLM 不会原样
+			// 复制 base64 字符串到自己的回复**;但 markdown image 语法 `![](data:)`
+			// 能让 LLM **识别这是张图**并在回复时直接复述语法——前端 markdown 渲染器
+			// 会自动把 data URL 渲染成 <img>。
+			//
+			// 限制: base64 字符串本身很占 token,只对 image/* 且 size <= 256KB 做嵌入;
+			// 更大的 PNG 只挂在 ToolOutputPart 里(LLM 仍然能"看图",只是不直接渲染)。
+			var embeddedImages []string
 			for _, p := range artifacts {
 				if part, ok := buildArtifactFilePart(p); ok {
 					result2.Parts = append(result2.Parts, part)
+					// 同步构造 markdown image 嵌入
+					if part.File != nil && part.File.MIMEType != "" &&
+						strings.HasPrefix(part.File.MIMEType, "image/") &&
+						part.File.Base64Data != nil && len(*part.File.Base64Data) <= 256*1024 {
+						name := filepath.Base(p)
+						embeddedImages = append(embeddedImages,
+							fmt.Sprintf("![%s](data:%s;base64,%s)",
+								name, part.File.MIMEType, *part.File.Base64Data))
+					}
+				}
+			}
+			if len(embeddedImages) > 0 {
+				// 把 markdown image 嵌入 text 末尾 —— LLM 看到后会在自己的回复里
+				// 引用同样的语法,前端将其渲染为 <img>。
+				result2.Parts[0] = schema.ToolOutputPart{
+					Type: schema.ToolPartTypeText,
+					Text: textPart + "\n\n产物文件已生成(请用 markdown image 语法在你的回复里展示):\n" +
+						strings.Join(embeddedImages, "\n"),
 				}
 			}
 			return result2, nil

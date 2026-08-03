@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
@@ -109,10 +110,166 @@ func handleRegularMessage(s *sse.Stream, event *adk.AgentEvent, msg *schema.Mess
 		Content:      msg.Content,
 		MultiContent: convertOutputPartsToSSE(msg.AssistantGenMultiContent),
 	}
+	// === 2026-07-30: 工具返回的多模态 part(image/pdf)推给前端 ===
+	//
+	// 背景: local_command 工具检出 PNG / PDF 产物后,会以 schema.ToolOutputPart
+	// 形式塞回 tool message。eino 框架会把这部分内容放到 msg.UserInputMultiContent
+	// (因为 tool 消息作为"user input to model"被组装时,多模态 part 走的就是这个字段)。
+	//
+	// 之前: 这部分只在 LLM 上下文里,前端看不到。
+	// 现在: 我们把它转成 SSE 的 multi_content 字段,前端 addToolResult 流程会在
+	// assistant 消息下追加 <img>/<a>。
+	//
+	// 同时也支持 msg.MultiContent(老式 schema,留兼容)。
+	if msg.Role == schema.Tool {
+		ev.MultiContent = append(ev.MultiContent,
+			convertInputPartsToSSE(msg.UserInputMultiContent)...)
+		ev.MultiContent = append(ev.MultiContent,
+			convertOldMultiContent(convertMultiContentToInputParts(msg.MultiContent))...)
+	}
 	if len(msg.ToolCalls) > 0 {
 		ev.ToolCalls = msg.ToolCalls
 	}
 	return SendSSEEvent(s, ev)
+}
+
+// convertInputPartsToSSE 把 schema.MessageInputPart 转成 SSE MessageOutputPart。
+//
+// 主要把 image_url / file_url 这两类带 base64 或 URL 的 part 暴露给前端。
+func convertInputPartsToSSE(parts []schema.MessageInputPart) []MessageOutputPart {
+	if len(parts) == 0 {
+		return nil
+	}
+	out := make([]MessageOutputPart, 0, len(parts))
+	for _, p := range parts {
+		sp := MessageOutputPart{
+			Type: string(p.Type),
+			Text: p.Text,
+		}
+		if p.Image != nil {
+			if p.Image.Base64Data != nil && p.Image.MIMEType != "" {
+				sp.URL = "data:" + p.Image.MIMEType + ";base64," + *p.Image.Base64Data
+			} else if p.Image.URL != nil {
+				sp.URL = *p.Image.URL
+			}
+			sp.MIME = p.Image.MIMEType
+		} else if p.File != nil {
+			if p.File.Base64Data != nil && p.File.MIMEType != "" {
+				sp.URL = "data:" + p.File.MIMEType + ";base64," + *p.File.Base64Data
+			} else if p.File.URL != nil {
+				sp.URL = *p.File.URL
+			}
+			sp.MIME = p.File.MIMEType
+		}
+		out = append(out, sp)
+	}
+	return out
+}
+
+// convertMultiContentToInputParts 把老的 ChatMessagePart 转成 MessageInputPart。
+//
+// schema.Message.MultiContent(已 deprecated)里也可能在 tool 消息下藏着图片 part;
+// 转换是为了兼容一些早期 eino 路径。
+//
+// 老的 ChatMessageImageURL / ChatMessageFileURL 只含 URL / URI / MIMEType
+// (URL 本身可以是 data:<mime>;base64,...) — 没有专门的 Base64Data 字段,
+// 解析 base64 需要从 URL 字符串里手动抠。
+func convertMultiContentToInputParts(mc []schema.ChatMessagePart) []schema.MessageInputPart {
+	if len(mc) == 0 {
+		return nil
+	}
+	out := make([]schema.MessageInputPart, 0, len(mc))
+	for _, p := range mc {
+		switch p.Type {
+		case schema.ChatMessagePartTypeImageURL:
+			if p.ImageURL == nil {
+				continue
+			}
+			img := &schema.MessageInputImage{}
+			if p.ImageURL.URL != "" {
+				url := p.ImageURL.URL
+				img.URL = &url
+				// 剥 data:image/xxx;base64, 前缀,如有
+				if b64, ok := extractBase64FromDataURL(p.ImageURL.URL); ok {
+					img.Base64Data = &b64
+				}
+			}
+			if p.ImageURL.URI != "" {
+				uri := p.ImageURL.URI
+				img.URL = &uri
+			}
+			img.MIMEType = p.ImageURL.MIMEType
+			out = append(out, schema.MessageInputPart{
+				Type:  p.Type,
+				Image: img,
+			})
+		case schema.ChatMessagePartTypeFileURL:
+			if p.FileURL == nil {
+				continue
+			}
+			f := &schema.MessageInputFile{
+				Name: p.FileURL.Name,
+			}
+			if p.FileURL.URL != "" {
+				url := p.FileURL.URL
+				f.URL = &url
+				if b64, ok := extractBase64FromDataURL(p.FileURL.URL); ok {
+					f.Base64Data = &b64
+				}
+			}
+			if p.FileURL.URI != "" {
+				uri := p.FileURL.URI
+				f.URL = &uri
+			}
+			f.MIMEType = p.FileURL.MIMEType
+			out = append(out, schema.MessageInputPart{
+				Type: p.Type,
+				File: f,
+			})
+		}
+	}
+	return out
+}
+
+// extractBase64FromDataURL 从 "data:image/png;base64,XXXXX" 抽出 base64 body。
+func extractBase64FromDataURL(s string) (string, bool) {
+	const prefix = "base64,"
+	i := strings.Index(s, prefix)
+	if i < 0 {
+		return "", false
+	}
+	return s[i+len(prefix):], true
+}
+
+// convertOldMultiContent 把老版 ChatMessagePart 直接转成 SSE 输出。
+func convertOldMultiContent(parts []schema.MessageInputPart) []MessageOutputPart {
+	if len(parts) == 0 {
+		return nil
+	}
+	out := make([]MessageOutputPart, 0, len(parts))
+	for _, p := range parts {
+		sp := MessageOutputPart{
+			Type: string(p.Type),
+			Text: p.Text,
+		}
+		if p.Image != nil {
+			if p.Image.Base64Data != nil && p.Image.MIMEType != "" {
+				sp.URL = "data:" + p.Image.MIMEType + ";base64," + *p.Image.Base64Data
+			} else if p.Image.URL != nil {
+				sp.URL = *p.Image.URL
+			}
+			sp.MIME = p.Image.MIMEType
+		} else if p.File != nil {
+			if p.File.Base64Data != nil && p.File.MIMEType != "" {
+				sp.URL = "data:" + p.File.MIMEType + ";base64," + *p.File.Base64Data
+			} else if p.File.URL != nil {
+				sp.URL = *p.File.URL
+			}
+			sp.MIME = p.File.MIMEType
+		}
+		out = append(out, sp)
+	}
+	return out
 }
 
 // convertOutputPartsToSSE 把 eino schema.MessageOutputPart 转成 SSE 层的精简结构。
