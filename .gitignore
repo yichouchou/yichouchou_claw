@@ -3,3 +3,4 @@
 workdir/memory/*
 /vendor/
 /workdir/sessions/
+/tmp/

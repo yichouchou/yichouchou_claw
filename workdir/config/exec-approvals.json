@@ -162,6 +162,10 @@
           "description": "Debian 包查询（仅 -l/-s/-L 只读查询），禁止安装/卸载"
         },
         {
+          "bash": "drawio",
+          "description": "Draw.io Desktop CLI（仅 -x 导出 + -f png/svg/pdf + --scale 缩放 + -t 透明背景 + -o 输出路径 + -V/--version），默认输出目录 /tmp/diagrams；root 用户必须加 --no-sandbox 标志（且位置在 -x/-f 之前），禁止写入 /etc /usr /var 系统敏感路径；与 workdir/skills/chat/drawio skill 配套，用于生成 ERD/类图/时序图/流程图/架构图"
+        },
+        {
           "bash": "du",
           "description": "统计目录/文件实际占用磁盘大小，排查大文件占用场景"
         },
