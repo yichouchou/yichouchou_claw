@@ -371,9 +371,11 @@ func IsDangerousWithAgent(ctx context.Context, agentName string, cmd string) (bo
 	}
 
 	// 5) 白名单检查（per-agent）：命令不在白名单时，需要 WhitelistAuth 授权才能放行。
-	//    注意：absolute path（"/" in cmd）走路径直跳分支，不做白名单校验
-	//    （这是历史行为，保留兼容性）。
-	if !isCommandAllowed(agentName, cmd) && !strings.Contains(cmd, "/") {
+	//    注意：absolute path 不再跳过白名单检查（2026-08-04 修复）。
+	//    原因: 之前用 `!strings.Contains(cmd, "/")` 跳过, 但 heredoc 写文件
+	//    (cat > /tmp/... <<'EOF' ... body ... EOF) 必含 "/", isCommandAllowed
+	//    会用 cmdName (即 "cat") 检查白名单, 通过则放行, 不需要再次限制。
+	if !isCommandAllowed(agentName, cmd) {
 		cmdName := strings.Fields(cmd)[0]
 		// WhitelistAuth=true 且（未指定具体命令 OR 指定的就是这条命令）→ 放行
 		if auth.WhitelistAuth && (auth.WhitelistCmd == "" || auth.WhitelistCmd == cmdName) {
@@ -597,11 +599,99 @@ func hasShellLogic(cmd string) bool {
 //
 // 引号处理：与 hasShellLogic 保持一致（单/双引号内的 ||/&&/; 视为字面量）。
 // 这意味着 `echo "a||b"` 不会被拆。
+// isHeredocTagChar 判断 c 是否是合法 heredoc 标签字符 (字母 / 数字 / 下划线 / 连字符)。
+//
+// 常见 heredoc 标签:
+//   - EOF
+//   - DRAWIO_XML
+//   - XML_EOF
+//   - SQL_END
+//
+// 不允许特殊字符 (避免与 shell 操作符冲突)。
+func isHeredocTagChar(c byte) bool {
+	return (c >= 'A' && c <= 'Z') ||
+		(c >= 'a' && c <= 'z') ||
+		(c >= '0' && c <= '9') ||
+		c == '_' || c == '-'
+}
+
 func splitByShellLogic(cmd string) []string {
 	var result []string
 	var current bytes.Buffer
 	var i int
 	for i < len(cmd) {
+		// ===== 2026-08-04 修复: 识别 heredoc (<<EOF / <<'EOF' / <<-EOF) =====
+		// 把整个 heredoc (含 body) 视为单 stage 的延续, body 内的内容
+		// 不会被当成新 stage。修复 sandbox 误把 'html=1' / 'whiteSpace=wrap' /
+		// 'rounded=1' 等 drawio XML 属性识别为"未授权命令名"。
+		//
+		// 匹配规则: <<[-]?['"]?TAG['"]? (TAG = EOF / DRAWIO_XML 等标识符)
+		// body 从下一行开始, 直到 TAG 单独一行为止。
+		if i+1 < len(cmd) && cmd[i] == '<' && cmd[i+1] == '<' {
+			// 解析 << 后, 提取 TAG
+			j := i + 2
+			// 跳过可选空白 (LLM 经常写 "<< 'EOF'" 而非 "<<'EOF'", 2026-08-04 修复)
+			for j < len(cmd) && (cmd[j] == ' ' || cmd[j] == '\t') {
+				j++
+			}
+			// 跳过可选 '-' (<<-)
+			if j < len(cmd) && cmd[j] == '-' {
+				j++
+				// 跳过分隔空白 (<<- EOF)
+				for j < len(cmd) && (cmd[j] == ' ' || cmd[j] == '\t') {
+					j++
+				}
+			}
+			// 跳过可选引号
+			if j < len(cmd) && (cmd[j] == '\'' || cmd[j] == '"') {
+				j++
+			}
+			tagBegin := j
+			for j < len(cmd) && isHeredocTagChar(cmd[j]) {
+				j++
+			}
+			tagEnd := j
+			// 跳过尾部引号
+			if j < len(cmd) && (cmd[j] == '\'' || cmd[j] == '"') {
+				j++
+			}
+			// 验证: TAG 至少 1 字符
+			if tagEnd > tagBegin {
+				tag := cmd[tagBegin:tagEnd]
+				// 把 <<TAG 自身 (含 'EOF' 等) 写到 current
+				current.WriteString(cmd[i:j])
+				// 把 <<TAG 后续到行尾的内容 (e.g. 'EOF' 后可能跟 \n) 写到 current
+				for j < len(cmd) && cmd[j] != '\n' {
+					current.WriteByte(cmd[j])
+					j++
+				}
+				if j < len(cmd) {
+					current.WriteByte(cmd[j]) // 写入 \n
+					j++
+				}
+				// 现在 body 阶段: 把所有 body 行 (直到单独一行的 TAG) 写到 current
+				for j < len(cmd) {
+					// 找下一行
+					lineStart := j
+					for j < len(cmd) && cmd[j] != '\n' {
+						j++
+					}
+					line := strings.TrimSpace(cmd[lineStart:j])
+					// 把这行原样写到 current (含换行)
+					current.WriteString(cmd[lineStart:j])
+					if j < len(cmd) {
+						current.WriteByte(cmd[j]) // \n
+						j++
+					}
+					if line == tag {
+						// 找到结束行, heredoc 完整
+						break
+					}
+				}
+				i = j
+				continue
+			}
+		}
 		// 单引号: 跳过整段
 		if cmd[i] == '\'' {
 			current.WriteByte(cmd[i])

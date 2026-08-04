@@ -555,7 +555,116 @@
             font-size: 12px;
             text-decoration: none;
         }
-        /* 输入区 */
+
+        /* === 启动时产物面板 (2026-08-04 新增) === */
+        /* page reload 后从 /api/attachment/list 拉的图片产物, sticky 显示在聊天顶部 */
+        .startup-attachment-panel {
+            margin: 8px 16px;
+            padding: 12px;
+            background: #fef3c7;
+            border: 1px solid #f59e0b;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(245, 158, 11, 0.15);
+        }
+        .sap-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+            font-weight: 600;
+            color: #78350f;
+            font-size: 14px;
+        }
+        .sap-close {
+            background: none;
+            border: none;
+            font-size: 20px;
+            cursor: pointer;
+            color: #78350f;
+            padding: 0 8px;
+            line-height: 1;
+        }
+        .sap-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 12px;
+        }
+        .sap-card {
+            background: white;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            overflow: hidden;
+            transition: transform 0.15s, box-shadow 0.15s;
+        }
+        .sap-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+        .sap-card a img {
+            width: 100%;
+            height: 140px;
+            object-fit: cover;
+            display: block;
+            cursor: zoom-in;
+        }
+        .sap-meta {
+            padding: 8px 10px;
+        }
+        .sap-name {
+            font-weight: 600;
+            font-size: 13px;
+            color: #111827;
+            word-break: break-all;
+            margin-bottom: 4px;
+        }
+        .sap-info {
+            font-size: 11px;
+            color: #6b7280;
+            margin-bottom: 6px;
+        }
+        .sap-actions {
+            display: flex;
+            gap: 6px;
+        }
+        .sap-download {
+            flex: 1;
+            padding: 4px 8px;
+            background: #3b82f6;
+            color: white;
+            border-radius: 4px;
+            font-size: 12px;
+            text-decoration: none;
+            text-align: center;
+        }
+        .sap-download:hover { background: #2563eb; }
+        .sap-copy {
+            padding: 4px 8px;
+            background: #f3f4f6;
+            color: #374151;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .sap-copy:hover { background: #e5e7eb; }
+
+        /* 附件下载链接 (attachment-download-link) 共用样式 */
+        .attachment-download-link {
+            display: inline-block;
+            padding: 2px 8px;
+            background: #3b82f6;
+            color: white;
+            border-radius: 4px;
+            font-size: 12px;
+            text-decoration: none;
+        }
+        .attachment-download-link:hover { background: #2563eb; }
+        .attachment-download-meta {
+            background: #6b7280;
+        }
+        .attachment-download-meta:hover { background: #4b5563; }
+
+        /* === 输入区 === */
         .input-area {
             padding: 16px 24px 24px 24px;
             background: #ffffff;
@@ -944,6 +1053,26 @@
                 case 'file_url':
                 case 'ChatMessagePartTypeFileURL':
                     if (dataUrl) {
+                        // === 2026-08-03 Codex CLI 模式: 同源 /api/attachment/... 且 mime 是 image/* → 走 <img> ===
+                        // 因为后端用 Content-Disposition: inline 渲染, 浏览器直接显示图;
+                        // 不要再走 file_url 跳转或下载。
+                        const isSameOriginAttach = dataUrl.startsWith('/api/attachment/');
+                        const isImageMime = part.mime && part.mime.startsWith('image/');
+                        if (isSameOriginAttach && isImageMime) {
+                            const img = document.createElement('img');
+                            img.src = dataUrl;
+                            img.alt = part.name || 'image';
+                            img.loading = 'lazy';
+                            div.appendChild(img);
+                            if (part.mime) {
+                                const cap = document.createElement('div');
+                                cap.className = 'mm-caption';
+                                cap.textContent = '🖼️ ' + part.mime;
+                                div.appendChild(cap);
+                            }
+                            break;
+                        }
+                        // 兜底: 老的 data: URL 或外链 URL 走 <a>
                         const a = document.createElement('a');
                         a.href = dataUrl;
                         // data: URL 强制触发下载而不是跳转
@@ -989,6 +1118,164 @@
             scrollToBottom();
         }
 
+        // === 2026-08-03 IPC 通道: 渲染 attachment event ===
+        // 这是新型 SSE event: data.attachment = {type, url, mime_type, size, name, ...}
+        // LLM 上下文**完全不接触** URL,前端直接从 IPC 通道拿 URL 渲染。
+        //
+        // 渲染逻辑:
+        //   - image/* → <img src=URL>
+        //   - audio/* → <audio controls src=URL>
+        //   - video/* → <video controls src=URL>
+        //   - file/* (download) → <a href=URL> 下载链接
+        // === 2026-08-04: standalone attachment 容器 ===
+        //
+        // 用途: 当 attachment event 在 message event 之前到达时 (例如 LocalCommandAgent
+        //       `ls` 返回带 attachment, 或者 LLM 文本路径被 backfill 推送), 不再 silently
+        //       drop; 而是建一个"产物卡片", 用户立刻能看到图 + 下载按钮。
+        //
+        // 视觉: 类似 assistant message, 但:
+        //   - header 写 "📎 工具产物" + 文件名
+        //   - body 只有附件渲染 (无文本流, 无 thinking)
+        //   - 后续 assistant message event 会另起一个常规 message 容器
+        function ensureStandaloneAttachmentContainer(ev) {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'message-wrapper standalone-attachment';
+            wrapper.innerHTML = `
+                <div class="message">
+                    <div class="avatar assistant-avatar">YC</div>
+                    <div class="message-body">
+                        <div class="message-header">
+                            <span>yichouchou_claw</span>
+                            <span class="agent-tag">产物附件</span>
+                        </div>
+                        <div class="message-content"></div>
+                    </div>
+                </div>
+            `;
+            chatContainer.appendChild(wrapper);
+            currentAssistantMsg = wrapper;
+            currentContentEl = wrapper.querySelector('.message-content');
+            currentAgentTag = wrapper.querySelector('.agent-tag');
+            scrollToBottom();
+
+            // 把当前 ev 渲染到这个新建容器里
+            const body = wrapper.querySelector('.message-body');
+            const contentEl = wrapper.querySelector('.message-content');
+            const div = document.createElement('div');
+            div.className = 'mm-part mm-ipc-attachment mm-attachment-' + ev.type;
+            buildAttachmentInner(div, ev);
+            contentEl.appendChild(div);
+            scrollToBottom();
+        }
+
+        // === 2026-08-04: 把 attachment 内层元素构造抽出来, 共用 ===
+        function buildAttachmentInner(div, ev) {
+            const url = ev.url;
+            switch (ev.type) {
+                case 'image':
+                    {
+                        const img = document.createElement('img');
+                        img.src = url;
+                        img.alt = ev.name || 'image';
+                        img.loading = 'lazy';
+                        img.style.maxWidth = '100%';
+                        img.style.cursor = 'zoom-in';
+                        img.onclick = () => window.open(url, '_blank');
+                        div.appendChild(img);
+                    }
+                    break;
+                case 'audio':
+                    {
+                        const audio = document.createElement('audio');
+                        audio.src = url;
+                        audio.controls = true;
+                        div.appendChild(audio);
+                    }
+                    break;
+                case 'video':
+                    {
+                        const video = document.createElement('video');
+                        video.src = url;
+                        video.controls = true;
+                        div.appendChild(video);
+                    }
+                    break;
+                case 'file':
+                default:
+                    {
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = ev.name || 'attachment';
+                        a.target = '_blank';
+                        a.textContent = '⬇ 下载 ' + (ev.name || '附件');
+                        a.className = 'attachment-download-link';
+                        div.appendChild(a);
+                    }
+                    break;
+            }
+            // 任何类型都附加 "下载" 链接 (image 也行, 右键另存 vs 直接给按钮)
+            if (ev.type === 'image' || ev.type === 'audio' || ev.type === 'video') {
+                const dl = document.createElement('a');
+                dl.href = url;
+                dl.download = ev.name || 'attachment';
+                dl.textContent = '⬇ ' + (ev.name || '下载');
+                dl.className = 'attachment-download-link attachment-download-meta';
+                dl.style.marginLeft = '8px';
+                div.appendChild(dl);
+            }
+            // mime + size caption
+            if (ev.mime_type) {
+                const cap = document.createElement('div');
+                cap.className = 'mm-caption';
+                cap.textContent = (ev.type === 'image' ? '🖼 ' : ev.type === 'audio' ? '🔊 ' : ev.type === 'video' ? '🎬 ' : '📎 ')
+                    + ev.mime_type + (ev.size ? ' (' + formatSize(ev.size) + ')' : '');
+                div.appendChild(cap);
+            }
+        }
+
+        function renderAttachmentEvent(ev) {
+            if (!ev || !ev.url) return;
+
+            // === 2026-08-04: 不再 silently drop ===
+            //
+            // 场景: LocalCommandAgent 调完 `ls` / `cat` 等只读命令, **或者** LLM
+            //       输出文字直接引用了历史产物路径 (backfillArtifactAttachments 推送)
+            //       → attachment event 可能比第一个 assistant message event 先到。
+            //       之前 if (!currentAssistantMsg) return 直接丢了 — 用户看到的就是
+            //       "对话内容正常, 但图没渲染"。
+            //
+            // 修复: 没 currentAssistantMsg 时, 主动建一个 "产物容器" (类似 assistant message,
+            //       但只显示附件 + 一个简短说明)。后续 assistant message event 来时正常
+            //       再开新的 — 不会冲突, 两个 DOM 节点并列。
+            if (!currentAssistantMsg) {
+                ensureStandaloneAttachmentContainer(ev);
+                return;
+            }
+            const body = currentAssistantMsg.querySelector('.message-body');
+            if (!body) {
+                ensureStandaloneAttachmentContainer(ev);
+                return;
+            }
+            const div = document.createElement('div');
+            div.className = 'mm-part mm-ipc-attachment mm-attachment-' + ev.type;
+
+            // URL 优先用相对 URL (前端同源 fetch),absolute_url 备用
+            // 通常 relative URL 就行 → 浏览器 fetch /api/attachment/<token>/... → 后端 serve 文件
+            const url = ev.url;
+
+            // === 2026-08-04: 共用 buildAttachmentInner, 把 attachment 内层元素构造抽出 ===
+            buildAttachmentInner(div, ev);
+            body.appendChild(div);
+            scrollToBottom();
+        }
+
+        // 格式化字节大小 (2026-08-03 新增)
+        function formatSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+        }
+
         function handleKeyDown(event) {
             if (event.key === 'Enter' && !event.shiftKey) {
                 event.preventDefault();
@@ -1004,7 +1291,74 @@
             // 新开一个会话：清掉旧的 session_id，下次请求让服务端再分配。
             sessionId = '';
             localStorage.removeItem('eino_session_id');
+            // 加载已有的产物面板 (page reload 兜底, 不依赖 SSE push)
+            loadStartupAttachmentPanel();
         }
+
+        // === 2026-08-04: 启动时拉取已有产物 (page reload 兜底) ===
+        //
+        // 触发场景: page reload / 浏览器清缓存 / SSE push 没收到。
+        //   此时历史产物在 attachment.Store 里, 但前端 chatContainer 是空的。
+        //   主动 GET /api/attachment/list → 拿到 token URL 列表 → 渲染到
+        //   "产物面板" sticky 区域(始终在聊天底部)。
+        //
+        // 关键: 这个面板独立于 message 流, 即便 SSE message 全部失败,
+        //       用户也能立刻看到图 + 下载按钮。
+        function loadStartupAttachmentPanel() {
+            fetch('/api/attachment/list')
+                .then(r => r.ok ? r.json() : null)
+                .then(data => {
+                    if (!data || !Array.isArray(data.attachments)) return;
+                    // 只显示图片类
+                    const images = data.attachments.filter(a => (a.mime || '').startsWith('image/'));
+                    if (images.length === 0) return;
+                    renderStartupPanel(images);
+                })
+                .catch(err => console.warn('[startup panel] fetch failed:', err));
+        }
+
+        function renderStartupPanel(attachments) {
+            // 避免重复
+            const existing = document.getElementById('startup-attachment-panel');
+            if (existing) existing.remove();
+
+            const panel = document.createElement('div');
+            panel.id = 'startup-attachment-panel';
+            panel.className = 'startup-attachment-panel';
+            panel.innerHTML = `
+                <div class="sap-header">
+                    <span>📎 已注册的产物 (${attachments.length})</span>
+                    <button class="sap-close" onclick="document.getElementById('startup-attachment-panel').remove()">×</button>
+                </div>
+                <div class="sap-grid"></div>
+            `;
+            const grid = panel.querySelector('.sap-grid');
+            attachments.forEach(att => {
+                const card = document.createElement('div');
+                card.className = 'sap-card';
+                const sizeStr = att.size ? formatSize(att.size) : '';
+                card.innerHTML = `
+                    <a href="${att.url}" target="_blank" title="点击查看大图 / 下载">
+                        <img src="${att.url}" alt="${att.name || 'image'}" loading="lazy" />
+                    </a>
+                    <div class="sap-meta">
+                        <div class="sap-name">${att.name || ''}</div>
+                        <div class="sap-info">${att.mime || ''} ${sizeStr}</div>
+                        <div class="sap-actions">
+                            <a href="${att.url}" download="${att.name || 'attachment'}" class="sap-download">⬇ 下载</a>
+                            <button class="sap-copy" onclick="navigator.clipboard.writeText('${att.url}').then(()=>this.textContent='✓ 已复制').catch(()=>{})">复制 URL</button>
+                        </div>
+                    </div>
+                `;
+                grid.appendChild(card);
+            });
+            // 插到 chatContainer 顶部之前
+            chatContainer.insertBefore(panel, chatContainer.firstChild);
+            scrollToBottom();
+        }
+
+        // page load 时主动拉一次 (在脚本末尾初始化)
+        loadStartupAttachmentPanel();
 
         function rememberSession(id) {
             if (!id) return;
@@ -1336,6 +1690,26 @@
                     }
                     // === 多模态 part 渲染（2026-07-29 新增） ===
                     if (Array.isArray(data.multi_content) && data.multi_content.length > 0) {
+                        data.multi_content.forEach(p => appendMultiPart(p));
+                    }
+                    break;
+
+                case 'attachment':
+                    // === 2026-08-03 IPC 通道模式: 工具产物附件 URL 推前端 ===
+                    // LLM 上下文**完全不接触** ev,只产生 attachment event
+                    // 前端收到 attachment event 渲染 <img>/<video>/<audio>/<a>
+                    if (data.attachment) {
+                        // 如果还没有 assistant message 容器，先建一个
+                        if (!currentAssistantMsg) {
+                            startAssistantMessage(agentName || 'RouterAgent');
+                        }
+                        renderAttachmentEvent(data.attachment);
+                    }
+                    // 兼容 2026-08-03 之前的 SSE attachment event (multi_content 形式)
+                    else if (Array.isArray(data.multi_content) && data.multi_content.length > 0) {
+                        if (!currentAssistantMsg) {
+                            startAssistantMessage(agentName || 'RouterAgent');
+                        }
                         data.multi_content.forEach(p => appendMultiPart(p));
                     }
                     break;

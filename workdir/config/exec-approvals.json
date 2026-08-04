@@ -146,6 +146,10 @@
           "description": "查看内核启动、硬件报错日志，服务器异常排查工具"
         },
         {
+          "bash": "dot",
+          "description": "graphviz dot（-V/-?/--version/T<fmt> 渲染到 stdout 或 -o 写到 /tmp/），纯文本图表描述工具，常用于 drawio 渲染失败时的 fallback"
+        },
+        {
           "bash": "dmidecode",
           "description": "读取 DMI/SMBIOS 硬件信息，查看 CPU/内存/主板/BIOS 配置"
         },
@@ -163,7 +167,7 @@
         },
         {
           "bash": "drawio",
-          "description": "Draw.io Desktop CLI（仅 -x 导出 + -f png/svg/pdf + --scale 缩放 + -t 透明背景 + -o 输出路径 + -V/--version），默认输出目录 /tmp/diagrams；root 用户必须加 --no-sandbox 标志（且位置在 -x/-f 之前），禁止写入 /etc /usr /var 系统敏感路径；与 workdir/skills/chat/drawio skill 配套，用于生成 ERD/类图/时序图/流程图/架构图"
+          "description": "Draw.io Desktop CLI（仅 -x 导出 + -f png/svg/pdf + --scale 缩放 + -t 透明背景 + -o 输出路径 + -V/--version），默认输出目录 /tmp/diagrams；root 用户必须加 --no-sandbox 标志（且位置在 -x/-f 之前），禁止写入 /etc /usr /var 系统敏感路径；与 workdir/skills/localcommand/drawio skill 配套，用于生成 ERD/类图/时序图/流程图/架构图"
         },
         {
           "bash": "du",
@@ -454,6 +458,14 @@
           "description": "Meson 配置工具（--version/--help），仅限工作目录"
         },
         {
+          "bash": "mermaid",
+          "description": "Mermaid 图表 CLI（mermaid --version / mmdc --version / -i 输入 -o 输出 PNG/SVG），与 drawio 互为图表渲染 fallback；输出仅限 /tmp/ 目录"
+        },
+        {
+          "bash": "mmdc",
+          "description": "@mermaid-js/mermaid-cli（mmdc -i xxx.mmd -o /tmp/xxx.png），与 drawio 互为图表渲染 fallback"
+        },
+        {
           "bash": "mkdir",
           "description": "创建空文件夹，仅允许在沙箱工作目录内新建目录"
         },
@@ -596,6 +608,10 @@
         {
           "bash": "pkill",
           "description": "按名称发送信号给进程，仅允许 SIGTERM/SIGINFO，禁止 SIGKILL 系统关键进程"
+        },
+        {
+          "bash": "plantuml",
+          "description": "PlantUML 图表 CLI（plantuml -tpng -o /tmp/ xxx.puml），与 drawio 互为图表渲染 fallback"
         },
         {
           "bash": "poetry",
@@ -872,6 +888,10 @@
         {
           "bash": "xh",
           "description": "Rust 写的 httpie 替代品（仅 GET / --version）"
+        },
+        {
+          "bash": "xvfb-run",
+          "description": "虚拟 X server 包装器（xvfb-run -a <cmd>），drawio/mermaid 等 GUI 渲染工具在没有 X 环境的沙箱中渲染时必需"
         },
         {
           "bash": "xxd",

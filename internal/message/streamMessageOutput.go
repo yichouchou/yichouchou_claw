@@ -33,6 +33,42 @@ type SSEEvent struct {
 	Error        string              `json:"error,omitempty"`
 	MultiContent []MessageOutputPart `json:"multi_content,omitempty"`
 	Files        []MessageOutputFile `json:"files,omitempty"`
+	// Attachment 是 2026-08-03 IPC 通道新增的"工具产物附件事件"。
+	// 字段是 message.MessageAttachmentEvent 的内部类型,前端按 type 渲染 (<img>/<video>/<audio>/<a>)。
+	// 与 LLM 上下文零耦合:LLM 推理不会看到 URL/base64,只产生附件 event。
+	//
+	// 2026-08-04 复盘: 必须用 **指针** 类型, 不能用值类型 — Go json marshaller
+	//   对值类型 struct 不识别 omitempty, 即便字段全零, 也会序列化成
+	//   `"attachment":{"type":"","url":"","mime_type":"","size":0,"name":""}`,
+	//   污染每一个 SSE event, 让前端在 stream_chunk 上也看到 `data.attachment` 存在,
+	//   干扰 routing / 触发 `if (data.attachment) renderAttachmentEvent(data.attachment)`
+	//   误进入 attachment 分支 (data.attachment.url 是空字符串, 触发 `if (!ev.url) return`,
+	//   但**仍消耗**了 stream_chunk 的渲染机会 — 因为 case 顺序是 'attachment' 先于
+	//   'stream_chunk' 都没匹配, 后续 message 也跟着丢)。
+	//
+	//   修复: 改为 `*AttachmentEvent`, nil 时不序列化。
+	Attachment *AttachmentEvent `json:"attachment,omitempty"`
+}
+
+// AttachmentEvent 推给前端的附件事件 (2026-08-03 IPC 模式新增)。
+//
+// 关键:这是 SSE 事件类型,前端直接接收。前端按 type 渲染:
+//   - "image" → <img src=URL>
+//   - "audio" → <audio controls src=URL>
+//   - "video" → <video controls src=URL>
+//   - "file"  → <a href=URL> 下载链接
+//
+// model UUID vs 业务:URL 是 relative path(/api/attachment/<token>/<name>),
+//前端直接 fetch 同源,不需要跨域配置。
+type AttachmentEvent struct {
+	Type         string `json:"type"`                    // image / audio / video / file
+	URL          string `json:"url"`                     // /api/attachment/<token>/<name>
+	AbsoluteURL  string `json:"absolute_url,omitempty"`  // 备用:http://host:port/... 完整 URL
+	MIMEType     string `json:"mime_type"`
+	Size         int64  `json:"size"`
+	Name         string `json:"name"`
+	OriginalPath string `json:"original_path,omitempty"`
+	Source       string `json:"source,omitempty"`         // 哪类工具产出的("local_command")
 }
 
 // MessageOutputPart 是 SSE 事件的多模态 part（精简版 schema.MessageOutputPart）。
