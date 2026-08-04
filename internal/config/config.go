@@ -102,6 +102,11 @@ type ExecApprovals struct {
 type ServerConfig struct {
 	// Host 监听地址，如 ":28080"
 	Host string `yaml:"host"`
+	// PublicBaseURL 暴露给 LLM 的公开 base URL(2026-08-03 新增; Ark 校验 image_url 必须是 http(s)://...).
+	//   例: "http://localhost:28080" (开发) / "https://chat.example.com" (生产)
+	//   末尾不要斜杠。如果为空,LLM 看到的 URL 仍是相对路径,Ark 会拒绝(non-data URL)。
+	//   浏览器内部 fetch 用相对路径,不受这个配置影响。
+	PublicBaseURL string `yaml:"public_base_url"`
 }
 
 // OpenAIConfig OpenAI 兼容协议配置。

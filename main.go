@@ -23,12 +23,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -40,7 +42,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/hertz-contrib/sse"
 
+	"github.com/yichouchou/yichouchou_claw/internal/attachment"
 	"github.com/yichouchou/yichouchou_claw/internal/config"
+	"github.com/yichouchou/yichouchou_claw/internal/ipc"
 	"github.com/yichouchou/yichouchou_claw/internal/localcommand"
 	"github.com/yichouchou/yichouchou_claw/internal/memory"
 	"github.com/yichouchou/yichouchou_claw/internal/message"
@@ -51,6 +55,142 @@ import (
 
 //go:embed index.html
 var staticFiles embed.FS
+
+// inferPublicBaseURL 推断本机服务暴露给 Ark 的 base URL (2026-08-03 新增)。
+//
+// 关键背景:
+//
+//	Ark 服务端(2026-08-03 验证)拒绝 "localhost" / "127.0.0.0/8" 形式 URL,
+//	会以 "disallowed url" 报错(防 SSRF)。
+//	所以不能用 "http://localhost:28080" 之类的形式生成 absoluteURL 给 LLM。
+//
+// 推断策略:
+//  1. 解析 listenHost 得到端口(:28080 → 28080)
+//  2. 走 detectOutboundIPv4() 拿本机 IPv4 (172.25.50.9 之类)
+//  3. 拼成 http://<ipv4>:<port>
+//  4. 兜底: 如果拿不到 IPv4,回退 localhost(打 warning 日志提示)
+//
+// 注意: 如果用户在 application.yml 显式配 public_base_url(生产环境用域名),
+//
+//	这个函数不会被调用,用户的配置优先。
+func inferPublicBaseURL(listenHost string) string {
+	port := extractPort(listenHost)
+	if port == "" {
+		port = "8080"
+	}
+
+	ipv4 := detectOutboundIPv4()
+	if ipv4 != "" {
+		return fmt.Sprintf("http://%s:%s", ipv4, port)
+	}
+
+	// 兜底: localhost + 警告
+	log.Printf("[main] WARN: detectOutboundIPv4 没有返回有效 IPv4,回退到 localhost。" +
+		"Ark 大概率会拒绝 localhost URL,导致 image_url 报错。" +
+		"建议在 application.yml 里显式配 public_base_url。")
+	if strings.HasPrefix(listenHost, ":") {
+		return "http://localhost" + listenHost
+	}
+	if listenHost == "" {
+		return "http://localhost:8080"
+	}
+	return "http://" + listenHost
+}
+
+// extractPort 从 listenHost 提取端口号。
+//
+//	":28080" → "28080"
+//	"0.0.0.0:28080" → "28080"
+//	"" → ""
+//	"127.0.0.1" → ""
+func extractPort(listenHost string) string {
+	if listenHost == "" {
+		return ""
+	}
+	_, port, err := net.SplitHostPort(listenHost)
+	if err != nil {
+		// 没有端口(如 "0.0.0.0" 或 "127.0.0.1")
+		return ""
+	}
+	return port
+}
+
+// detectOutboundIPv4 探测本机可对外的 IPv4 地址 (2026-08-03 新增)。
+//
+// 策略:
+//  1. 遍历 net.Interfaces() 找到第一个非 loopback、状态 UP 的 IPv4 接口
+//  2. 优先级: eth0 / en0(wlan) > 其他 (按接口名)
+//  3. 拿不到时返回 ""
+//
+// 为什么不用 127.0.0.1: Ark disallow localhost / 127.0.0.0/8
+// 为什么不用 0.0.0.0: 浏览器侧 0.0.0.0 不能作为 host,且 Ark 也可能拒绝
+func detectOutboundIPv4() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		log.Printf("[main] detectOutboundIPv4: net.Interfaces failed: %v", err)
+		return ""
+	}
+
+	// 优先级: 物理网卡 > 虚拟网卡
+	preferredPrefixes := []string{"eth", "en", "wl", "br-"} // eth0/en0/wlan0/br-docker
+	var fallback []ifaceAddr
+
+	for _, iface := range ifaces {
+		// 跳过 loopback / down / 点对点
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		ifaceAddrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range ifaceAddrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			ip4 := ip.To4()
+			if ip4 == nil {
+				continue // 跳过 IPv6
+			}
+			if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue
+			}
+
+			if hasPrefix(iface.Name, preferredPrefixes) {
+				return ip4.String() // 立即返回
+			}
+			fallback = append(fallback, ifaceAddr{ip: ip4.String(), name: iface.Name})
+		}
+	}
+
+	// 兜底: 用 fallback 第一个
+	if len(fallback) > 0 {
+		return fallback[0].ip
+	}
+	return ""
+}
+
+type ifaceAddr struct {
+	ip   string
+	name string
+}
+
+func hasPrefix(name string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
 
 func main() {
 	// 解析 cwd：所有 workdir 相对路径都以 cwd 为基准。
@@ -265,6 +405,48 @@ func main() {
 	})
 
 	// =====================================================================
+	// Attachment Store (2026-08-03 新增;Codex CLI view_image 模式)
+	// =====================================================================
+	// 本地磁盘存储 + HTTP 静态服务,前端 /api/attachment/:token/*filepath 直接 fetch。
+	// 工具产物(mermaid 输出 /tmp/flow.png) → 复制到 store → 返回 URL 字符串
+	//   LLM 上下文看到 URL(不接触 base64,节省 token)
+	//   浏览器 <img src=URL> 自动 fetch,hertz SendFile 零拷贝
+	// =====================================================================
+	attachStore, err := attachment.NewStore("")
+	if err != nil {
+		log.Fatalf("[main] failed to init attachment store: %v", err)
+	}
+	defer attachStore.Close()
+
+	// === 2026-08-03: 配置 PublicBaseURL 给 LLM 看 (Ark 校验 image_url) ===
+	// 优先级: application.yml > 推断 IPv4 + Host port
+	//   1. 用户在 application.yml 里显式配 public_base_url (生产 HTTPS 用)
+	//   2. 推断: 本机 IPv4 (e.g. 172.25.50.9) + Host port (e.g. :28080)
+	//      原因: Ark 服务端 disallow "localhost" / "127.0.0.0/8" 的 URL(防 SSRF),
+	//      自动检测本机 IPv4 地址作为 host 是最稳妥的方式
+	//   3. 兜底: localhost (警告:Ark 大概率会拒绝,会触发 400 bad_request)
+	publicBaseURL := appCfg.Server.PublicBaseURL
+	if publicBaseURL == "" {
+		publicBaseURL = inferPublicBaseURL(appCfg.Server.Host)
+	}
+	attachStore.SetBaseURL(publicBaseURL)
+	log.Printf("[main] attachment store at %s, HTTP prefix=%s/*, public_base=%s",
+		attachStore.Root(), attachment.PublicURLPrefix, publicBaseURL)
+
+	// 启动 GC goroutine 每小时清理一次过期附件(>24h)。
+	// 进程退出时 defer attachStore.Close() 一次性清理全部。
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			cleaned := attachStore.GC(attachment.DefaultTTL)
+			if cleaned > 0 {
+				log.Printf("[main] attachment GC cleaned %d", cleaned)
+			}
+		}
+	}()
+
+	// =====================================================================
 	// HTTP 服务（监听地址从配置读取）
 	// =====================================================================
 	h := server.Default(server.WithHostPorts(appCfg.Server.Host))
@@ -291,10 +473,47 @@ func main() {
 		c.Data(consts.StatusOK, "text/html; charset=utf-8", data)
 	})
 
-	h.GET("/chat", handleChatWrapper(ctx, runner, store, true))
+	h.GET("/chat", handleChatWrapper(ctx, runner, store, attachStore, true))
 	// === 多模态修复(2026-07-29): 支持 POST + JSON body ===
 	// 旧 GET 把多模态放在 header/base64 中不可靠,改成 POST + body。
-	h.POST("/chat", handleChatWrapper(ctx, runner, store, false))
+	h.POST("/chat", handleChatWrapper(ctx, runner, store, attachStore, false))
+
+	// === 附件静态服务 (2026-08-03 新增;Codex CLI view_image 模式) ===
+	// 工具产物(mermaid/sketch/png)经 attachment.Store 注册后挂在路由下,
+	// 浏览器 <img src="/api/attachment/<token>/<name>"> 直接 fetch 真实文件。
+	// 注意: 路径用 /*filepath 而不是 /:token/...,hertz 路由匹配更宽松。
+	h.GET(attachment.PublicURLPrefix+"/*filepath", func(ctx context.Context, c *app.RequestContext) {
+		attachStore.ServeHTTP(ctx, c)
+	})
+
+	// === 附件列表端点 (2026-08-04 新增) ===
+	//
+	// 用途: 前端 page reload 后 / 第一次打开, 主动 GET /api/attachment/list
+	// 拿到 Store 里所有已知附件, 渲染到"产物面板"。
+	// 之前只有 SSE push 路径, page reload 后历史产物丢失; 现在 HTTP GET 兜底。
+	//
+	// 安全考虑: list 返回 token URL, 前端 fetch /api/attachment/<token>/<name>
+	//          仍然要 token 匹配 (Store.Lookup), 所以"列出 token"不算泄漏。
+	h.GET(attachment.PublicURLPrefix+"/list", func(ctx context.Context, c *app.RequestContext) {
+		all := attachStore.ListAll()
+		// 简化字段, 不暴露磁盘绝对路径(避免前端缓存)
+		out := make([]map[string]interface{}, 0, len(all))
+		for _, att := range all {
+			out = append(out, map[string]interface{}{
+				"token":         att.Token,
+				"name":          att.Name,
+				"url":           "/api/attachment/" + att.Token + "/" + att.Name,
+				"mime":          att.Mime,
+				"size":          att.Size,
+				"original_path": att.Original,
+				"created_at":    att.CreatedAt.Unix(),
+			})
+		}
+		c.JSON(consts.StatusOK, map[string]interface{}{
+			"attachments": out,
+			"count":       len(out),
+		})
+	})
 
 	// === 多模态文件上传端点（2026-07-29 新增）===
 	// 前端 fetch('/upload', FormData) 走这里。
@@ -377,7 +596,7 @@ func applyRefinerConfig(dst *memory.RefinerConfig, src config.RefinerConfig) {
 //	它在 URL 里是 query 分隔符,所以 hertz 拒绝注册。但浏览器收到的"旧前端
 //	拼错的 URL"是 /chat&session_id=xxx,hertz 看到的 path 是 "chat&session_id=xxx"
 //	没法在注册阶段处理,所以我们在 dispatcher 阶段做 rewrite。
-func handleChatWrapper(ctx context.Context, runner *adk.Runner, store *session.Store, _ bool) app.HandlerFunc {
+func handleChatWrapper(ctx context.Context, runner *adk.Runner, store *session.Store, attachStore *attachment.Store, _ bool) app.HandlerFunc {
 	return func(c context.Context, rc *app.RequestContext) {
 		// === 兜底 rewrite: /chat&xxx → /chat?xxx ===
 		// hertz 已经按 path 段匹配了 "/chat";path 里 & 后面的部分在 hertz
@@ -389,7 +608,7 @@ func handleChatWrapper(ctx context.Context, runner *adk.Runner, store *session.S
 			rc.Request.SetRequestURI(rebuilt)
 			log.Printf("[main] rewrote malformed URL %s → %s", uri, rebuilt)
 		}
-		handleChat(ctx, rc, runner, store)
+		handleChat(ctx, rc, runner, store, attachStore)
 	}
 }
 
@@ -420,7 +639,7 @@ type ChatRequest struct {
 	FileName  []string `json:"file_name,omitempty"`
 }
 
-func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, store *session.Store) {
+func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, store *session.Store, attachStore *attachment.Store) {
 	// === 兼容 GET(旧)和 POST+JSON body(新) ===
 	// 旧版:GPT query=xxx&session_id=xxx
 	// 新版:POST body = {"query":"...", "session_id":"...", "image_data":["xxx"], ...}
@@ -473,6 +692,22 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 		}),
 	}
 
+	// === 2026-08-03: IPC 通道 (LLM 上下文不接触图片字节) ===
+	// 分配 session attachment channel, 启 goroutine 监听转发 SSE event。
+	// ctx 注入在下面 runCtx 处,通过 ctx.WithValue 注入 (eino Runner.Run(ctx, ...) 会自动传递)。
+	//
+	// 设计:
+	//   - LocalCommandAgent 工具 wrapper 调 ipc.PublishAttachment(ctx, ev)
+	//   - 写进 sessionChannel
+	//   - goroutine 读 sessionChannel → 转 SSE attachment event → 浏览器
+	//   - LLM 上下文**完全不接触** ev (URL/base64),只看到文本元数据
+	//
+	// 杀掉 session 时 cleanup() 关闭 channel,避免 goroutine 泄漏。
+	sessionChannel, cleanupIPC := ipc.RegisterSession(sessionID)
+	// 注意: cleanupIPC 移到 iter.Run() 后面调用 (见下方 defer),
+	//       确保 iter 结束后立即 close channel, 让 SSE handler goroutine 退出,
+	//       然后再发 SSE end event, 浏览器收尾
+
 	// 加载上一轮 SDK 维护的完整多轮 messages，作为本轮的输入。
 	history := store.Get(sessionID)
 
@@ -487,6 +722,21 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 	parts := []schema.MessageInputPart{
 		{Type: schema.ChatMessagePartTypeText, Text: query},
 	}
+
+	// === 客户端附件直推收集器(2026-08-03 重构) ===
+	//
+	// 设计原则:"内容与理解分离"。
+	//   - 用户上传的图片/文件(base64 / URL / 磁盘路径) → 进 clientAttachments,
+	//     通过 SSE multi_content 一次性推给浏览器,前端 <img>/<a> 直接渲染原图。
+	//   - LLM 只能看到元数据(mime + 大小 + 文件名 + 路径),不接触 base64 字节。
+	//
+	// 收益:
+	//  1. 不再因 Ark 不支持 file_url 报错(LLM 上下文根本没 file_url part)
+	//  2. 用户看到的图是原图,不是 LLM 转述的失真文字
+	//  3. 节省 token(一张 1MB 图片 = ~250K token,本来根本不该进 LLM)
+	//
+	// 类型复用 message.MessageOutputPart,SSE 推送时直接用。
+	clientAttachments := []message.MessageOutputPart{}
 
 	// === 方式 1: POST body 里的 base64(最稳定) ===
 	// 严格按 base64 校验;长度超限(<1B 或 >8MB)跳过
@@ -508,16 +758,20 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 		if i < len(req.ImageMime) && req.ImageMime[i] != "" {
 			mime = req.ImageMime[i]
 		}
-		b := b64
-		m := mime
+		// === 2026-08-03: 不再把图片 base64 喂给 LLM ===
+		// 原代码构造 ChatMessagePartTypeImageURL + Base64Data,会让 Ark adapter
+		// 收到大量 token(1MB 图片 ≈ 250K token)且对 MiniMax-M3(纯文本 LLM)毫无意义。
+		// 新策略:base64 → data URL → 收集到 clientAttachments(走 SSE 推前端),
+		//        LLM 上下文只放元数据 TextPart。
+		clientAttachments = append(clientAttachments, message.MessageOutputPart{
+			Type: "image_url",
+			URL:  "data:" + mime + ";base64," + b64,
+			MIME: mime,
+			Name: fmt.Sprintf("image[%d]", i),
+		})
 		parts = append(parts, schema.MessageInputPart{
-			Type: schema.ChatMessagePartTypeImageURL,
-			Image: &schema.MessageInputImage{
-				MessagePartCommon: schema.MessagePartCommon{
-					Base64Data: &b,
-					MIMEType:   m,
-				},
-			},
+			Type: schema.ChatMessagePartTypeText,
+			Text: fmt.Sprintf("[用户上传图片: mime=%s, size=%d bytes]", mime, len(b64)*3/4),
 		})
 	}
 	for i, b64 := range req.FileData {
@@ -541,56 +795,58 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 			name = req.FileName[i]
 		}
 
-		// === 2026-07-30: Ark 模型 bug 修复 ===
+		// === 2026-08-03: 文件分发与 LLM 上下文解耦 ===
 		//
-		// eino Ark adapter (chat_completion_api.go:704) **不支持** ChatMessagePartTypeFileURL。
-		// 用户模型实际为 ark( MiniMax-M3 ),之前传 .md/.pdf/.docx 会报:
-		//   "unsupported chat message part type in user message: file_url"
+		// 原策略:把文件 base64 喂给 LLM(走 buildAttachmentText 转文本)
+		//   问题: LLM (MiniMax-M3) 是纯文本模型,无法理解 PDF 二进制;
+		//         强行喂 base64 解码的文本 → 信息丢失 + token 浪费 + 触发 Ark bug。
 		//
-		// 修复:把文件 base64 解码 → 拼成 Markdown 风格文本 → 直接进 ChatMessagePartTypeText part。
-		// 这样无论底层是 Ark / Anthropic / OpenAI 都接受(TEXT 所有 provider 都支持)。
+		// 新策略(内容与理解分离):
+		//   1. base64 → data URL → 收集到 clientAttachments(SSE 推前端)
+		//   2. LLM 上下文只放元数据 + 用途提示
 		//
-		// 限制:二进制 PDF 直接 base64 解码会乱码。我们按 mime 分流:
-		//   - text/* (txt/md/html/log)       → 解 base64,得到 UTF-8 字符串,正常并入
-		//   - application/pdf                 → 标注 "[PDF 附件,具体内容无法以文本传输,请用户口头描述]"
-		//   - application/vnd.openxmlformats-* → 同样内容已经过 office.ExtractText 转 text/plain
-		//                                       (handleUpload 在上传时已经做了抽取),所以这里
-		//                                       mime 是 text/plain,会进 text 分支,正常显示
-		//   - 其他二进制                       → 标注格式不支持
-		attachmentText := buildAttachmentText(b64, mime, name)
-		if attachmentText != "" {
-			parts = append(parts, schema.MessageInputPart{
-				Type: schema.ChatMessagePartTypeText,
-				Text: attachmentText,
-			})
-			log.Printf("[chat] file[%d] name=%s mime=%s as-text len=%d",
-				i, name, mime, len(attachmentText))
-		}
+		// 文本类附件(.md/.txt/.html)仍是用户主动上传的内容,LLM 如果任务需要
+		// 引用其内容,可在 system prompt 里提示用户"复述要点"——比让 LLM 看 base64 更稳。
+		clientAttachments = append(clientAttachments, message.MessageOutputPart{
+			Type: "file_url",
+			URL:  "data:" + mime + ";base64," + b64,
+			MIME: mime,
+			Name: name,
+		})
+		parts = append(parts, schema.MessageInputPart{
+			Type: schema.ChatMessagePartTypeText,
+			Text: fmt.Sprintf("[用户上传文件: name=%s, mime=%s, size=%d bytes] 该文件已发送给浏览器展示,LLM 不读取其字节内容,如需引用请用户口头描述。",
+				name, mime, len(b64)*3/4),
+		})
+		log.Printf("[chat] file[%d] name=%s mime=%s sse-only (not fed to LLM)",
+			i, name, mime)
 	}
 
-	// === 方式 2: POST body.image_url / file_url(http(s) URL 或 /uploads/ 相对路径) ===
+	// === 方式 2: POST body.image_url (http(s) URL 或 /uploads/ 相对路径) ===
+	//
+	// 2026-08-03 重构: 不再构造 ImageURL+Base64Data 喂 LLM。
+	//  - /uploads/xxx → 读磁盘 base64 → data URL → 推前端
+	//  - http(s) URL  → 直接 URL 推前端,前端 <img src=...>
 	for _, rawURL := range req.ImageURL {
 		rawURL = strings.TrimSpace(rawURL)
 		if rawURL == "" {
 			continue
 		}
-		// 相对路径(/uploads/xxx) → 后端从磁盘读 base64
 		if strings.HasPrefix(rawURL, "/") {
 			b64, mime, ok := loadDiskAsBase64(strings.TrimPrefix(rawURL, "/"))
 			if !ok {
 				log.Printf("[chat] image_url=%s disk read failed, skip", rawURL)
 				continue
 			}
-			b := b64
-			m := mime
+			clientAttachments = append(clientAttachments, message.MessageOutputPart{
+				Type: "image_url",
+				URL:  "data:" + mime + ";base64," + b64,
+				MIME: mime,
+				Name: extractFileNameFromURL(rawURL),
+			})
 			parts = append(parts, schema.MessageInputPart{
-				Type: schema.ChatMessagePartTypeImageURL,
-				Image: &schema.MessageInputImage{
-					MessagePartCommon: schema.MessagePartCommon{
-						Base64Data: &b,
-						MIMEType:   m,
-					},
-				},
+				Type: schema.ChatMessagePartTypeText,
+				Text: fmt.Sprintf("[用户引用图片: %s, mime=%s] 已发送浏览器展示。", rawURL, mime),
 			})
 			continue
 		}
@@ -598,36 +854,44 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 			log.Printf("[chat] image_url=%s not http(s), skip", rawURL)
 			continue
 		}
-		url := rawURL
+		clientAttachments = append(clientAttachments, message.MessageOutputPart{
+			Type: "image_url",
+			URL:  rawURL,
+			MIME: "",
+			Name: extractFileNameFromURL(rawURL),
+		})
 		parts = append(parts, schema.MessageInputPart{
-			Type:  schema.ChatMessagePartTypeImageURL,
-			Image: &schema.MessageInputImage{MessagePartCommon: schema.MessagePartCommon{URL: &url}},
+			Type: schema.ChatMessagePartTypeText,
+			Text: fmt.Sprintf("[用户引用图片: %s] 已发送浏览器展示。", rawURL),
 		})
 	}
+	// === 方式 2: POST body.file_url (http(s) URL 或 /uploads/ 相对路径) ===
+	//
+	// 2026-08-03 重构: 与 image_url 路径一致——
+	//   - /uploads/xxx → 读磁盘 base64 → data URL → 推前端
+	//   - http(s) URL  → 直接 URL 推前端
+	// LLM 上下文只放元数据 TextPart,不再构造 FileURL part(Ark 也不支持)。
 	for _, rawURL := range req.FileURL {
 		rawURL = strings.TrimSpace(rawURL)
 		if rawURL == "" {
 			continue
 		}
+		name := extractFileNameFromURL(rawURL)
 		if strings.HasPrefix(rawURL, "/") {
 			b64, mime, ok := loadDiskAsBase64(strings.TrimPrefix(rawURL, "/"))
 			if !ok {
 				log.Printf("[chat] file_url=%s disk read failed, skip", rawURL)
 				continue
 			}
-			name := extractFileNameFromURL(rawURL)
-			b := b64
-			m := mime
-			n := name
+			clientAttachments = append(clientAttachments, message.MessageOutputPart{
+				Type: "file_url",
+				URL:  "data:" + mime + ";base64," + b64,
+				MIME: mime,
+				Name: name,
+			})
 			parts = append(parts, schema.MessageInputPart{
-				Type: schema.ChatMessagePartTypeFileURL,
-				File: &schema.MessageInputFile{
-					MessagePartCommon: schema.MessagePartCommon{
-						Base64Data: &b,
-						MIMEType:   m,
-					},
-					Name: n,
-				},
+				Type: schema.ChatMessagePartTypeText,
+				Text: fmt.Sprintf("[用户引用文件: %s, mime=%s] 已发送浏览器展示。", rawURL, mime),
 			})
 			continue
 		}
@@ -635,38 +899,66 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 			log.Printf("[chat] file_url=%s not http(s), skip", rawURL)
 			continue
 		}
-		url := rawURL
-		name := extractFileNameFromURL(url)
+		clientAttachments = append(clientAttachments, message.MessageOutputPart{
+			Type: "file_url",
+			URL:  rawURL,
+			MIME: "",
+			Name: name,
+		})
 		parts = append(parts, schema.MessageInputPart{
-			Type: schema.ChatMessagePartTypeFileURL,
-			File: &schema.MessageInputFile{
-				MessagePartCommon: schema.MessagePartCommon{URL: &url},
-				Name:              name,
-			},
+			Type: schema.ChatMessagePartTypeText,
+			Text: fmt.Sprintf("[用户引用文件: %s] 已发送浏览器展示。", rawURL),
 		})
 	}
 
 	// 把 query 文本里残留的 "@image:xxx" inline 标记剥离（避免污染 LLM 看到的内容）
 	cleanQuery := query
 	for _, rawURL := range parseInlineAttachments(query, "@image") {
-		url := rawURL
+		clientAttachments = append(clientAttachments, message.MessageOutputPart{
+			Type: "image_url",
+			URL:  rawURL,
+			MIME: "",
+			Name: extractFileNameFromURL(rawURL),
+		})
 		parts = append(parts, schema.MessageInputPart{
-			Type:  schema.ChatMessagePartTypeImageURL,
-			Image: &schema.MessageInputImage{MessagePartCommon: schema.MessagePartCommon{URL: &url}},
+			Type: schema.ChatMessagePartTypeText,
+			Text: fmt.Sprintf("[用户引用图片: %s] 已发送浏览器展示。", rawURL),
 		})
 		cleanQuery = strings.ReplaceAll(cleanQuery, "@image:"+rawURL, "")
 	}
 	for _, rawURL := range parseInlineAttachments(query, "@file") {
 		url := rawURL
 		name := extractFileNameFromURL(url)
-		parts = append(parts, schema.MessageInputPart{
-			Type: schema.ChatMessagePartTypeFileURL,
-			File: &schema.MessageInputFile{
-				MessagePartCommon: schema.MessagePartCommon{URL: &url},
-				Name:              name,
-			},
-		})
-		cleanQuery = strings.ReplaceAll(cleanQuery, "@file:"+rawURL, "")
+		// 与 file_url 路径一致: 不读 base64 喂 LLM,直接推前端。
+		if strings.HasPrefix(url, "/") {
+			b64, mime, ok := loadDiskAsBase64(strings.TrimPrefix(url, "/"))
+			if !ok {
+				cleanQuery = strings.ReplaceAll(cleanQuery, "@file:"+url, "")
+				continue
+			}
+			clientAttachments = append(clientAttachments, message.MessageOutputPart{
+				Type: "file_url",
+				URL:  "data:" + mime + ";base64," + b64,
+				MIME: mime,
+				Name: name,
+			})
+			parts = append(parts, schema.MessageInputPart{
+				Type: schema.ChatMessagePartTypeText,
+				Text: fmt.Sprintf("[用户引用文件: %s, mime=%s] 已发送浏览器展示。", url, mime),
+			})
+		} else {
+			clientAttachments = append(clientAttachments, message.MessageOutputPart{
+				Type: "file_url",
+				URL:  url,
+				MIME: "",
+				Name: name,
+			})
+			parts = append(parts, schema.MessageInputPart{
+				Type: schema.ChatMessagePartTypeText,
+				Text: fmt.Sprintf("[用户引用文件: %s] 已发送浏览器展示。", url),
+			})
+		}
+		cleanQuery = strings.ReplaceAll(cleanQuery, "@file:"+url, "")
 	}
 	// 用清理后的 query 作为 text part（如果没解析到任何 part，parts 只有 text）
 	if len(parts) == 1 {
@@ -690,14 +982,14 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 	// === Memory: 记录本轮用户请求(2026-07-29 多模态改造) ===
 	// 把 inline 标记 + 多模态附件都序列化到 memory,便于 memory 检索。
 	memQuery := cleanQuery
-	if len(parts) > 1 {
+	if len(clientAttachments) > 0 {
 		imgCount := 0
 		fileCount := 0
-		for _, p := range parts {
-			switch p.Type {
-			case schema.ChatMessagePartTypeImageURL:
+		for _, a := range clientAttachments {
+			switch a.Type {
+			case "image_url", "ChatMessagePartTypeImageURL":
 				imgCount++
-			case schema.ChatMessagePartTypeFileURL:
+			case "file_url", "ChatMessagePartTypeFileURL":
 				fileCount++
 			}
 		}
@@ -730,6 +1022,24 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 		log.Printf("[main] run timeout=%s session=%s", timeout, sessionID)
 	}
 
+	// === 2026-08-03: 注入 attachment.Store 到 ctx ===
+	// LocalCommandAgent 工具 wrapper 通过 ctx 拿到 store,把产物文件注册进去,
+	// 然后通过 IPC channel 推 attachment event 给前端 (不通过 LLM context)。
+	//
+	// 关键好处: LLM 上下文**永远不接触图片字节**,节省 token + 避免 Ark 报错。
+	runCtx = attachment.WithStore(runCtx, attachStore)
+
+	// === 2026-08-03: 注入 IPC attachment channel 到 ctx ===
+	// 工具 wrapper 调 ipc.PublishAttachment(ctx, ev) → 写 channel
+	// main.go 上面启的 goroutine 读 channel → 发 SSE attachment event
+	// LLM 上下文**完全不接触**图片 URL/base64,完全借助 IPC + SSE 推前端
+	//
+	// 重要: sessionChannel 必须在 iter 完成后**主动 close**,否则:
+	//   - 工具 wrapper 不会写更多 (iter 已结束)
+	//   - goroutine 永远阻塞 range channel
+	//   - SSE "end" 永远不发, 浏览器 hang
+	runCtx = ipc.WithAttachmentChannel(runCtx, sessionChannel)
+
 	iter := runner.Run(runCtx, messages, opts...)
 
 	// 把 SSE 流挂到 hertz 响应上。
@@ -739,7 +1049,70 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 		Content: sessionID,
 	})
 
+	// === 2026-08-03: 把客户端附件直推 SSE 流 ===
+	//
+	// 在 iter 循环开始前先发一个 message event,把本轮收集到的客户端附件
+	// (图片 base64 / 文件 base64 / URL) 通过 multi_content 推给浏览器。
+	// 前端 index.html 的 appendMultiPart() 已经能正确渲染 image_url / file_url
+	// 两种 part(包括 data URL)。
+	//
+	// 这里故意不写在 iter 第一个 assistant message 里——因为 iter 可能直接
+	// 走到 tool_call / transfer / error,前端还没创建 assistant 容器就提前
+	// 推 multi_content,渲染时机不稳定。先发一个独立的"attachment" type 事件
+	// 让前端立刻渲染附件,后续 iter 流正常处理 assistant message。
+	if len(clientAttachments) > 0 {
+		if err := message.SendSSEEvent(s, message.SSEEvent{
+			Type:         "attachment",
+			AgentName:    "RouterAgent",
+			MultiContent: clientAttachments,
+		}); err != nil {
+			log.Printf("[main] sse attachment send failed: %v", err)
+		}
+		log.Printf("[main] sse attachment pushed count=%d session=%s",
+			len(clientAttachments), sessionID)
+	}
+
 	// === Memory: 把 SSE event 流转发给客户端 ===
+	//
+	// 2026-08-03 增强: 同步启 IPC 监听 goroutine,把工具产物附件 URL 转 SSE attachment event
+	// 推给前端。IPC channel 在 sessionChannel 里,LocalCommandAgent 工具 wrapper 写,
+	// goroutine 读 → 发 SSE event → 前端 <img src=URL> 渲染。
+	//
+	// 2026-08-04 14h 复盘修复: 在 goroutine 启动后立即**主动**扫 Store,把已知附件
+	//   (尤其是 /tmp/diagrams/ 下的图片) 通过 IPC 推到当前 session 前端。
+	//   这样即使用户重复提同样的请求, LLM 不调 local_command 重新生成,
+	//   也能立刻在前端产物面板看到图 + 下载按钮。
+	ipcDone := make(chan struct{})
+	go func() {
+		defer close(ipcDone)
+		// === 启动时主动 backfill: 把 Store 里 /tmp/ 下的已知 PNG/PDF 等都推到前端 ===
+		pushStartupAttachments(attachStore, sessionChannel)
+		for ev := range sessionChannel {
+			// 转换 ipc.AttachmentEvent → SSE attachment event
+			if err := message.SendSSEEvent(s, message.SSEEvent{
+				Type: "attachment",
+				// === 2026-08-04 修复: 用指针, nil 走 omitempty ===
+				//   之前值类型即便全零也会序列化成 attachment:{...}, 污染每个 SSE event。
+				Attachment: &message.AttachmentEvent{
+					Type:         string(ev.Type),
+					URL:          ev.URL,
+					AbsoluteURL:  ev.AbsoluteURL,
+					MIMEType:     ev.MIMEType,
+					Size:         ev.Size,
+					Name:         ev.Name,
+					OriginalPath: ev.OriginalPath,
+					Source:       ev.Source,
+				},
+			}); err != nil {
+				log.Printf("[main] SSE attachment send failed: %v", err)
+				return
+			}
+			// 详细日志: 调试"为什么前端看不到图"
+			log.Printf("[main] SSE attachment pushed url=%s mime=%s size=%d type=%s",
+				ev.URL, ev.MIMEType, ev.Size, ev.Type)
+		}
+	}()
+
 	for {
 		event, ok := iter.Next()
 		if !ok {
@@ -749,7 +1122,39 @@ func handleChat(ctx context.Context, c *app.RequestContext, runner *adk.Runner, 
 			log.Printf("[main] ProcessAgentEvent error session=%s err=%v", sessionID, err)
 			break
 		}
+
+		// === 2026-08-04: 补救 LLM 文本里提到的产物路径 (前端图片渲染) ===
+		//
+		// 场景:
+		//   - LocalCommandAgent 这一轮没调 local_command 重新渲染,而是
+		//     "按 ROOT_SYSTEM_POLICY 不重复 base64" 直接引用 /tmp/diagrams/xxx.png
+		//   - IPC 通道收不到新 attachment event,前端看不到图
+		//   - 但 attachment.Store 里**历史 session**已经注册过这个文件
+		//     (见 outputs/2026-08-04/10h.md 里"store 注册 2 个 attachment")
+		//
+		// 补救: 每次收到 message event,扫描 message.Content 文本里的绝对路径,
+		//       若 Store 里已有 → 通过 IPC 通道补推一次 attachment event 给前端。
+		//       注意 IPC channel 是 session 级,**当前 session 才能推送**。
+		//
+		// 2026-08-04 14h 复盘修复: 必须传 runCtx (注入过 IPC channel), 不能传
+		//   原始 ctx (没注入) — 否则 ipc.PublishAttachment silent drop,
+		//   SSE event 永远发不到前端。
+		backfillArtifactAttachments(runCtx, attachStore, event)
 	}
+
+	// === 2026-08-04: 关闭 sessionChannel (关键!) ===
+	//
+	// 历史死锁修复:
+	//   - defer cleanupIPC() 在 handleChat 末尾执行
+	//   - 而 <-ipcDone 在 cleanupIPC() 之前 → 等 goroutine range channel 退出
+	//   - goroutine range 等 channel close → channel close 由 cleanupIPC() 完成
+	//   - cleanupIPC() 等 handleChat 返回 → handleChat 等 <-ipcDone
+	//   - **死锁**:SSE end 事件永远不发,前端 hang
+	//
+	// 修复: 不再用 defer,在 <-ipcDone **之前** 显式调 cleanupIPC(),
+	//       让 channel 关闭 → goroutine range 退出 → ipcDone 关闭 → 解阻塞。
+	cleanupIPC()
+	<-ipcDone
 
 	_ = message.SendSSEEvent(s, message.SSEEvent{Type: "end"})
 
@@ -804,6 +1209,112 @@ func eventToMemoryString(event *adk.AgentEvent) string {
 		return string(msg.Role) + ": " + memory.TruncateBytes(msg.Content, 500)
 	}
 	return fmt.Sprintf("[event agent=%s]", event.AgentName)
+}
+
+// pushStartupAttachments 在新 session 启动时, 把 attachment.Store 里**所有已知附件**
+// 主动通过 IPC 推到当前 session 前端 (2026-08-04 新增)。
+//
+// 触发场景: 用户重复提同样的请求 (例如今天的"科创板 IPO 流程图"已经 6+ 次),
+// LLM 按 ROOT_SYSTEM_POLICY 不重复 base64/转码, 直接引用历史产物路径;
+// 但前端如果之前没正常收到 SSE attachment event (或者 page reload 清空了 UI),
+// 当前 session 就看不到图。
+//
+// 修复: 不依赖 LLM 输出路径, 直接在 session 启动时**主动**扫 Store,
+// 把所有注册过的附件都推给当前 session 前端, 用户立刻能看到产物面板。
+//
+// 限制:
+//   - 只推**图片类** (image/png, image/jpeg, image/gif, image/webp) —
+//     其他类型留给 LLM 在文本里描述 (避免误推 PDF / docx 等)
+func pushStartupAttachments(store *attachment.Store, sessionChannel chan<- ipc.AttachmentEvent) {
+	if store == nil {
+		return
+	}
+	all := store.ListAll()
+	for _, att := range all {
+		// 只推图片类
+		if !strings.HasPrefix(att.Mime, "image/") {
+			continue
+		}
+		select {
+		case sessionChannel <- ipc.AttachmentEvent{
+			Type:         ipc.AttachmentImage,
+			URL:          "/api/attachment/" + att.Token + "/" + att.Name,
+			MIMEType:     att.Mime,
+			Size:         att.Size,
+			Name:         att.Name,
+			OriginalPath: att.Original,
+			Source:       "startup_backfill",
+		}:
+			log.Printf("[main] startup backfill attachment url=/api/attachment/%s/%s mime=%s size=%d",
+				att.Token, att.Name, att.Mime, att.Size)
+		default:
+			// channel 满了就跳过,不影响主流程
+		}
+	}
+}
+
+// artifactPathRegexp 匹配 markdown 文本里的绝对路径文件引用。
+//
+// 触发场景:LLM 输出文字里写到 `图片产物: /tmp/diagrams/star_market_2026.png`,
+// 这条文本本身不带 URL,但 attachment.Store 里前几 session 已经注册过。
+// backfillArtifactAttachments 会扫描这种路径,通过 IPC 通道补推 SSE attachment event。
+//
+// 限制:必须是 /tmp 或 ~ 开头的"可识别产物路径",避免误把 `/usr/bin/foo` 之类的
+// 命令路径当成附件。
+var artifactPathRegexp = regexp.MustCompile(`(?:/tmp/|/var/tmp/|/root/|~/)[^\s"'<>)\]}]+\.(?:png|jpg|jpeg|gif|webp|svg|pdf|mp4|webm|mp3|wav|zip|tar\.gz|drawio)\b`)
+
+// backfillArtifactAttachments 扫描 event 里 message content 提到的产物路径,
+// 若 attachment.Store 已有, 通过 IPC 通道补推一次 SSE attachment event。
+//
+// 2026-08-04 新增: 之前 LLM 按 ROOT_SYSTEM_POLICY "严禁重复 base64" 直接引用
+// 已有图片路径时, 当前 session 的 IPC 通道收不到 attachment event, 前端看不到图。
+// 现在补救: 文本路径扫一遍, Store 里有就补 push。
+//
+// 注意: idempotent — 同一附件 event 重复推不会出 bug (前端 appendChild 也是 idempotent),
+//
+//	但为了避免每条 message 都重推, 我们用 session 内的 path 已 push 集合去重。
+var backfillPushedPaths sync.Map // map[string]bool session 级别去重
+
+func backfillArtifactAttachments(ctx context.Context, store *attachment.Store, event *adk.AgentEvent) {
+	if event == nil || event.Output == nil || event.Output.MessageOutput == nil {
+		return
+	}
+	msg := event.Output.MessageOutput.Message
+	if msg == nil || msg.Content == "" {
+		return
+	}
+	if store == nil {
+		return
+	}
+
+	matches := artifactPathRegexp.FindAllString(msg.Content, -1)
+	if len(matches) == 0 {
+		return
+	}
+	for _, p := range matches {
+		// session 级别去重:同一 session 内同一路径只补 push 一次
+		if _, loaded := backfillPushedPaths.LoadOrStore(p, true); loaded {
+			continue
+		}
+		att := store.LookupByOriginal(p)
+		if att == nil {
+			// 文本提到了但 Store 里没注册 → LLM 在描述"假想"产物,跳过
+			continue
+		}
+		// 构造 IPC attachment event 并写入 ctx 里的 channel
+		ipc.PublishAttachment(ctx, ipc.AttachmentEvent{
+			Type:         ipc.AttachmentImage, // 主要场景是图片;非图类会被前端忽略
+			URL:          "/api/attachment/" + att.Token + "/" + att.Name,
+			AbsoluteURL:  "",
+			MIMEType:     att.Mime,
+			Size:         att.Size,
+			Name:         att.Name,
+			OriginalPath: att.Original,
+			Source:       "backfill", // 标识是"补救"推送,不是 LocalCommandAgent 当场产出
+		})
+		log.Printf("[main] backfill attachment url=/api/attachment/%s/%s mime=%s size=%d",
+			att.Token, att.Name, att.Mime, att.Size)
+	}
 }
 
 // stripThinkTags 剥离 <think> 复合标签及其内容。

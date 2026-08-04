@@ -246,11 +246,23 @@ func resolveMemoryFilePath(rel string) string {
 	return ""
 }
 
-// buildMemoryFilePart 把磁盘文件转成 ToolOutputPart file 类型。
+// buildMemoryFilePart 把磁盘文件转成 ToolOutputPart 推给前端 + 进 LLM 上下文。
+//
+// 2026-08-03 重构: 关键修复——**用 ToolPartTypeImage 而不是 ToolPartTypeFile**。
+//
+// 之前的设计: ToolPartTypeFile → eino ToolNode 转 ChatMessagePartTypeFileURL
+//
+//	→ Ark adapter 不支持 → 报 "unsupported chat message part type in user message: file_url"
+//
+// 当前设计: ToolPartTypeImage → 转 ChatMessagePartTypeImageURL
+//
+//	→ Ark adapter 支持 (chat_completion_api.go line 644)
+//	→ 同时通过 SSE multi_content (handleRegularMessage line 113-129) 推前端 <img>
 //
 // 行为:
-//   - 文件存在 → 读字节,按文件扩展推断 MIME → base64 编码 → file part
-//   - 文件不存在或太大(>2MB)→ 跳过(返回 ok=false)
+//   - 文件存在 → 读字节,按文件扩展推断 MIME → base64 编码 → image/audio/video part
+//   - text/* 类返回 false (LLM 看不懂 base64,前端也不展示原始文本)
+//   - 文件不存在或太大(>2MB) → 跳过(返回 ok=false)
 //
 // 限制(2026-07-29): 单个 part 限 2MB,避免 tool_result 爆炸撑爆上下文。
 // 后续可改成"上传到对象存储并返回 URL",但当前项目体量暂不引入额外依赖。
@@ -267,15 +279,53 @@ func buildMemoryFilePart(absPath, displayName string) (schema.ToolOutputPart, bo
 	}
 	mime := guessMIMEFromExt(absPath)
 	encoded := base64.StdEncoding.EncodeToString(data)
-	return schema.ToolOutputPart{
-		Type: schema.ToolPartTypeFile,
-		File: &schema.ToolOutputFile{
-			MessagePartCommon: schema.MessagePartCommon{
-				Base64Data: &encoded,
-				MIMEType:   mime,
+
+	// === 2026-08-03: 用 ToolPartTypeImage 替代 ToolPartTypeFile ===
+	// 详见上方注释 + chatmodel.go buildArtifactFilePart。
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		return schema.ToolOutputPart{
+			Type: schema.ToolPartTypeImage,
+			Image: &schema.ToolOutputImage{
+				MessagePartCommon: schema.MessagePartCommon{
+					Base64Data: &encoded,
+					MIMEType:   mime,
+				},
 			},
-		},
-	}, true
+		}, true
+	case strings.HasPrefix(mime, "audio/"):
+		return schema.ToolOutputPart{
+			Type: schema.ToolPartTypeAudio,
+			Audio: &schema.ToolOutputAudio{
+				MessagePartCommon: schema.MessagePartCommon{
+					Base64Data: &encoded,
+					MIMEType:   mime,
+				},
+			},
+		}, true
+	case strings.HasPrefix(mime, "video/"):
+		return schema.ToolOutputPart{
+			Type: schema.ToolPartTypeVideo,
+			Video: &schema.ToolOutputVideo{
+				MessagePartCommon: schema.MessagePartCommon{
+					Base64Data: &encoded,
+					MIMEType:   mime,
+				},
+			},
+		}, true
+	default:
+		// text/* / application/pdf 等其他类 → 走 ToolPartTypeImage
+		// (前端根据 mime 决定渲染方式,LLM 接受 image_url)
+		return schema.ToolOutputPart{
+			Type: schema.ToolPartTypeImage,
+			Image: &schema.ToolOutputImage{
+				MessagePartCommon: schema.MessagePartCommon{
+					Base64Data: &encoded,
+					MIMEType:   mime,
+				},
+			},
+		}, true
+	}
 }
 
 // guessMIMEFromExt 按文件后缀猜 MIME。

@@ -1,6 +1,6 @@
 ---
 name: drawio
-description: 当用户要求生成 draw.io 图表(ERD / 数据库表、UML 类图、时序图、流程图、架构图)并导出为 PNG 时加载本 skill。ChatAgent 会按本 skill 的规范生成 draw.io XML,通过 local_command 工具调用主机已安装的 draw.io CLI 完成 PNG 导出。本 skill 不在 eino 内部实现 draw.io,只输出 XML 和导出命令。
+description: 当用户要求生成 draw.io 图表(ERD / 数据库表、UML 类图、时序图、流程图、架构图)并导出为 PNG/SVG 时加载本 skill。LocalCommandAgent 会按本 skill 的规范写 .drawio XML,然后通过 local_command 工具调用主机已安装的 draw.io CLI 完成 PNG 导出。本 skill 输出的源文件通过 buildArtifactFilePart 的 text/* 过滤(2026-08-03 fix)不会污染 LLM 上下文,产物 .png 走 SSE multi_content 推前端。
 context: inline
 ---
 
@@ -148,7 +148,7 @@ file /tmp/diagrams/<name>.png
 
 ### Step 8 — 内联 PNG 到对话(强制)
 
-**ChatAgent 拿到 PNG 后必须转 base64 内联**——详见后文 "ChatAgent PNG → Base64 协议"章节。
+**LocalCommandAgent 拿到 PNG 后必须转 base64 内联**——详见后文 "LocalCommandAgent PNG → Base64 协议"章节。
 
 ### Step 9 — 询问用户后续格式(强制)
 
@@ -191,21 +191,21 @@ file /tmp/diagrams/<name>.png
 
 (root 用户版本请在 `-x` 前加 `--no-sandbox`)
 
-## ChatAgent PNG → Base64 协议(关键)
+## LocalCommandAgent PNG → Base64 协议(关键)
 
-> **这是 ChatAgent 把 PNG 传给前端浏览器的核心机制,必须严格遵守。**
+> **这是 LocalCommandAgent 把 PNG 传给前端浏览器的核心机制,必须严格遵守。**
 
 ### 流程
 
 ```
 drawio 工具 → 生成 /tmp/diagrams/order.png (本地文件)
                 ↓
-ChatAgent 调用 local_command 工具:
+LocalCommandAgent 调用 local_command 工具:
   base64 -w 0 /tmp/diagrams/order.png
                 ↓
 命令输出字符串 (e.g. iVBORw0KGgo... 几 MB 字符串)
                 ↓
-ChatAgent 把这个 base64 字符串作为工具返回的一部分,告诉前端:
+LocalCommandAgent 把这个 base64 字符串作为工具返回的一部分,告诉前端:
   {
     "image_data": "iVBORw0KGgo...",
     "mime": "image/png",
@@ -235,7 +235,7 @@ echo "data:image/png;base64,${B64}"
 ![order.png](data:image/png;base64,iVBORw0KGgo...)
 ```
 
-实际 ChatAgent 把 data URL 当成 markdown 内容 append,前端在 SSE 流里渲染。
+实际 LocalCommandAgent 把 data URL 当成 markdown 内容 append,前端在 SSE 流里渲染。
 
 ### 小 PNG 的 fallback(更稳)
 
@@ -257,7 +257,7 @@ convert /tmp/diagrams/order.png -resize 1024x /tmp/diagrams/order_small.png
 | Windows (installer) | `C:\Program Files\draw.io\drawio.exe` | 默认安装 |
 | Windows (scoop) | `~/scoop/apps/drawio/current/drawio.exe` | scoop 用户 |
 
-**ChatAgent 在执行命令前,先用 `which drawio` 探测实际路径**——而不是写死。
+**LocalCommandAgent 在执行命令前,先用 `which drawio` 探测实际路径**——而不是写死。
 
 ## root 用户处理(`--no-sandbox`)
 
@@ -283,7 +283,7 @@ drawio Desktop 在 Linux/macOS 上**默认启用 Chromium sandbox** 以提高安
 
 ### 自动判断
 
-**ChatAgent 写命令前必须先 `whoami` 探测**:
+**LocalCommandAgent 写命令前必须先 `whoami` 探测**:
 
 ```bash
 # 一次性探测,后续所有 drawio 命令沿用结果

@@ -159,8 +159,12 @@ func IsDangerousWithAgentV2(ctx context.Context, agentName, cmd string) (bool, s
 	// Stage 3: allow (自动放行)
 	// =================================================================
 
-	if isCommandAllowed(agentName, cmd) && !strings.Contains(cmd, "/") {
-		// 命令在白名单 → 放行
+	// 命令在白名单 → 放行
+	// (2026-08-04 修复: 之前用 `&& !strings.Contains(cmd, "/")` 限制绝对路径
+	//  走白名单检查, 但对 heredoc 写文件 (cat > /tmp/... <<'EOF' ... body ... EOF)
+	//  这种 "命令名在白名单, body 必含 /" 的场景是误伤:
+	//  isCommandAllowed 已经正确处理路径 (见 tool.go:443),不需要重复限制。)
+	if isCommandAllowed(agentName, cmd) {
 		return false, ""
 	}
 
