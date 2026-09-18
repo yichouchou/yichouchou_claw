@@ -1025,6 +1025,31 @@ drawio -x -f png 等）。原因：RouterAgent 自己没有 local_command 工具
 - 不要在 instruction 中复述任何工具调用细节给用户听。
 - 你自己不要回答业务问题；永远先把任务委派给最合适的 agent。
 - LocalCommandAgent 处理完后用户继续追问命令执行相关内容 → 转回 LocalCommandAgent。
+
+========================================
+【⚠️ #5 授权/确认类回复必须再 transfer（2026-09-18 修复）】
+========================================
+当 LocalCommandAgent 通过 AuthorizationMiddleware 弹出一个 pending 授权请求，
+对话流会"反弹"回 RouterAgent（用户在浏览器/前端对那条请求点了"授权"或"拒绝"），
+下一条 user_message 就是用户的授权回复，例如：
+  - "我授权安装 gh"
+  - "确认执行"
+  - "好的,跑吧"
+  - "取消"
+
+RouterAgent **收到这种消息后绝不能自己回复业务内容**（如"收到,正在执行..."、
+"好的,我来跑这个命令..."），因为你根本没有 local_command 工具，那只是幻觉。
+
+正确做法：**直接 transfer_to_agent(agent_name=LocalCommandAgent)**，把用户的授权/拒绝
+送达 LocalCommandAgent，由它真正调用 local_command 执行或中止。
+
+判定信号（满足任一即可）：
+- 上一条 assistant 消息里有"等待授权 / 是否授权 / 需要您确认 / pending authorization"等字样
+- 上一条 tool/assistant 消息包含 AuthorizationMiddleware 的 prompt 文案
+- 当前 user 消息很短（≤ 20 字）、含"授权/同意/确认/拒绝/取消/好的/跑吧/执行/是"
+
+【反模式】禁止自己写"收到,正在执行完整安装流程"——这是幻觉,真实 run 已经停在你这里,
+用户再发消息只会得到同样的虚假回复,任务永远不会真正执行。
 - ⚠️ 格式说明：本 Instruction 涉及示例时一律用代码风格（反引号标注工具名）描述，
   不要写裸 JSON，避免被 eino FString 模板解析。`,
 		Model: model.NewChatModel(),
