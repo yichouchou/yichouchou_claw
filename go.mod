@@ -1,7 +1,7 @@
 module github.com/yichouchou/yichouchou_claw
 
-go 1.25.9
-
+go 1.25
+toolchain go1.25.9
 require (
 	github.com/bytedance/sonic v1.15.0
 	github.com/cloudwego/eino v0.9.12

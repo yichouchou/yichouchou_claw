@@ -116,8 +116,11 @@ type WebSearchInput struct {
 	Query string `json:"query"`
 }
 
-// sharedWebSearchTool 是 ChatAgent / LocalCommandAgent / RouterAgent 等多个 agent 共享的
+// sharedWebSearchTool 是 ChatAgent / LocalCommandAgent 等多个 agent 共享的
 // web_search 占位工具。
+//
+// 2026-09-18 更新: RouterAgent 不再持有 web_search——它只做任务委派,任何联网搜索
+// 都属于子 agent。
 //
 // 设计要点 (2026-08-03 修复):
 //   - 实际执行由 Anthropic/Minimaxi 服务端完成（API 层在请求时已开启 web_search 工具）
@@ -144,7 +147,10 @@ func sharedWebSearchTool() tool.BaseTool {
 	return t
 }
 
-// sharedMemorySearchTool 是 ChatAgent / LocalCommandAgent / RouterAgent 共用的 memory_search 工具。
+// sharedMemorySearchTool 是 ChatAgent / LocalCommandAgent 共用的 memory_search 工具。
+//
+// 2026-09-18 更新: RouterAgent 不再持有 memory_search——RouterAgent 只做任务委派,
+// 不读历史。需要历史上下文的子 agent 自己读。
 //
 // LocalCommandAgent 持有 memory_search 的原因 (2026-08-03 修复):
 //   - 复合任务 context: 当用户问"上次画的图改个样式",LocalCommandAgent 需要读历史决策
@@ -290,9 +296,9 @@ stderr 关键字速查 (这些都是沙箱真实返回的标识, 看到后按规
 // （例如 internal/memory.MemoryMiddleware）。
 // routerAgentUnknownToolHandler 在 RouterAgent 的 ToolsNode 找不到目标工具时被调用。
 //
-// 触发场景:LLM 偶尔会"幻觉"地调用 transfer_to_agent / memory_search 之外的工具名
-// (local_command / web_search / skill / get_weather / read_file 等), 这些工具属于
-// 子 agent, RouterAgent 没注册。不拦截会让 ToolsNode 直接返回
+// 触发场景:LLM 偶尔会"幻觉"地调用 transfer_to_agent 之外的工具名
+// (local_command / web_search / skill / get_weather / read_file / memory_search 等),
+// 这些工具属于子 agent, RouterAgent 没注册。不拦截会让 ToolsNode 直接返回
 // "[NodeRunError] tool X not found in toolsNode indexes, node path: [node_1, ToolNode]",
 // 整个 run 失败, 用户看不到任何修复路径。
 //
@@ -303,6 +309,9 @@ stderr 关键字速查 (这些都是沙箱真实返回的标识, 看到后按规
 //
 // 注意:这个 handler 只在 RouterAgent 上挂——子 agent (LocalCommandAgent / ChatAgent /
 // WeatherAgent) 自己有完整的工具集, 不需要这种回退。
+//
+// 2026-09-18 更新: RouterAgent 工具集已精简到只剩 transfer_to_agent, memory_search 也
+// 不再属于 RouterAgent——它现在只是 ChatAgent / LocalCommandAgent 持有的子 agent 工具。
 //
 // 2026-08-04 修复: 之前只有 [NodeRunError] 硬错, LLM 看到 tool_call 失败后陷入死循环;
 // 现在 LLM 拿到明确文本, 会主动 transfer 到正确的子 agent, 任务继续。
@@ -328,6 +337,9 @@ func routerAgentUnknownToolHandler(ctx context.Context, name, input string) (str
 		"web_search": "LocalCommandAgent", // 复合任务通常 LocalCommandAgent 用
 		"skill":      "LocalCommandAgent",
 		"drawio":     "LocalCommandAgent",
+		// memory_search (2026-09-18): RouterAgent 不再持有, 但 ChatAgent / LocalCommandAgent 仍持有。
+		// RouterAgent 自己没有 history, 看到 LLM 调它就直接指去最常用的 ChatAgent。
+		"memory_search": "ChatAgent",
 	}
 
 	if dest, ok := childAgentTools[name]; ok {
@@ -344,8 +356,8 @@ func routerAgentUnknownToolHandler(ctx context.Context, name, input string) (str
 	// 完全未知的工具名 — 返回"未注册"通用提示
 	return fmt.Sprintf(
 			"工具 %q 在 RouterAgent 中未注册。"+
-				"RouterAgent 只能调用 transfer_to_agent 与 memory_search；"+
-				"其它工具属于子 agent（ChatAgent / WeatherAgent / LocalCommandAgent）。"+
+				"RouterAgent 只能调用 transfer_to_agent；其它工具属于子 agent"+
+				"（ChatAgent / WeatherAgent / LocalCommandAgent）。"+
 				"请用 transfer_to_agent(agent_name=...) 委派任务，或改用已注册工具。",
 			name),
 		nil
@@ -880,64 +892,42 @@ draw.io / drawio / mermaid / PlantUML / graphviz / 思维导图 / org chart / �
 //   - WeatherAgent：查天气
 //   - LocalCommandAgent：执行主机 bash 命令（含沙箱授权）
 //
-// 注意：RouterAgent 同时持有 memory_search 工具，并自动注入"最近记忆"到
-// system prompt。原因：路由前需要先理解上下文（用户经常问"刚才那个 XX 是什么"、
-// "上一次装的包是啥"），必须先调 memory 检索历史再判断委派。
+// 2026-09-18 重构: RouterAgent 只做任务委派,不再加载 memory。
+//   - 之前会注册 memory_search 工具 + 注入 recent memory 块 + 加 dynamic recent middleware,
+//     目的是"路由前先理解上下文"。但这让 RouterAgent 承担了"读历史 → 整理上下文 → 再路由"
+//     的复合职责,与"纯粹的路由器"职责冲突,也容易让 LLM 在上下文模糊时反问用户。
+//   - 现在: RouterAgent 的工具集只有 transfer_to_agent (eino 隐式注册),
+//     instruction 也不再注入 recent memory / 不要求 LLM 主动查 memory。
+//   - 需要历史上下文的子 agent (ChatAgent / LocalCommandAgent) 自己持有 memory_search
+//   - dynamicRecentMw,在被 transfer 后自行加载上下文;RouterAgent 只负责"转交"。
 func NewRouterAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMiddleware) adk.Agent {
-	// memory_search 工具：路由前先读历史,避免在没有上下文时反问用户。
-	memorySearchTool, err := memorytool.NewSearchTool()
-	if err != nil {
-		log.Fatalf("RouterAgent memory_search tool: %v", err)
-	}
-
-	// ==== 自动注入最近记忆到 RouterAgent 的 system prompt ====
-	// 关键修复(2026-07-29)：之前的版本在 NewRouterAgent() 构造时把 recentBlock
-	// 写死到 Instruction 里,导致:
-	//   1. 服务重启后,新会话第一条 user_message 之前的 recent memory 还是
-	//      "启动那一刻"的内容(若重启前最后一条对话还没被 refine/落盘就漏掉)
-	//   2. 同一会话连问多轮,recentBlock 不会更新
-	// 改进:让 recentBlock 仍作为 Instruction 的静态部分(提供基础上下文),
-	// 再**额外**注册一个 BeforeModelRewriteState middleware,在每次
-	// ChatModel 调用前把"最新"recent memory 拼到当前 user message 前面,
-	// 保证 RouterAgent 看到的"最近记忆"始终是最新视角。
-	recentCfg := config.GetRecentMemoryConfig()
-	var recentBlock string
-	if !recentCfg.Enabled {
-		recentBlock = ""
-	} else {
-		recentBlock = memorytool.RecentMemoryBlock(memorytool.RecentMemoryConfig{
-			Enabled:     true,
-			Limit:       recentCfg.Limit,
-			MaxTokens:   recentCfg.MaxTokens,
-			KindsFilter: recentCfg.KindsFilter,
-			MaxAgeDays:  recentCfg.MaxAgeDays,
-		})
-		if recentBlock == "<recent_memory>\n\n</recent_memory>" {
-			recentBlock = "<recent_memory>\n（长期记忆索引未启用或暂无最近对话；如需历史上下文,请调用 memory_search 工具）\n</recent_memory>"
-		}
-	}
-	// 动态 recent block 中间件:每次调用前重新生成。
-	dynamicRecentMw := newDynamicRecentMemoryMiddleware(recentCfg)
-
 	a, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:        "RouterAgent",
 		Description: "一个智能任务路由器，负责将任务分配给其他专家 agent。",
-		Instruction: `你是 RouterAgent，**唯一的职责**是把任务分给最合适的专家 agent。
+		Instruction: `你是 RouterAgent，**唯一的职责**是把任务分给最合适的专家 agent，自己不读历史、不执行命令、不回答业务问题。
 
 ========================================
-【⚠️ HARD RULE #0：你能且只能使用这两个工具】
+【⚠️ HARD RULE #0：你只能使用这一个工具】
 ========================================
 ✅ transfer_to_agent(agent_name=...)   ← 路由
-✅ memory_search(query=..., limit=...)   ← 查历史
 
-❌ 其它任何工具——local_command / web_search / skill / get_weather /
-   read_file / write_file 等都属于子 agent，RouterAgent 没注册，调用就
-   触发 "tool XXX not found in toolsNode indexes"。
+❌ 任何其它工具——local_command / web_search / skill / get_weather / read_file / write_file /
+   memory_search 等都属于子 agent，RouterAgent 没注册，调用就触发
+   "tool XXX not found in toolsNode indexes"。
 
 如果你不小心调了这种工具，**不要重试**，立刻在文字回复里说明"该工具属于子 agent Y，
 已转 Y 处理"，然后发起 transfer_to_agent。
 
-可用的专家 agent：
+【关于 memory_search / 历史上下文】
+- RouterAgent 不再读历史、不查 memory、不在 transfer 前复述上下文。
+- 子 agent (ChatAgent / LocalCommandAgent) 各自持有 memory_search 与 recent memory 注入,
+  被 transfer 后会自己读历史；如需上下文请直接交给它们。
+- 不要在文字回复里写"根据上下文..."这种总结——你看不到上下文，瞎猜会让子 agent
+  收到错误前提。
+
+========================================
+【可用的专家 agent】
+========================================
 - ChatAgent：日常闲聊、通用知识问答、技术方案讨论、澄清式追问、代码 review、文档翻译。
   **不**执行任何命令。技能：general_chat。
 - WeatherAgent：查询指定城市天气，调 get_weather 工具。
@@ -946,42 +936,7 @@ func NewRouterAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMid
   技能：system_diagnosis / git_operations / network_diagnosis / **drawio**（2026-08-03 移入）。
 
 ========================================
-【#1 路由前先理解上下文】
-========================================
-在判断"这条消息转给谁"之前，先理解用户问什么。两种手段：
-
-(a) **下方 <recent_memory> 块**：系统已自动注入最近 7 天的对话摘要。
-    这是事实来源，不要凭训练数据猜测。
-
-(b) **memory_search 工具**：仅当 recent_memory 窗口太短/太旧，或用户明确要求
-    "翻 memory / 之前怎么做的" 时主动调。
-
-【绝对禁止】
-- 不查 memory 就对模糊短问反问用户"请提供具体命令"。
-- 仅凭当前 query 路由，忽略上文。
-
-========================================
-【#2 transfer 必须显式复述上下文（修复上下文断层）】
-========================================
-eino 的 transfer_to_agent 工具签名是固定的（一个 agent_name 字段），**无法带自定义 payload**。
-被 transfer 过去的子 agent 看不到 recent memory，只看到你整理后的"任务陈述"。
-
-因此**你在 transfer 之前必须在文字回复里复述上下文**，否则子 agent 收到
-"系统初始化，没有用户问题"，会反问澄清。
-
-【标准工作流】
-1) 先读 recent_memory：能推出上下文就够用。
-2) 不够就调 memory_search：query 用核心名词定位（如 "pwd 替代命令"）。
-3) 在工具调用前的文字回复里复述清楚："用户问的'它'指代的是 X" + 简述用户原话与上文的关联。
-4) 然后才发起 transfer_to_agent。
-
-【反模式】
-- 直接 transfer_to_agent 不交代上下文。
-- 调 memory_search 但不整合结果就 transfer。
-- 反问用户"你指的是哪个"——永远先自己查。
-
-========================================
-【#3 路由判定规则（按优先级）】
+【路由判定规则（按优先级）】
 ========================================
 
 ### 3.0 图表/图表生成类任务（强专项，最优先）
@@ -1044,12 +999,11 @@ drawio -x -f png 等）。原因：RouterAgent 自己没有 local_command 工具
 
 用户消息 ≤ 8 汉字，或 follow-up 形式（"北京的呢？"、"那上海呢"、"然后呢"、"继续"）：
 
-- 绝对不要直接反问。先看 recent_memory 能否推出上下文。
-- 若上文在聊某命令 → 转 LocalCommandAgent 继续。
-- 若上文聊某 topic → 转对应 ChatAgent / WeatherAgent 继续。
-- recent_memory + memory_search 都查不到 → 走 ChatAgent 反问澄清。
-
-严格禁止对无上文且措辞模糊的短问直接转 WeatherAgent 或 LocalCommandAgent。
+- RouterAgent 不读历史,无法判断"它指什么"——不要假装知道。
+- 默认按字面最可能意图路由:含"天气/温度/下雨"等天气词 → WeatherAgent;
+  含命令执行/系统查询/git 等词 → LocalCommandAgent;其它 → ChatAgent。
+- 严格禁止对无上文且措辞模糊的短问直接反问"你指的是哪个"——交给 ChatAgent
+  让它在自己上下文里反问更合适。
 
 ### 3.4 地理孤词例外
 
@@ -1072,29 +1026,29 @@ drawio -x -f png 等）。原因：RouterAgent 自己没有 local_command 工具
 - 你自己不要回答业务问题；永远先把任务委派给最合适的 agent。
 - LocalCommandAgent 处理完后用户继续追问命令执行相关内容 → 转回 LocalCommandAgent。
 - ⚠️ 格式说明：本 Instruction 涉及示例时一律用代码风格（反引号标注工具名）描述，
-  不要写裸 JSON，避免被 eino FString 模板解析。` + recentBlock,
+  不要写裸 JSON，避免被 eino FString 模板解析。`,
 		Model: model.NewChatModel(),
 		ToolsConfig: adk.ToolsConfig{
 			ToolsNodeConfig: compose.ToolsNodeConfig{
-				// 注册 memory_search 工具,让 RouterAgent 在路由前能主动检索历史。
-				// 最近记忆通常已通过 recentBlock 自动注入,只在窗口不够时调。
-				Tools: []tool.BaseTool{memorySearchTool},
-				// 2026-08-04 修复: 加 UnknownToolsHandler 防 LLM 幻觉调 local_command / web_search 等
-				//   "子 agent 工具"。RouterAgent 的工具集只有 memory_search (+ transfer_to_agent
-				//   由 eino 隐式注册), LLM 偶尔会在试图"直接做事"时调出 local_command 等名字,
-				//   触发 [NodeRunError] tool X not found in toolsNode indexes 硬错导致整个 run
-				//   崩溃。现在 handler 返回明确"请改用 transfer_to_agent(agent_name=LocalCommandAgent)"
+				// 2026-09-18 重构: RouterAgent 不再持有 memory_search 工具。
+				//   工具集只有 eino 隐式注册的 transfer_to_agent;其它任何工具
+				//   (local_command / web_search / memory_search / skill / get_weather / ...)
+				//   都属于子 agent。
+				//
+				// 2026-08-04 修复: UnknownToolsHandler 防 LLM 幻觉调子 agent 工具名
+				//   (local_command / web_search / read_file 等) 触发 [NodeRunError]
+				//   硬错导致整个 run 崩溃。handler 返回明确"请改用 transfer_to_agent"
 				//   提示, LLM 下一轮会主动 transfer, 任务继续。
 				UnknownToolsHandler: routerAgentUnknownToolHandler,
 			},
 		},
 		// 只在 RouterAgent 上注册 PersistMiddleware，让最外层 agent 在每次成功结束后
 		// 把完整 messages 写入 store；子 agent（ChatAgent / WeatherAgent / LocalCommandAgent）不会触发。
+		// 不挂 dynamicRecentMw:RouterAgent 不读历史。
 		Handlers: append([]adk.ChatModelAgentMiddleware{
 			session.NewPersistMiddleware(store),
 			messagehandler.NewLanguageConstraintMiddleware(),
 			messagehandler.NewAuthorizationMiddleware(),
-			dynamicRecentMw,
 		}, extraHandlers...),
 	})
 	if err != nil {
