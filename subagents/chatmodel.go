@@ -189,7 +189,7 @@ func NewWeatherAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMi
 - 不要尝试委派任务给其他 agent，不要建议用户联系其他 agent。
 - 如果用户的请求超出你"查天气"的能力范围（例如闲聊、其他专业问题），直接回答"我无法处理这个请求"，不要做任何重试或转移动作。
 - 只在你确定需要城市天气时才调用 get_weather；其他场景直接文本回复。`,
-		Model: model.NewChatModel(),
+		Model: pickChatModel(model.NewChatModel()),
 		ToolsConfig: adk.ToolsConfig{
 			ToolsNodeConfig: compose.ToolsNodeConfig{
 				Tools: []tool.BaseTool{weatherTool},
@@ -198,6 +198,20 @@ func NewWeatherAgent(store *session.Store, extraHandlers ...adk.ChatModelAgentMi
 		Handlers: handlers,
 	})
 	if err != nil {
+		log.Fatal(err)
+	}
+	// 结构性摘掉 transfer_to_agent（详见 transfer_guard.go 顶部注释）。
+	//
+	// eino 在「agent 有 parent」时会自动注册 transfer_to_agent 工具，并追加一段
+	// 「鼓励转出」的 instruction（拼在本 agent 自己的 Instruction 之后）。
+	// 因此 Instruction 里写「严禁调用 transfer_to_agent」是压不住的 —— 工具本身就在
+	// 交给模型的工具列表里，模型会照抄历史中 router 那次 transfer 的 tool_result，
+	// 对着自己发起转出，形成无限循环，最终报
+	// 「transfer failed: agent 'X' not found when transferring from 'X'」。
+	//
+	// 这里在构造期就禁止向 parent 转移，使 eino 不再注册该工具、也不再拼接转出
+	// instruction —— 从工具列表层面根除，而不是靠 prompt 约束。
+	if err := a.OnDisallowTransferToParent(context.Background()); err != nil {
 		log.Fatal(err)
 	}
 	return a
@@ -667,7 +681,7 @@ local_command 跑出产物文件 (.png / .jpg / .pdf / .drawio / 任意), 后端
   **这条错误不可恢复, 必须立即停止重试, 转为文本回答用户**。
 - **不要试图转回 RouterAgent / ChatAgent** — LocalCommandAgent 没兄弟 agent,
   任何"转出"需求都改成"文本回答用户"即可。`,
-		Model: model.NewChatModel(),
+		Model: pickChatModel(model.NewChatModel()),
 		ToolsConfig: adk.ToolsConfig{
 			ToolsNodeConfig: compose.ToolsNodeConfig{
 				// 2026-08-03 修复: LocalCommandAgent 持有 web_search + memory_search
@@ -702,6 +716,20 @@ local_command 跑出产物文件 (.png / .jpg / .pdf / .drawio / 任意), 后端
 		MaxIterations: config.GetMaxIterationsFor("local_command"),
 	})
 	if err != nil {
+		log.Fatal(err)
+	}
+	// 结构性摘掉 transfer_to_agent（详见 transfer_guard.go 顶部注释）。
+	//
+	// eino 在「agent 有 parent」时会自动注册 transfer_to_agent 工具，并追加一段
+	// 「鼓励转出」的 instruction（拼在本 agent 自己的 Instruction 之后）。
+	// 因此 Instruction 里写「严禁调用 transfer_to_agent」是压不住的 —— 工具本身就在
+	// 交给模型的工具列表里，模型会照抄历史中 router 那次 transfer 的 tool_result，
+	// 对着自己发起转出，形成无限循环，最终报
+	// 「transfer failed: agent 'X' not found when transferring from 'X'」。
+	//
+	// 这里在构造期就禁止向 parent 转移，使 eino 不再注册该工具、也不再拼接转出
+	// instruction —— 从工具列表层面根除，而不是靠 prompt 约束。
+	if err := a.OnDisallowTransferToParent(context.Background()); err != nil {
 		log.Fatal(err)
 	}
 	return a
@@ -847,7 +875,7 @@ draw.io / drawio / mermaid / PlantUML / graphviz / 思维导图 / org chart / �
 - 不要在 ChatAgent 里假装做了命令执行；如需执行，明确告诉用户会路由到 LocalCommandAgent
 - 当用户询问实时信息（新闻、天气、股价、最新事件）时，可以使用 web_search 工具联网搜索
 - 用户要求"画图 + 发给我"：**永远不**给出"假完成"回复，永远引导重路由到 LocalCommandAgent`,
-		Model: model.NewChatModelForChatAgent(),
+		Model: pickChatModel(model.NewChatModelForChatAgent()),
 		ToolsConfig: adk.ToolsConfig{
 			ToolsNodeConfig: compose.ToolsNodeConfig{
 				// 注册 web_search 占位工具，让 eino ToolNode 能找到对应的执行入口。
@@ -866,6 +894,20 @@ draw.io / drawio / mermaid / PlantUML / graphviz / 思维导图 / org chart / �
 		}()), skillMw), extraHandlers...),
 	})
 	if err != nil {
+		log.Fatal(err)
+	}
+	// 结构性摘掉 transfer_to_agent（详见 transfer_guard.go 顶部注释）。
+	//
+	// eino 在「agent 有 parent」时会自动注册 transfer_to_agent 工具，并追加一段
+	// 「鼓励转出」的 instruction（拼在本 agent 自己的 Instruction 之后）。
+	// 因此 Instruction 里写「严禁调用 transfer_to_agent」是压不住的 —— 工具本身就在
+	// 交给模型的工具列表里，模型会照抄历史中 router 那次 transfer 的 tool_result，
+	// 对着自己发起转出，形成无限循环，最终报
+	// 「transfer failed: agent 'X' not found when transferring from 'X'」。
+	//
+	// 这里在构造期就禁止向 parent 转移，使 eino 不再注册该工具、也不再拼接转出
+	// instruction —— 从工具列表层面根除，而不是靠 prompt 约束。
+	if err := a.OnDisallowTransferToParent(context.Background()); err != nil {
 		log.Fatal(err)
 	}
 	return a
@@ -1073,7 +1115,7 @@ drawio -x -f png 等）。原因：RouterAgent 自己没有 local_command 工具
 - LocalCommandAgent 处理完后用户继续追问命令执行相关内容 → 转回 LocalCommandAgent。
 - ⚠️ 格式说明：本 Instruction 涉及示例时一律用代码风格（反引号标注工具名）描述，
   不要写裸 JSON，避免被 eino FString 模板解析。` + recentBlock,
-		Model: model.NewChatModel(),
+		Model: pickChatModel(model.NewChatModel()),
 		ToolsConfig: adk.ToolsConfig{
 			ToolsNodeConfig: compose.ToolsNodeConfig{
 				// 注册 memory_search 工具,让 RouterAgent 在路由前能主动检索历史。
@@ -1086,6 +1128,16 @@ drawio -x -f png 等）。原因：RouterAgent 自己没有 local_command 工具
 				//   崩溃。现在 handler 返回明确"请改用 transfer_to_agent(agent_name=LocalCommandAgent)"
 				//   提示, LLM 下一轮会主动 transfer, 任务继续。
 				UnknownToolsHandler: routerAgentUnknownToolHandler,
+				// 2026-10-27 修复: transfer_to_agent 目标白名单。
+				//
+				// eino 的 transferToAgent 工具不校验目标名，任何名字都回显
+				// "successfully transferred to agent [X]"，真正的失败在 adk/flow.go：
+				// 目标不在子 agent 列表里时报 "transfer failed: agent 'X' not found"，
+				// 整个 run 被打死。这里在工具执行前做白名单校验，非法目标（例如模型
+				// 把任务转移给自己）返回明确提示让模型重新决策，而不是让流程崩溃。
+				ToolCallMiddlewares: []compose.ToolMiddleware{
+					NewTransferTargetGuard(transferTargets),
+				},
 			},
 		},
 		// 只在 RouterAgent 上注册 PersistMiddleware，让最外层 agent 在每次成功结束后
