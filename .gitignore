@@ -4,3 +4,7 @@ workdir/memory/*
 /vendor/
 /workdir/sessions/
 /tmp/
+
+# 构建产物 / 本地备份
+*.bak
+*.new
