@@ -99,6 +99,16 @@ cd yichouchou_claw
 
 ### 2. 配置环境变量
 
+推荐使用 `.env` 文件：仓库提供 `.env.example` 模板，复制后填入真实值即可
+（`.env` 已在 `.gitignore` 中，不会被提交）。
+
+```bash
+cp .env.example .env
+$EDITOR .env
+```
+
+也可以直接用环境变量：
+
 ```bash
 # 使用 OpenAI（默认）
 export OPENAI_API_KEY="sk-..."
